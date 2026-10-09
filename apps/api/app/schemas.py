@@ -12,3 +12,10 @@ class AnswerKeyIn(BaseModel): answer:dict=Field(min_length=1); confidence:float|
 class TestCreate(BaseModel): title:str=Field(min_length=2,max_length=255); subject:str=Field(min_length=2,max_length=120); duration_seconds:int=Field(ge=60,le=28800); opens_at:datetime|None=None; closes_at:datetime|None=None; max_attempts:int=Field(default=1,ge=1,le=10); results_policy:dict=Field(default_factory=lambda:{"mode":"immediate"}); question_ids:list[str]=Field(min_length=1)
 class ResponseIn(BaseModel): answer:dict|None=None; marked_for_review:bool=False; revision:int=Field(ge=0)
 class EnrolIn(BaseModel): email:EmailStr
+class ClassroomCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
+    description:str|None=Field(default=None,max_length=500)
+class RosterUpdate(BaseModel):
+    emails:list[EmailStr]=Field(min_length=1,max_length=500)
+class TestClassAssignmentsIn(BaseModel):
+    class_ids:list[str]=Field(default_factory=list,max_length=100)

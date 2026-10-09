@@ -9,6 +9,16 @@ TestNow is now a deployable monorepo: a Next.js assessment interface, FastAPI AP
 3. In another terminal, run `npm install && npm run dev:web`.
 4. Apply migrations in production with `cd apps/api && alembic upgrade head`.
 
+## Local demo accounts
+
+Docker Compose enables `SEED_DEMO_DATA` for local use. It creates the **Demo Physics** class and these accounts (password: `TestNowDev!2026`):
+
+- `teacher@testnow.local`
+- `student1@testnow.local`
+- `student2@testnow.local`
+
+The seed flag defaults to `false` and must remain disabled in shared and production environments.
+
 The old `server.py`, `app.js`, and static assets are intentionally retained as the non-deployed prototype reference. They are not part of the Railway deployment.
 
 ## Railway

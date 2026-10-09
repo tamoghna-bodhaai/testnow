@@ -2,23 +2,31 @@ from datetime import datetime, timedelta, timezone
 import re
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
-from .models import Attempt, Enrollment, ImportJob, ImportStatus, Question, Response as AnswerResponse, Role, SourceDocument, Test, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, EnrolIn, LoginIn, QuestionIn, QuestionOut, RegisterIn, ResponseIn, TestCreate
+from .models import Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, Response as AnswerResponse, Role, SourceDocument, Test, TestClassAssignment, TestStatus, TestVersion, User
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, RegisterIn, ResponseIn, RosterUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, uid, verify_password
 from .services import audit, ensure_live, publish, score, snapshot_questions
-from .storage import digest, put, signed_get
+from .storage import digest, get, put, signed_get
 from .tasks import extract_import
+from .seed import ensure_demo_data
 
 app=FastAPI(title="TestNow API",version="1.0.0")
 app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 @app.on_event("startup")
 def startup():
     # Alembic is the production migration authority; this supports a clean local first boot.
-    if "localhost" in settings().database_url: Base.metadata.create_all(engine)
+    if "localhost" in settings().database_url or settings().database_url.startswith("sqlite"):
+        Base.metadata.create_all(engine)
+    if settings().seed_demo_data:
+        from .db import SessionLocal
+        db=SessionLocal()
+        try: ensure_demo_data(db)
+        finally: db.close()
 @app.get("/health")
 def health(db:Session=Depends(get_db)): db.execute(__import__("sqlalchemy").text("SELECT 1"));return {"status":"ok"}
 @app.get("/ready")
@@ -52,8 +60,8 @@ async def store_upload(file:UploadFile,user:User,db:Session)->SourceDocument:
     if existing:return existing
     source=SourceDocument(id=uid(),owner_id=user.id,filename=re.sub(r"[^A-Za-z0-9._ -]","_",file.filename or "paper.pdf"),object_key=f"documents/{user.id}/{uid()}.pdf",sha256=checksum,media_type="application/pdf",size_bytes=len(raw));put(source.object_key,raw,source.media_type);db.add(source);db.commit();return source
 @app.post("/teacher/imports",status_code=202)
-async def create_import(question_paper:UploadFile=File(...),answer_key:UploadFile|None=File(None),user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
-    paper=await store_upload(question_paper,user,db); key=await store_upload(answer_key,user,db) if answer_key else None
+async def create_import(question_paper:UploadFile=File(...),answer_key:UploadFile=File(...),user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    paper=await store_upload(question_paper,user,db); key=await store_upload(answer_key,user,db)
     job=ImportJob(id=uid(),owner_id=user.id,question_document_id=paper.id,answer_document_id=key.id if key else None,status=ImportStatus.UPLOADED,extraction_meta={"phase":"Queued for extraction"});db.add(job);audit(db,user.id,"import.created","import",job.id);db.commit();extract_import.delay(job.id);return import_view(job,db)
 @app.get("/teacher/imports")
 def list_imports(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
@@ -143,10 +151,61 @@ def question_media(question_id:str,index:int,user:User=Depends(current_user),db:
             version=db.get(TestVersion,a.version_id)
             if version and question_id in {item["id"] for item in version.content.get("questions",[])}:allowed=True;break
     if not allowed:raise HTTPException(403,"Media not available")
-    return RedirectResponse(signed_get(q.diagrams[index]["object_key"]))
+    # Do not redirect the browser to an internal object-store hostname. In local and
+    # private deployments that hostname is unreachable from the browser, producing a
+    # broken image despite successful diagram extraction.
+    return StreamingResponse(iter([get(q.diagrams[index]["object_key"])]),media_type="image/png",headers={"Cache-Control":"private, max-age=300"})
 @app.post("/questions",status_code=201)
 def create_question(data:QuestionIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     q=Question(id=uid(),owner_id=user.id,approved_at=datetime.now(timezone.utc),**data.model_dump());db.add(q);audit(db,user.id,"question.created","question",q.id);db.commit();return question_view(q)
+
+def classroom_for_owner(class_id:str,user:User,db:Session)->Classroom:
+    classroom=db.get(Classroom,class_id)
+    if not classroom or (classroom.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Class not found")
+    return classroom
+def classroom_view(classroom:Classroom,db:Session,include_students:bool=False):
+    members=db.query(ClassMembership).filter_by(class_id=classroom.id).all()
+    result={"id":classroom.id,"name":classroom.name,"description":classroom.description,"student_count":len(members),"created_at":classroom.created_at}
+    if include_students:
+        result["students"]=[user_public(db.get(User,m.student_id)) for m in members if db.get(User,m.student_id)]
+    return result
+@app.get("/classes")
+def list_classes(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    query=db.query(Classroom)
+    if user.role!=Role.ADMIN:query=query.filter_by(owner_id=user.id)
+    return [classroom_view(c,db) for c in query.order_by(Classroom.created_at.desc())]
+@app.post("/classes",status_code=201)
+def create_class(data:ClassroomCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    if db.query(Classroom).filter_by(owner_id=user.id,name=data.name.strip()).first():raise HTTPException(409,"A class with this name already exists")
+    classroom=Classroom(id=uid(),owner_id=user.id,name=data.name.strip(),description=data.description.strip() if data.description else None)
+    db.add(classroom);audit(db,user.id,"class.created","class",classroom.id);db.commit();return classroom_view(classroom,db)
+@app.get("/classes/{class_id}")
+def get_class(class_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    return classroom_view(classroom_for_owner(class_id,user,db),db,True)
+@app.put("/classes/{class_id}")
+def update_class(class_id:str,data:ClassroomCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    classroom=classroom_for_owner(class_id,user,db); classroom.name=data.name.strip();classroom.description=data.description.strip() if data.description else None;db.commit();return classroom_view(classroom,db)
+@app.delete("/classes/{class_id}",status_code=204)
+def delete_class(class_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    classroom=classroom_for_owner(class_id,user,db)
+    db.query(TestClassAssignment).filter_by(class_id=classroom.id).delete(synchronize_session=False)
+    db.query(ClassMembership).filter_by(class_id=classroom.id).delete(synchronize_session=False)
+    db.delete(classroom);audit(db,user.id,"class.deleted","class",class_id);db.commit()
+@app.post("/classes/{class_id}/members")
+def add_class_members(class_id:str,data:RosterUpdate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    classroom=classroom_for_owner(class_id,user,db);added=[];existing=[];unknown=[]
+    for email in dict.fromkeys(str(x).lower() for x in data.emails):
+        student=db.query(User).filter_by(email=email,role=Role.STUDENT).first()
+        if not student:unknown.append(email);continue
+        if db.get(ClassMembership,{"class_id":classroom.id,"student_id":student.id}):existing.append(email);continue
+        db.add(ClassMembership(class_id=classroom.id,student_id=student.id));added.append(email)
+    audit(db,user.id,"class.roster_updated","class",classroom.id,{"added":added,"unknown":unknown});db.commit()
+    return {"added":added,"existing":existing,"unknown":unknown,"classroom":classroom_view(classroom,db,True)}
+@app.delete("/classes/{class_id}/members/{student_id}",status_code=204)
+def remove_class_member(class_id:str,student_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    classroom=classroom_for_owner(class_id,user,db);membership=db.get(ClassMembership,{"class_id":classroom.id,"student_id":student_id})
+    if not membership:raise HTTPException(404,"Class member not found")
+    db.delete(membership);audit(db,user.id,"class.member_removed","class",classroom.id,{"student_id":student_id});db.commit()
 
 @app.post("/tests",status_code=201)
 def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
@@ -157,13 +216,11 @@ def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMI
 def list_tests(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):return [test_view(t,db) for t in db.query(Test).filter_by(owner_id=user.id).order_by(Test.created_at.desc())]
 @app.get("/tests/{test_id}")
 def test_detail(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
-    t=db.get(Test,test_id)
-    if not t or t.owner_id!=user.id:raise HTTPException(404,"Test not found")
+    t=test_for_owner(test_id,user,db)
     return test_view(t,db,True)
 @app.post("/tests/{test_id}/publish")
 def publish_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
-    t=db.get(Test,test_id)
-    if not t or t.owner_id!=user.id:raise HTTPException(404,"Test not found")
+    t=test_for_owner(test_id,user,db)
     draft=db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first()
     if not draft:raise HTTPException(422,"Test has no draft")
     # Make a separately immutable snapshot for delivery.
@@ -174,18 +231,59 @@ def enrol(test_id:str,data:EnrolIn,user:User=Depends(require(Role.TEACHER,Role.A
     if not t or t.owner_id!=user.id or not student:raise HTTPException(404,"Test or student not found")
     if not db.get(Enrollment,{"test_id":t.id,"student_id":student.id}):db.add(Enrollment(test_id=t.id,student_id=student.id));audit(db,user.id,"student.enrolled","test",t.id,{"student_id":student.id});db.commit()
     return {"ok":True}
+def test_for_owner(test_id:str,user:User,db:Session)->Test:
+    test=db.get(Test,test_id)
+    if not test or (test.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Test not found")
+    return test
+def assigned_classrooms(test:Test,db:Session):
+    assignments=db.query(TestClassAssignment).filter_by(test_id=test.id).all()
+    return [db.get(Classroom,a.class_id) for a in assignments if db.get(Classroom,a.class_id)]
+def assigned_student_ids(test:Test,db:Session)->set[str]:
+    ids={row.student_id for row in db.query(Enrollment).filter_by(test_id=test.id)}
+    class_ids=[row.class_id for row in db.query(TestClassAssignment).filter_by(test_id=test.id)]
+    if class_ids:ids.update(row.student_id for row in db.query(ClassMembership).filter(ClassMembership.class_id.in_(class_ids)))
+    return ids
+def student_can_access(test:Test,student_id:str,db:Session)->bool:
+    return student_id in assigned_student_ids(test,db)
+@app.put("/tests/{test_id}/classes")
+def replace_test_classes(test_id:str,data:TestClassAssignmentsIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    test=test_for_owner(test_id,user,db); class_ids=list(dict.fromkeys(data.class_ids))
+    classrooms=[db.get(Classroom,class_id) for class_id in class_ids]
+    if any(c is None or (c.owner_id!=user.id and user.role!=Role.ADMIN) for c in classrooms):raise HTTPException(422,"Every assigned class must belong to you")
+    db.query(TestClassAssignment).filter_by(test_id=test.id).delete(synchronize_session=False)
+    db.add_all(TestClassAssignment(test_id=test.id,class_id=class_id) for class_id in class_ids)
+    audit(db,user.id,"test.classes_updated","test",test.id,{"class_ids":class_ids});db.commit();return test_view(test,db,True)
+@app.get("/tests/{test_id}/analytics")
+def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    test=test_for_owner(test_id,user,db); student_ids=assigned_student_ids(test,db); rows=[];started=submitted=0
+    students=db.query(User).filter(User.id.in_(student_ids)).order_by(User.name).all() if student_ids else []
+    for student in students:
+        attempts=db.query(Attempt).filter_by(test_id=test.id,student_id=student.id).order_by(Attempt.started_at.desc()).all()
+        latest=attempts[0] if attempts else None
+        if attempts:started+=1
+        if any(a.submitted_at for a in attempts):submitted+=1
+        status="not_started" if not latest else "submitted" if latest.submitted_at else "in_progress"
+        rows.append({"student":user_public(student),"status":status,"score":latest.score if latest else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"attempt_count":len(attempts)})
+    return {"test_id":test.id,"summary":{"assigned":len(student_ids),"started":started,"submitted":submitted,"pending":len(student_ids)-started},"students":rows}
 def test_view(t:Test,db:Session,include=False):
-    v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0}
-    if include and v:out["questions"]=v.content["questions"]
+    v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids)}
+    if include:
+        out["classes"]=[classroom_view(c,db) for c in classes]
+        if v:out["questions"]=v.content["questions"]
     return out
 
 @app.get("/student/tests")
 def student_tests(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
-    rows=db.query(Test).join(Enrollment,Enrollment.test_id==Test.id).filter(Enrollment.student_id==user.id,Test.status==TestStatus.PUBLISHED).all();return [test_view(t,db) for t in rows]
+    now=datetime.now(timezone.utc);rows=[]
+    for test in db.query(Test).filter_by(status=TestStatus.PUBLISHED).all():
+        if not student_can_access(test,user.id,db):continue
+        availability="upcoming" if test.opens_at and now<test.opens_at else "closed" if test.closes_at and now>test.closes_at else "available"
+        rows.append({**test_view(test,db),"availability":availability})
+    return rows
 @app.post("/tests/{test_id}/attempts",status_code=201)
 def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
-    test=db.get(Test,test_id); enrolled=db.get(Enrollment,{"test_id":test_id,"student_id":user.id})
-    if not test or not enrolled:raise HTTPException(403,"You are not enrolled")
+    test=db.get(Test,test_id)
+    if not test or not student_can_access(test,user.id,db):raise HTTPException(403,"You are not assigned to this assessment")
     ensure_live(test); active=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id,submitted_at=None).first()
     if active:return attempt_view(active,db)
     prior=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id).count()
@@ -223,4 +321,4 @@ def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=De
     if policy.get("mode")!="immediate" and (not release or datetime.now(timezone.utc)<datetime.fromisoformat(release.replace("Z","+00:00"))):raise HTTPException(403,"Results have not been released")
     responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};_,items=score(db.get(TestVersion,a.version_id).content,responses);return {"attempt":attempt_view(a,db),"questions":items}
 def attempt_view(a:Attempt,db:Session):
-    v=db.get(TestVersion,a.version_id);resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"questions":[{k:x[k] for k in ("id","kind","stem_markdown","options","diagrams","scoring")} for x in v.content["questions"]],"responses":resp}
+    v=db.get(TestVersion,a.version_id);resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"questions":[{k:x[k] for k in ("id","source_number","kind","stem_markdown","options","diagrams","scoring") if k in x} for x in v.content["questions"]],"responses":resp}

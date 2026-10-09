@@ -39,6 +39,7 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
       OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-90}
+      SEED_DEMO_DATA: "true"
     depends_on: [postgres, redis, objectstore]
     ports: ["8000:8000"]
   worker:
@@ -57,4 +58,5 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
       OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-90}
+      SEED_DEMO_DATA: "true"
     depends_on: [postgres, redis, objectstore]

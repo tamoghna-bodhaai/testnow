@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     openrouter_timeout_seconds: int = 90
     max_upload_bytes: int = 52_428_800
     cors_origins: str = "http://localhost:3000"
+    seed_demo_data: bool = False
 
 @lru_cache
 def settings() -> Settings: return Settings()

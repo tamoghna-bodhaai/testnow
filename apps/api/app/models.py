@@ -65,6 +65,21 @@ class TestVersion(Timestamped, Base):
     __table_args__=(UniqueConstraint("test_id","ordinal"),)
 class Enrollment(Timestamped, Base):
     __tablename__="enrollments"; test_id: Mapped[str] = mapped_column(ForeignKey("tests.id",ondelete="CASCADE"),primary_key=True); student_id: Mapped[str] = mapped_column(ForeignKey("users.id",ondelete="CASCADE"),primary_key=True)
+class Classroom(Timestamped, Base):
+    __tablename__="classrooms"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str | None] = mapped_column(String(500))
+    __table_args__=(UniqueConstraint("owner_id", "name"),)
+class ClassMembership(Timestamped, Base):
+    __tablename__="class_memberships"
+    class_id: Mapped[str] = mapped_column(ForeignKey("classrooms.id", ondelete="CASCADE"), primary_key=True)
+    student_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+class TestClassAssignment(Timestamped, Base):
+    __tablename__="test_class_assignments"
+    test_id: Mapped[str] = mapped_column(ForeignKey("tests.id", ondelete="CASCADE"), primary_key=True)
+    class_id: Mapped[str] = mapped_column(ForeignKey("classrooms.id", ondelete="CASCADE"), primary_key=True)
 class Attempt(Timestamped, Base):
     __tablename__="attempts"; id: Mapped[str] = mapped_column(String(36),primary_key=True); test_id: Mapped[str] = mapped_column(ForeignKey("tests.id"),index=True); version_id: Mapped[str] = mapped_column(ForeignKey("test_versions.id")); student_id: Mapped[str] = mapped_column(ForeignKey("users.id"),index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); score: Mapped[float | None] = mapped_column(); revision: Mapped[int] = mapped_column(Integer,default=0)

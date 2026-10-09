@@ -13,7 +13,7 @@ from .storage import get, put
 celery_app=Celery("testnow",broker=settings().redis_url,backend=settings().redis_url)
 SYSTEM="""You extract educational examination papers into teacher-reviewable records. Return only JSON matching the supplied schema.
 
-Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Its source_spans must cover the complete source area for that question, including its options and any associated figure. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. The separately supplied answer-key document is authoritative: map its answer to the question option, and return its corresponding worked explanation in solution_markdown whenever available. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
+Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Its source_spans must cover the complete source area for that question, including its options and any associated figure. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. The separately supplied answer-key document is authoritative: map its answer to the question option, and return its corresponding worked explanation in solution_markdown whenever available. Format each solution as readable Markdown: use blank paragraphs, numbered steps for sequential working, and display math for substantial equations. Never flatten a multi-step solution into one paragraph. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
 OPTION_SCHEMA={"type":"object","additionalProperties":False,"required":["value","markdown"],"properties":{"value":{"type":"string"},"markdown":{"type":"string"}}}
 DIAGRAM_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox","alt"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"alt":{"type":"string"}}}
 SPAN_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}}}
@@ -28,9 +28,21 @@ def normalize_item(item:dict)->dict:
         elif isinstance(option, dict):
             options.append({"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")})
     item["options"]=options
+    item["answer"]=normalize_answer(item.get("answer"),options)
     try:item["confidence"]=min(1.0,max(0.0,float(item.get("confidence",0))))
     except (TypeError,ValueError):item["confidence"]=0.0
     return item
+def normalize_answer(answer,options:list[dict]):
+    """Convert provider answer variants to the response shape used for scoring."""
+    if not isinstance(answer,dict):return None
+    raw=answer.get("option",answer.get("value",answer.get("correct_option")))
+    if isinstance(raw,int) and 0<=raw<len(options):return {"option":raw}
+    if isinstance(raw,str):
+        needle=raw.strip().lower()
+        for index,option in enumerate(options):
+            if needle in {str(index),str(index+1),chr(65+index).lower(),str(option.get("value","")).lower()}:
+                return {"option":index}
+    return {"value":raw} if raw is not None else None
 def validate(item:dict):
     if not item.get("stem_markdown"):raise ValueError("Blank question stem")
     if item["kind"] in ("single_choice","multiple_choice") and len(item.get("options",[]))<2:raise ValueError("Choice question requires two options")
