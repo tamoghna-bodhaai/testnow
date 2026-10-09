@@ -1,0 +1,8 @@
+__pycache__/
+testnow.db
+uploads/
+.DS_Store
+node_modules/
+.next/
+.env
+.pytest_cache/
