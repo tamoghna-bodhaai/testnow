@@ -13,7 +13,7 @@ from .storage import get, put
 celery_app=Celery("testnow",broker=settings().redis_url,backend=settings().redis_url)
 SYSTEM="""You extract educational examination papers into teacher-reviewable records. Return only JSON matching the supplied schema.
 
-Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Its source_spans must cover the complete source area for that question, including its options and any associated figure. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
+Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Its source_spans must cover the complete source area for that question, including its options and any associated figure. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. The separately supplied answer-key document is authoritative: map its answer to the question option, and return its corresponding worked explanation in solution_markdown whenever available. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
 OPTION_SCHEMA={"type":"object","additionalProperties":False,"required":["value","markdown"],"properties":{"value":{"type":"string"},"markdown":{"type":"string"}}}
 DIAGRAM_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox","alt"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"alt":{"type":"string"}}}
 SPAN_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}}}
@@ -35,6 +35,15 @@ def validate(item:dict):
     if not item.get("stem_markdown"):raise ValueError("Blank question stem")
     if item["kind"] in ("single_choice","multiple_choice") and len(item.get("options",[]))<2:raise ValueError("Choice question requires two options")
     if "$$$" in item["stem_markdown"]:raise ValueError("Malformed LaTex delimiters")
+
+def infer_paper_title(reader:PdfReader, text:str, fallback:str)->str:
+    metadata=reader.metadata or {}
+    title=str(metadata.get("/Title") or "").strip()
+    if title and title.lower() not in {"untitled","null"}:return title[:160]
+    for line in text.splitlines()[:40]:
+        clean=" ".join(line.split()).strip("-:| ")
+        if 8<=len(clean)<=140 and not re.match(r"^(page|question|section)\s*\d",clean,re.I):return clean
+    return fallback.rsplit(".",1)[0][:160]
 
 def native_image_regions(document):
     """Find illustrations embedded in the PDF independently of model detection."""
@@ -72,7 +81,7 @@ def extract_import(self, job_id:str):
     db:Session=SessionLocal(); job=db.get(ImportJob,job_id)
     try:
       job.status=ImportStatus.PROCESSING; job.extraction_meta={"phase":"Reading the question paper"}; db.commit(); doc=db.get(SourceDocument, job.question_document_id); raw=get(doc.object_key)
-      reader=PdfReader(BytesIO(raw)); text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages))
+      reader=PdfReader(BytesIO(raw)); text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages)); paper_title=infer_paper_title(reader,text,doc.filename)
       # Full rendered pages are the VLM input. We preserve mathematical layout and diagrams,
       # while native extraction acts only as context for reading order and recovery checks.
       rendered=fitz.open(stream=raw,filetype="pdf")
@@ -111,7 +120,7 @@ def extract_import(self, job_id:str):
             diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
           except Exception: continue
         db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=item["number"],kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item["solution_markdown"],confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams))
-      job.status=ImportStatus.REVIEW; job.extraction_meta={"model":settings().openrouter_model,"question_count":len(parsed["questions"]),"phase":"Ready for review"};db.commit()
+      job.status=ImportStatus.REVIEW; job.extraction_meta={"model":settings().openrouter_model,"paper_title":paper_title,"question_count":len(parsed["questions"]),"phase":"Ready for review"};db.commit()
     except Exception as exc:
       job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit();raise
     finally:db.close()
