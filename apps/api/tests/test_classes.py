@@ -4,8 +4,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, question_media, student_can_access, test_analytics as assessment_analytics
+from app.main import assigned_student_ids, question_media, student_can_access, student_tests, test_analytics as assessment_analytics
 from app.models import Attempt, Classroom, ClassMembership, Question, QuestionKind, Role, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.schemas import LoginIn, RosterUpdate
 
 def make_db():
     engine=create_engine("sqlite+pysqlite:///:memory:")
@@ -31,6 +32,10 @@ def test_class_assignment_controls_visibility_and_analytics():
     analytics=assessment_analytics("test",teacher,db)
     assert analytics["summary"]=={"assigned":2,"started":1,"submitted":1,"pending":1}
     assert {row["status"] for row in analytics["students"]}=={"submitted","not_started"}
+    assessments=student_tests(first,db)
+    assert assessments[0]["attempts_remaining"]==0
+    assert assessments[0]["latest_attempt"]["id"]=="attempt"
+    assert assessments[0]["latest_attempt"]["status"]=="submitted"
 
 def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch):
     db=make_db()
@@ -41,3 +46,8 @@ def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch)
     response=question_media("question",0,teacher,db)
     assert response.media_type=="image/png"
     assert response.headers["cache-control"]=="private, max-age=300"
+
+def test_seeded_local_email_addresses_are_accepted_for_login_and_rosters():
+    assert LoginIn(email="student1@testnow.local",password="TestNowDev!2026").email=="student1@testnow.local"
+    roster=RosterUpdate(emails=["student1@testnow.local", " STUDENT2@TESTNOW.LOCAL "])
+    assert roster.emails==["student1@testnow.local", "student2@testnow.local"]

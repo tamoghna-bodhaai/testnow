@@ -1,21 +1,55 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+import re
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .models import QuestionKind, Role
 
 class APIModel(BaseModel): model_config=ConfigDict(from_attributes=True)
-class RegisterIn(BaseModel): name:str=Field(min_length=2,max_length=160); email:EmailStr; password:str=Field(min_length=12,max_length=128); role:Role
-class LoginIn(BaseModel): email:EmailStr; password:str
+EMAIL_PATTERN=re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+def normalise_email(value:str)->str:
+    """Validate an address without rejecting local development domains.
+
+    ``EmailStr`` intentionally rejects special-use domains such as ``.local``.
+    TestNow's documented local seed accounts use that domain, so account and
+    roster APIs need a syntax check rather than a deliverability check.
+    """
+    email=value.strip().lower()
+    if not EMAIL_PATTERN.fullmatch(email):
+        raise ValueError("Enter a valid email address")
+    return email
+
+class RegisterIn(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
+    email:str
+    password:str=Field(min_length=12,max_length=128)
+    role:Role
+
+    _normalise_email=field_validator("email")(normalise_email)
+
+class LoginIn(BaseModel):
+    email:str
+    password:str
+
+    _normalise_email=field_validator("email")(normalise_email)
 class QuestionIn(BaseModel):
     source_number:str|None=None; kind:QuestionKind; stem_markdown:str=Field(min_length=1); options:list[dict]=Field(default_factory=list); answer:dict|None=None; solution_markdown:str|None=None; scoring:dict=Field(default_factory=lambda:{"correct":4,"incorrect":-1,"unanswered":0}); diagrams:list[dict]=Field(default_factory=list); source_spans:list[dict]=Field(default_factory=list); confidence:float|None=None
 class QuestionOut(QuestionIn): id:str; approved:bool=False
 class AnswerKeyIn(BaseModel): answer:dict=Field(min_length=1); confidence:float|None=Field(default=None,ge=0,le=1)
 class TestCreate(BaseModel): title:str=Field(min_length=2,max_length=255); subject:str=Field(min_length=2,max_length=120); duration_seconds:int=Field(ge=60,le=28800); opens_at:datetime|None=None; closes_at:datetime|None=None; max_attempts:int=Field(default=1,ge=1,le=10); results_policy:dict=Field(default_factory=lambda:{"mode":"immediate"}); question_ids:list[str]=Field(min_length=1)
 class ResponseIn(BaseModel): answer:dict|None=None; marked_for_review:bool=False; revision:int=Field(ge=0)
-class EnrolIn(BaseModel): email:EmailStr
+class EnrolIn(BaseModel):
+    email:str
+
+    _normalise_email=field_validator("email")(normalise_email)
 class ClassroomCreate(BaseModel):
     name:str=Field(min_length=2,max_length=160)
     description:str|None=Field(default=None,max_length=500)
 class RosterUpdate(BaseModel):
-    emails:list[EmailStr]=Field(min_length=1,max_length=500)
+    emails:list[str]=Field(min_length=1,max_length=500)
+
+    @field_validator("emails")
+    @classmethod
+    def normalise_emails(cls, emails:list[str])->list[str]:
+        return [normalise_email(email) for email in emails]
 class TestClassAssignmentsIn(BaseModel):
     class_ids:list[str]=Field(default_factory=list,max_length=100)

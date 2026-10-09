@@ -278,7 +278,18 @@ def student_tests(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(ge
     for test in db.query(Test).filter_by(status=TestStatus.PUBLISHED).all():
         if not student_can_access(test,user.id,db):continue
         availability="upcoming" if test.opens_at and now<test.opens_at else "closed" if test.closes_at and now>test.closes_at else "available"
-        rows.append({**test_view(test,db),"availability":availability})
+        attempts=db.query(Attempt).filter_by(test_id=test.id,student_id=user.id).order_by(Attempt.started_at.desc()).all()
+        latest=attempts[0] if attempts else None
+        latest_attempt=None
+        if latest:
+            latest_attempt={
+                "id":latest.id,
+                "status":"submitted" if latest.submitted_at else "in_progress" if now<latest.ends_at else "expired",
+                "started_at":latest.started_at,
+                "submitted_at":latest.submitted_at,
+                "score":latest.score,
+            }
+        rows.append({**test_view(test,db),"availability":availability,"attempts_remaining":max(test.max_attempts-len(attempts),0),"latest_attempt":latest_attempt})
     return rows
 @app.post("/tests/{test_id}/attempts",status_code=201)
 def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
