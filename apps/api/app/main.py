@@ -291,6 +291,12 @@ def student_tests(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(ge
             }
         rows.append({**test_view(test,db),"availability":availability,"attempts_remaining":max(test.max_attempts-len(attempts),0),"latest_attempt":latest_attempt})
     return rows
+@app.get("/student/classes")
+def student_classes(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
+    """Return the current student's class enrolments for their portal profile."""
+    class_ids=[row.class_id for row in db.query(ClassMembership).filter_by(student_id=user.id).all()]
+    classes=db.query(Classroom).filter(Classroom.id.in_(class_ids)).order_by(Classroom.name).all() if class_ids else []
+    return [{"id":classroom.id,"name":classroom.name,"description":classroom.description} for classroom in classes]
 @app.post("/tests/{test_id}/attempts",status_code=201)
 def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     test=db.get(Test,test_id)
