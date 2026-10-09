@@ -11,8 +11,26 @@ from .security import uid
 from .storage import get, put
 
 celery_app=Celery("testnow",broker=settings().redis_url,backend=settings().redis_url)
-SYSTEM="""You extract educational examination papers. Return only strict JSON matching the supplied schema. Preserve all mathematical notation as valid LaTex delimited by $...$ or $$...$$. Never render a whole question as an image. Return diagrams only as page/bounding-box references. Keep each question, all options, and answer key separate."""
-SCHEMA={"name":"exam_questions","strict":True,"schema":{"type":"object","additionalProperties":False,"required":["questions"],"properties":{"questions":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["number","kind","stem_markdown","options","answer","solution_markdown","confidence","source_spans","diagrams"],"properties":{"number":{"type":"string"},"kind":{"type":"string","enum":["single_choice","multiple_choice","numerical","integer","assertion_reason","subjective"]},"stem_markdown":{"type":"string"},"options":{"type":"array"},"answer":{"type":["object","null"]},"solution_markdown":{"type":["string","null"]},"confidence":{"type":"number"},"source_spans":{"type":"array"},"diagrams":{"type":"array"}}}}}}}
+SYSTEM="""You extract educational examination papers into teacher-reviewable records. Return only JSON matching the supplied schema.
+
+Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
+OPTION_SCHEMA={"type":"object","additionalProperties":False,"required":["value","markdown"],"properties":{"value":{"type":"string"},"markdown":{"type":"string"}}}
+DIAGRAM_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox","alt"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"alt":{"type":"string"}}}
+SPAN_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}}}
+SCHEMA={"name":"exam_questions","strict":True,"schema":{"type":"object","additionalProperties":False,"required":["questions"],"properties":{"questions":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["number","kind","stem_markdown","options","answer","solution_markdown","confidence","source_spans","diagrams"],"properties":{"number":{"type":"string"},"kind":{"type":"string","enum":["single_choice","multiple_choice","numerical","integer","assertion_reason","subjective"]},"stem_markdown":{"type":"string"},"options":{"type":"array","items":OPTION_SCHEMA},"answer":{"type":["object","null"]},"solution_markdown":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"source_spans":{"type":"array","items":SPAN_SCHEMA},"diagrams":{"type":"array","items":DIAGRAM_SCHEMA}}}}}}}
+
+def normalize_item(item:dict)->dict:
+    """Accept legacy provider variations, but never store presentation JSON as an option."""
+    options=[]
+    for index, option in enumerate(item.get("options") or []):
+        if isinstance(option, str):
+            options.append({"value":chr(97+index),"markdown":option})
+        elif isinstance(option, dict):
+            options.append({"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")})
+    item["options"]=options
+    try:item["confidence"]=min(1.0,max(0.0,float(item.get("confidence",0))))
+    except (TypeError,ValueError):item["confidence"]=0.0
+    return item
 def validate(item:dict):
     if not item.get("stem_markdown"):raise ValueError("Blank question stem")
     if item["kind"] in ("single_choice","multiple_choice") and len(item.get("options",[]))<2:raise ValueError("Choice question requires two options")
@@ -21,7 +39,7 @@ def validate(item:dict):
 def extract_import(self, job_id:str):
     db:Session=SessionLocal(); job=db.get(ImportJob,job_id)
     try:
-      job.status=ImportStatus.PROCESSING; db.commit(); doc=db.get(SourceDocument, job.question_document_id); raw=get(doc.object_key)
+      job.status=ImportStatus.PROCESSING; job.extraction_meta={"phase":"Reading the question paper"}; db.commit(); doc=db.get(SourceDocument, job.question_document_id); raw=get(doc.object_key)
       reader=PdfReader(BytesIO(raw)); text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages))
       # Full rendered pages are the VLM input. We preserve mathematical layout and diagrams,
       # while native extraction acts only as context for reading order and recovery checks.
@@ -37,11 +55,14 @@ def extract_import(self, job_id:str):
           key_text="\nANSWER KEY DOCUMENT:\n"+"\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(get(key_doc.object_key))).pages)
           vision_content[0]["text"]+=key_text[:40000]
       if not settings().openrouter_api_key: raise RuntimeError("OPENROUTER_API_KEY is not configured")
+      job.extraction_meta={"phase":"Extracting structured questions"}; db.commit()
       import httpx
       payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":vision_content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"stream":False}
       response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow"},json=payload,timeout=settings().openrouter_timeout_seconds); response.raise_for_status()
       parsed=json.loads(response.json()["choices"][0]["message"]["content"]); numbers=set()
+      job.extraction_meta={"phase":"Saving extracted questions"}; db.commit()
       for item in parsed["questions"]:
+        item=normalize_item(item)
         validate(item)
         if item["number"] in numbers:raise ValueError("Duplicate source question number")
         numbers.add(item["number"]); kind=QuestionKind(item["kind"])
@@ -57,7 +78,7 @@ def extract_import(self, job_id:str):
             diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
           except Exception: continue
         db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=item["number"],kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item["solution_markdown"],confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams))
-      job.status=ImportStatus.REVIEW; job.extraction_meta={"model":settings().openrouter_model,"question_count":len(parsed["questions"])};db.commit()
+      job.status=ImportStatus.REVIEW; job.extraction_meta={"model":settings().openrouter_model,"question_count":len(parsed["questions"]),"phase":"Ready for review"};db.commit()
     except Exception as exc:
-      job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];db.commit();raise
+      job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit();raise
     finally:db.close()

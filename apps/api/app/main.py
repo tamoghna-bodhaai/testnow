@@ -54,12 +54,30 @@ async def store_upload(file:UploadFile,user:User,db:Session)->SourceDocument:
 @app.post("/teacher/imports",status_code=202)
 async def create_import(question_paper:UploadFile=File(...),answer_key:UploadFile|None=File(None),user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     paper=await store_upload(question_paper,user,db); key=await store_upload(answer_key,user,db) if answer_key else None
-    job=ImportJob(id=uid(),owner_id=user.id,question_document_id=paper.id,answer_document_id=key.id if key else None,status=ImportStatus.UPLOADED);db.add(job);audit(db,user.id,"import.created","import",job.id);db.commit();extract_import.delay(job.id);return import_view(job)
+    job=ImportJob(id=uid(),owner_id=user.id,question_document_id=paper.id,answer_document_id=key.id if key else None,status=ImportStatus.UPLOADED,extraction_meta={"phase":"Queued for extraction"});db.add(job);audit(db,user.id,"import.created","import",job.id);db.commit();extract_import.delay(job.id);return import_view(job,db)
+@app.get("/teacher/imports")
+def list_imports(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    query=db.query(ImportJob)
+    if user.role!=Role.ADMIN: query=query.filter_by(owner_id=user.id)
+    return [import_view(job,db) for job in query.order_by(ImportJob.created_at.desc()).limit(25)]
 @app.get("/teacher/imports/{job_id}")
 def get_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     job=db.get(ImportJob,job_id)
     if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
-    return {**import_view(job),"questions":[question_view(q) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.source_number)]}
+    return {**import_view(job,db),"questions":[question_view(q) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.source_number)]}
+@app.get("/teacher/imports/{job_id}/source")
+def import_source(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
+    return RedirectResponse(signed_get(db.get(SourceDocument,job.question_document_id).object_key))
+@app.post("/teacher/imports/{job_id}/reextract",status_code=202)
+def reextract_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
+    if db.query(Question).filter_by(import_job_id=job.id).filter(Question.approved_at.is_not(None)).first():raise HTTPException(409,"Approved questions cannot be replaced; create a new import instead")
+    db.query(Question).filter_by(import_job_id=job.id).delete(synchronize_session=False)
+    job.status=ImportStatus.UPLOADED;job.error=None;job.extraction_meta={"phase":"Queued for improved extraction"};audit(db,user.id,"import.reextraction_requested","import",job.id);db.commit();extract_import.delay(job.id)
+    return import_view(job,db)
 @app.put("/teacher/imports/{job_id}/questions/{question_id}")
 def edit_import_question(job_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     q=db.get(Question,question_id);job=db.get(ImportJob,job_id)
@@ -72,9 +90,23 @@ def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.T
     q=db.get(Question,question_id);job=db.get(ImportJob,job_id)
     if not job or not q or q.import_job_id!=job.id or job.owner_id!=user.id:raise HTTPException(404,"Question not found")
     if not q.answer or q.confidence is None:raise HTTPException(422,"An answer and extraction confidence are required before approval")
-    q.approved_at=datetime.now(timezone.utc);db.commit();return question_view(q)
-def import_view(job:ImportJob):return {"id":job.id,"status":job.status.value,"error":job.error,"meta":job.extraction_meta,"created_at":job.created_at}
-def question_view(q:Question):return {"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":q.options,"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"confidence":q.confidence,"approved":bool(q.approved_at)}
+    q.approved_at=datetime.now(timezone.utc)
+    pending=db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first()
+    if not pending: job.status=ImportStatus.APPROVED; job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete"}
+    db.commit();return question_view(q)
+def import_view(job:ImportJob,db:Session|None=None):
+    source=db.get(SourceDocument,job.question_document_id) if db else None
+    return {"id":job.id,"status":job.status.value,"error":job.error,"meta":job.extraction_meta,"created_at":job.created_at,"filename":source.filename if source else None}
+def normalized_options(options):
+    output=[]
+    for index,option in enumerate(options or []):
+        if isinstance(option,str): output.append({"value":chr(97+index),"markdown":option})
+        elif isinstance(option,dict): output.append({"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")})
+    return output
+def question_view(q:Question):
+    confidence=q.confidence
+    if confidence is not None: confidence=min(1.0,max(0.0,float(confidence)))
+    return {"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":normalized_options(q.options),"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"confidence":confidence,"approved":bool(q.approved_at)}
 @app.get("/questions")
 def questions(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     return [question_view(q) for q in db.query(Question).filter_by(owner_id=user.id).order_by(Question.created_at.desc())]
