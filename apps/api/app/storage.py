@@ -5,7 +5,7 @@ from .config import settings
 
 def client():
     s=settings()
-    return boto3.client("s3",endpoint_url=s.s3_endpoint_url,aws_access_key_id=s.s3_access_key,aws_secret_access_key=s.s3_secret_key,region_name=s.s3_region,config=Config(signature_version="s3v4"))
+    return boto3.client("s3",endpoint_url=s.s3_endpoint_url,aws_access_key_id=s.s3_access_key,aws_secret_access_key=s.s3_secret_key,region_name=s.s3_region,config=Config(signature_version="s3v4",s3={"addressing_style":"path"}))
 def put(key:str,data:bytes,content_type:str):
     s=settings(); c=client()
     try: c.head_bucket(Bucket=s.s3_bucket)
