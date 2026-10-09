@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, question_media, student_can_access, student_tests, test_analytics as assessment_analytics
+from app.main import assigned_student_ids, question_media, student_can_access, student_classes, student_tests, test_analytics as assessment_analytics
 from app.models import Attempt, Classroom, ClassMembership, Question, QuestionKind, Role, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.schemas import LoginIn, RosterUpdate
 
@@ -36,6 +36,18 @@ def test_class_assignment_controls_visibility_and_analytics():
     assert assessments[0]["attempts_remaining"]==0
     assert assessments[0]["latest_attempt"]["id"]=="attempt"
     assert assessments[0]["latest_attempt"]["status"]=="submitted"
+
+def test_student_classes_returns_only_the_current_students_enrolments():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    first=User(id="student-1",name="One",email="one@example.com",password_hash="x",role=Role.STUDENT)
+    second=User(id="student-2",name="Two",email="two@example.com",password_hash="x",role=Role.STUDENT)
+    enrolled=Classroom(id="class-1",owner_id="teacher",name="Physics 12A",description="Morning section")
+    other=Classroom(id="class-2",owner_id="teacher",name="Physics 12B")
+    db.add_all([teacher,first,second,enrolled,other,ClassMembership(class_id="class-1",student_id="student-1"),ClassMembership(class_id="class-2",student_id="student-2")])
+    db.commit()
+
+    assert student_classes(first,db)==[{"id":"class-1","name":"Physics 12A","description":"Morning section"}]
 
 def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch):
     db=make_db()
