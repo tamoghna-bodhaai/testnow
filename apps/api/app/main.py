@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
 from .models import Attempt, Enrollment, ImportJob, ImportStatus, Question, Response as AnswerResponse, Role, SourceDocument, Test, TestStatus, TestVersion, User
-from .schemas import EnrolIn, LoginIn, QuestionIn, QuestionOut, RegisterIn, ResponseIn, TestCreate
+from .schemas import AnswerKeyIn, EnrolIn, LoginIn, QuestionIn, QuestionOut, RegisterIn, ResponseIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, uid, verify_password
 from .services import audit, ensure_live, publish, score, snapshot_questions
 from .storage import digest, put, signed_get
@@ -85,11 +85,22 @@ def edit_import_question(job_id:str,question_id:str,data:QuestionIn,user:User=De
     if q.approved_at:raise HTTPException(409,"Approved questions cannot be edited; duplicate for a new version")
     for name,value in data.model_dump().items():setattr(q,name,value)
     db.commit();return question_view(q)
+@app.put("/teacher/imports/{job_id}/questions/{question_id}/answer-key")
+def save_answer_key(job_id:str,question_id:str,data:AnswerKeyIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    q=db.get(Question,question_id);job=db.get(ImportJob,job_id)
+    if not job or not q or q.import_job_id!=job.id or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Question not found")
+    if q.approved_at:raise HTTPException(409,"Approved questions cannot be edited")
+    q.answer=canonical_answer(data.answer,q.options)
+    q.confidence=data.confidence if data.confidence is not None else (min(1.0,max(0.0,float(q.confidence))) if q.confidence is not None else 0.0)
+    audit(db,user.id,"question.answer_key_saved","question",q.id);db.commit();return question_view(q)
 @app.post("/teacher/imports/{job_id}/questions/{question_id}/approve")
 def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     q=db.get(Question,question_id);job=db.get(ImportJob,job_id)
     if not job or not q or q.import_job_id!=job.id or job.owner_id!=user.id:raise HTTPException(404,"Question not found")
-    if not q.answer or q.confidence is None:raise HTTPException(422,"An answer and extraction confidence are required before approval")
+    if not q.answer:raise HTTPException(422,"Select and save an answer key before approving this question")
+    # Confidence is audit metadata, never a reason to block teacher approval. Legacy
+    # imports may have omitted it or stored it on a 0-100 scale.
+    q.confidence=min(1.0,max(0.0,float(q.confidence))) if q.confidence is not None else 0.0
     q.approved_at=datetime.now(timezone.utc)
     pending=db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first()
     if not pending: job.status=ImportStatus.APPROVED; job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete"}
@@ -103,6 +114,18 @@ def normalized_options(options):
         if isinstance(option,str): output.append({"value":chr(97+index),"markdown":option})
         elif isinstance(option,dict): output.append({"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")})
     return output
+def canonical_answer(answer,options):
+    """Store one stable answer format that matches the exam client's response shape."""
+    if not isinstance(answer,dict):raise HTTPException(422,"Answer key must be an object")
+    raw=answer.get("option",answer.get("value",answer.get("correct_option")))
+    if isinstance(raw,int) and 0<=raw<len(options or []):return {"option":raw}
+    if isinstance(raw,str):
+        for index,option in enumerate(normalized_options(options)):
+            if raw.strip().lower() in {str(index),str(index+1),chr(65+index).lower(),option["value"].lower()}:
+                return {"option":index}
+    # Numerical / subjective answer keys keep their reviewed structured value.
+    if raw is not None:return {"value":raw}
+    raise HTTPException(422,"Choose a valid option or provide an answer value")
 def question_view(q:Question):
     confidence=q.confidence
     if confidence is not None: confidence=min(1.0,max(0.0,float(confidence)))
