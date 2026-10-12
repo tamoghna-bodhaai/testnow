@@ -17,20 +17,20 @@ depends_on=None
 def upgrade():
     # Delete in dependency order. Each statement is limited to records owned by
     # legacy teacher/student accounts, preserving any administrator data.
-    op.execute("DELETE FROM responses WHERE attempt_id IN (SELECT id FROM attempts WHERE student_id IN (SELECT id FROM users WHERE role = 'student'))")
-    op.execute("DELETE FROM attempts WHERE student_id IN (SELECT id FROM users WHERE role = 'student')")
-    op.execute("DELETE FROM test_class_assignments WHERE test_id IN (SELECT id FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher'))")
-    op.execute("DELETE FROM enrollments WHERE test_id IN (SELECT id FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher')) OR student_id IN (SELECT id FROM users WHERE role = 'student')")
-    op.execute("DELETE FROM test_versions WHERE test_id IN (SELECT id FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher'))")
-    op.execute("DELETE FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher'))")
-    op.execute("DELETE FROM class_memberships WHERE class_id IN (SELECT id FROM classrooms WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher')) OR student_id IN (SELECT id FROM users WHERE role = 'student')")
-    op.execute("DELETE FROM classrooms WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher')")
-    op.execute("DELETE FROM questions WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher')")
-    op.execute("DELETE FROM import_jobs WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher')")
-    op.execute("DELETE FROM source_documents WHERE owner_id IN (SELECT id FROM users WHERE role = 'teacher')")
-    op.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role IN ('teacher', 'student'))")
-    op.execute("DELETE FROM audit_events WHERE actor_id IN (SELECT id FROM users WHERE role IN ('teacher', 'student'))")
-    op.execute("DELETE FROM users WHERE role IN ('teacher', 'student')")
+    op.execute("DELETE FROM responses WHERE attempt_id IN (SELECT id FROM attempts WHERE student_id IN (SELECT id FROM users WHERE role = 'STUDENT'))")
+    op.execute("DELETE FROM attempts WHERE student_id IN (SELECT id FROM users WHERE role = 'STUDENT')")
+    op.execute("DELETE FROM test_class_assignments WHERE test_id IN (SELECT id FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER'))")
+    op.execute("DELETE FROM enrollments WHERE test_id IN (SELECT id FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')) OR student_id IN (SELECT id FROM users WHERE role = 'STUDENT')")
+    op.execute("DELETE FROM test_versions WHERE test_id IN (SELECT id FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER'))")
+    op.execute("DELETE FROM tests WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')")
+    op.execute("DELETE FROM class_memberships WHERE class_id IN (SELECT id FROM classrooms WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')) OR student_id IN (SELECT id FROM users WHERE role = 'STUDENT')")
+    op.execute("DELETE FROM classrooms WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')")
+    op.execute("DELETE FROM questions WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')")
+    op.execute("DELETE FROM import_jobs WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')")
+    op.execute("DELETE FROM source_documents WHERE owner_id IN (SELECT id FROM users WHERE role = 'TEACHER')")
+    op.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role IN ('TEACHER', 'STUDENT'))")
+    op.execute("DELETE FROM audit_events WHERE actor_id IN (SELECT id FROM users WHERE role IN ('TEACHER', 'STUDENT'))")
+    op.execute("DELETE FROM users WHERE role IN ('TEACHER', 'STUDENT')")
 
 def downgrade():
     # Historical assessment and account data cannot be reconstructed.
