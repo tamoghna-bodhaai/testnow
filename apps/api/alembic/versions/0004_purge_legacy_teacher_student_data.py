@@ -1,6 +1,6 @@
 """purge legacy teacher and student records before access-code launch
 
-Revision ID: 0004_purge_legacy_teacher_student_data
+Revision ID: 0004_purge_legacy
 Revises: 0003_access_code_auth
 
 This is intentionally irreversible. It clears data owned by historical teacher
@@ -9,7 +9,7 @@ the configured super-admin account is preserved.
 """
 from alembic import op
 
-revision="0004_purge_legacy_teacher_student_data"
+revision="0004_purge_legacy"
 down_revision="0003_access_code_auth"
 branch_labels=None
 depends_on=None
