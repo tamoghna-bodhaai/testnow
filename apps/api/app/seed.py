@@ -8,8 +8,10 @@ DEMO_ACCESS_CODE="12345"
 DEMO_TEACHER="teacher@testnow.local"
 DEMO_STUDENTS=("student1@testnow.local", "student2@testnow.local")
 
-def ensure_demo_data(db:Session):
-    people=[("Local Admin", DEMO_ADMIN, Role.ADMIN), ("Demo Teacher", DEMO_TEACHER, Role.TEACHER), ("Student One", DEMO_STUDENTS[0], Role.STUDENT), ("Student Two", DEMO_STUDENTS[1], Role.STUDENT)]
+def ensure_demo_data(db:Session, admin_email:str=DEMO_ADMIN):
+    # Keep the demo administrator separate from the production bootstrap identity.
+    demo_admin = DEMO_ADMIN if admin_email.lower()!=DEMO_ADMIN else "admin@testnow.local"
+    people=[("Local Admin", demo_admin, Role.ADMIN), ("Demo Teacher", DEMO_TEACHER, Role.TEACHER), ("Student One", DEMO_STUDENTS[0], Role.STUDENT), ("Student Two", DEMO_STUDENTS[1], Role.STUDENT)]
     users={}
     for name,email,role in people:
         user=db.query(User).filter_by(email=email).first()

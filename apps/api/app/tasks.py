@@ -35,7 +35,17 @@ def normalize_item(item:dict)->dict:
 def normalize_answer(answer,options:list[dict]):
     """Convert provider answer variants to the response shape used for scoring."""
     if not isinstance(answer,dict):return None
-    raw=answer.get("option",answer.get("value",answer.get("correct_option")))
+    raw=answer.get("options",answer.get("option",answer.get("value",answer.get("correct_option"))))
+    if isinstance(raw,list):
+        selected=[]
+        for item in raw:
+            if isinstance(item,int) and 0<=item<len(options): selected.append(item);continue
+            if isinstance(item,str):
+                needle=item.strip().lower()
+                for index,option in enumerate(options):
+                    if needle in {str(index),str(index+1),chr(65+index).lower(),str(option.get("value","")).lower()}:
+                        selected.append(index);break
+        return {"options":sorted(set(selected))} if selected else None
     if isinstance(raw,int) and 0<=raw<len(options):return {"option":raw}
     if isinstance(raw,str):
         needle=raw.strip().lower()
@@ -93,14 +103,19 @@ def extract_import(self, job_id:str):
     db:Session=SessionLocal(); job=db.get(ImportJob,job_id)
     try:
       job.status=ImportStatus.PROCESSING; job.extraction_meta={"phase":"Reading the question paper"}; db.commit(); doc=db.get(SourceDocument, job.question_document_id); raw=get(doc.object_key)
-      reader=PdfReader(BytesIO(raw)); text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages)); paper_title=infer_paper_title(reader,text,doc.filename)
+      reader=PdfReader(BytesIO(raw))
+      if len(reader.pages)>settings().max_pdf_pages: raise ValueError(f"PDF exceeds the {settings().max_pdf_pages}-page limit")
+      text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages)); paper_title=infer_paper_title(reader,text,doc.filename)
       # Full rendered pages are the VLM input. We preserve mathematical layout and diagrams,
       # while native extraction acts only as context for reading order and recovery checks.
       rendered=fitz.open(stream=raw,filetype="pdf")
       native_regions=native_image_regions(rendered)
       vision_content=[{"type":"text","text":f"Extract every question from this paper. Native layout context:\n{text[:100000]}"}]
+      rendered_bytes=0
       for page_number,page in enumerate(rendered,1):
           png=page.get_pixmap(matrix=fitz.Matrix(1.5,1.5),alpha=False).tobytes("png")
+          rendered_bytes+=len(png)
+          if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("PDF rendered pages exceed the extraction size limit")
           vision_content.append({"type":"text","text":f"Source page {page_number}"})
           vision_content.append({"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}})
       key_text=""

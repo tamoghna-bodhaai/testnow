@@ -7,13 +7,13 @@ from .security import uid
 def audit(db:Session, actor:str|None, action:str, entity_type:str, entity_id:str, data:dict|None=None):
     from .models import AuditEvent
     db.add(AuditEvent(id=uid(),actor_id=actor,action=action,entity_type=entity_type,entity_id=entity_id,data=data or {}))
-def snapshot_questions(db:Session, ids:list[str])->list[dict]:
-    found=db.query(Question).filter(Question.id.in_(ids),Question.approved_at.is_not(None)).all()
+def snapshot_questions(db:Session, ids:list[str], owner_id:str)->list[dict]:
+    found=db.query(Question).filter(Question.id.in_(ids),Question.owner_id==owner_id,Question.approved_at.is_not(None)).all()
     by_id={q.id:q for q in found}
     if len(by_id)!=len(set(ids)):raise HTTPException(422,"Every selected question must be teacher-approved")
     return [{"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":q.options,"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams} for qid in ids for q in [by_id[qid]]]
 def publish(db:Session,test:Test,actor_id:str,question_ids:list[str]):
-    content={"questions":snapshot_questions(db,question_ids),"duration_seconds":test.duration_seconds,"results_policy":test.results_policy}
+    content={"questions":snapshot_questions(db,question_ids,test.owner_id),"duration_seconds":test.duration_seconds,"results_policy":test.results_policy}
     number=(db.query(TestVersion).filter_by(test_id=test.id).count()+1); version=TestVersion(id=uid(),test_id=test.id,ordinal=number,content=content,published_at=datetime.now(timezone.utc))
     db.add(version); test.status=TestStatus.PUBLISHED; test.published_version_id=version.id; audit(db,actor_id,"test.published","test",test.id,{"version":number}); db.commit(); return version
 def ensure_live(test:Test):

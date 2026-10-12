@@ -4,9 +4,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, question_media, student_can_access, student_classes, student_tests, test_analytics as assessment_analytics
-from app.models import Attempt, Classroom, ClassMembership, Question, QuestionKind, Role, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
-from app.schemas import LoginIn, RosterUpdate
+from app.main import assigned_student_ids, create_student, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
+from app.models import AccountStatus, Attempt, Classroom, ClassMembership, Question, QuestionKind, Role, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.schemas import LoginIn, RosterUpdate, StudentCreate
+from fastapi import HTTPException
 
 def make_db():
     engine=create_engine("sqlite+pysqlite:///:memory:")
@@ -63,3 +64,36 @@ def test_seeded_local_email_addresses_are_accepted_for_login_and_rosters():
     assert LoginIn(email="student1@testnow.local",access_code="12345",role="student").email=="student1@testnow.local"
     roster=RosterUpdate(emails=["student1@testnow.local", " STUDENT2@TESTNOW.LOCAL "])
     assert roster.emails==["student1@testnow.local", "student2@testnow.local"]
+
+def test_teacher_cannot_take_over_another_teachers_student():
+    db=make_db()
+    first=User(id="teacher-1",name="First",email="first@example.com",password_hash="x",role=Role.TEACHER,status=AccountStatus.ACTIVE)
+    second=User(id="teacher-2",name="Second",email="second@example.com",password_hash="x",role=Role.TEACHER,status=AccountStatus.ACTIVE)
+    student=User(id="student",name="Original",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    first_class=Classroom(id="first-class",owner_id=first.id,name="First")
+    second_class=Classroom(id="second-class",owner_id=second.id,name="Second")
+    db.add_all([first,second,student,first_class,second_class,ClassMembership(class_id=first_class.id,student_id=student.id)]);db.commit()
+    data=StudentCreate(name="Taken over",email=student.email,access_code="12345",class_id=second_class.id)
+    try:
+        create_student(data,second,db)
+        assert False, "expected ownership conflict"
+    except HTTPException as exc:
+        assert exc.status_code==409
+    assert student.name=="Original"
+    assert not db.get(ClassMembership,{"class_id":second_class.id,"student_id":student.id})
+
+def test_expired_attempt_cannot_be_submitted():
+    db=make_db()
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=1)
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc))
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc).replace(year=2020))
+    db.add_all([student,test,version,attempt]);db.commit()
+    # Explicit enrolment keeps this test assigned even without a classroom.
+    from app.models import Enrollment
+    db.add(Enrollment(test_id=test.id,student_id=student.id));db.commit()
+    try:
+        submit(attempt.id,student,db)
+        assert False, "expected expiry conflict"
+    except HTTPException as exc:
+        assert exc.status_code==409

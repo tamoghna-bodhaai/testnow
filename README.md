@@ -13,12 +13,12 @@ TestNow is now a deployable monorepo: a Next.js assessment interface, FastAPI AP
 
 Docker Compose enables `SEED_DEMO_DATA` for local use. It creates the **Demo Physics** class and these accounts, all with access code `12345`:
 
-- `utils@bodhaai.tech` (super administrator)
+- `admin@testnow.local` (local super administrator)
 - `teacher@testnow.local`
 - `student1@testnow.local`
 - `student2@testnow.local`
 
-The seed flag defaults to `false` and must remain disabled in shared and production environments.
+The seed flag defaults to `false` and is rejected by the API in production. The real super-admin address is never seeded with a known demo code.
 
 The old `server.py`, `app.js`, and static assets are intentionally retained as the non-deployed prototype reference. They are not part of the Railway deployment.
 

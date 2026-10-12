@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     openrouter_fallback_model: str | None = None
     openrouter_timeout_seconds: int = 90
     max_upload_bytes: int = 52_428_800
+    max_pdf_pages: int = 60
+    max_rendered_pdf_bytes: int = 20_000_000
     cors_origins: str = "http://localhost:3000"
     seed_demo_data: bool = False
     super_admin_email: str = "utils@bodhaai.tech"

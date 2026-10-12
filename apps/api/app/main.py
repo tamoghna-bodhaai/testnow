@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-import csv, io, re, time
+import csv, io, re
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -11,27 +11,28 @@ from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollme
 from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import audit, ensure_live, publish, score, snapshot_questions
-from .storage import digest, get, put, signed_get
+from .storage import client as storage_client, digest, get, put, signed_get
 from .tasks import extract_import
 from .seed import ensure_demo_data
 
 app=FastAPI(title="TestNow API",version="1.0.0")
-LOGIN_ATTEMPTS:dict[str,list[float]]={}
 app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 @app.on_event("startup")
 def startup():
     # Alembic is the production migration authority; this supports a clean local first boot.
     if "localhost" in settings().database_url or settings().database_url.startswith("sqlite"):
         Base.metadata.create_all(engine)
+    production=not ("localhost" in settings().database_url or settings().database_url.startswith("sqlite"))
+    if production and settings().seed_demo_data:
+        raise RuntimeError("SEED_DEMO_DATA must be false in production")
     if settings().seed_demo_data:
         from .db import SessionLocal
         db=SessionLocal()
-        try: ensure_demo_data(db)
+        try: ensure_demo_data(db, settings().super_admin_email)
         finally: db.close()
     # The production administrator is deliberately configured, never derived from
     # a public request. Local development may use seeded demo data instead.
     configured_code=settings().super_admin_access_code
-    production=not ("localhost" in settings().database_url or settings().database_url.startswith("sqlite"))
     if production and not configured_code:
         raise RuntimeError("SUPER_ADMIN_ACCESS_CODE is required in production")
     if configured_code and not re.fullmatch(r"\d{5}",configured_code):
@@ -51,19 +52,35 @@ def startup():
 @app.get("/health")
 def health(db:Session=Depends(get_db)): db.execute(__import__("sqlalchemy").text("SELECT 1"));return {"status":"ok"}
 @app.get("/ready")
-def ready(db:Session=Depends(get_db)): db.execute(__import__("sqlalchemy").text("SELECT 1"));return {"status":"ready"}
+def ready(db:Session=Depends(get_db)):
+    """Readiness covers every required internal dependency, not just Postgres."""
+    from redis import Redis
+    db.execute(__import__("sqlalchemy").text("SELECT 1"))
+    try:
+        Redis.from_url(settings().redis_url, socket_connect_timeout=2, socket_timeout=2).ping()
+        storage_client().head_bucket(Bucket=settings().s3_bucket)
+    except Exception as exc:
+        raise HTTPException(503,"A required service is unavailable") from exc
+    return {"status":"ready"}
 
 @app.post("/auth/login")
 def login(data:LoginIn,response:Response,db:Session=Depends(get_db)):
-    now=time.monotonic(); attempts=LOGIN_ATTEMPTS.setdefault(data.email.lower(),[]);attempts[:]=[stamp for stamp in attempts if now-stamp<300]
-    if len(attempts)>=10:raise HTTPException(429,"Too many sign-in attempts. Try again later")
+    from redis import Redis
+    key=f"login-attempts:{data.email.lower()}"
+    try:
+        limiter=Redis.from_url(settings().redis_url, socket_connect_timeout=2, socket_timeout=2)
+        if int(limiter.get(key) or 0)>=10:raise HTTPException(429,"Too many sign-in attempts. Try again later")
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(503,"Sign-in is temporarily unavailable") from exc
     user=db.query(User).filter_by(email=data.email.lower()).first()
     # The super-admin intentionally uses the teacher-facing login choice so the
     # privileged portal is not discoverable from the public interface.
     role_matches=bool(user) and (user.role==data.role or (data.role==Role.TEACHER and user.role==Role.ADMIN))
     if not user or not role_matches or user.status!=AccountStatus.ACTIVE or not user.access_code_hash or not verify_password(data.access_code,user.access_code_hash):
-        attempts.append(now);raise HTTPException(401,"Invalid email, role, or access code")
-    LOGIN_ATTEMPTS.pop(data.email.lower(),None);user.last_login_at=datetime.now(timezone.utc);new_session(response,db,user);db.commit();return user_public(user)
+        attempts=limiter.incr(key)
+        if attempts==1:limiter.expire(key,300)
+        raise HTTPException(429 if attempts>10 else 401,"Too many sign-in attempts. Try again later" if attempts>10 else "Invalid email, role, or access code")
+    limiter.delete(key);user.last_login_at=datetime.now(timezone.utc);new_session(response,db,user);db.commit();return user_public(user)
 @app.post("/auth/logout",status_code=204)
 def logout(request:Request,response:Response,user:User=Depends(current_user),db:Session=Depends(get_db)):
     import hashlib
@@ -128,7 +145,11 @@ def create_student(data:StudentCreate,user:User=Depends(require(Role.TEACHER)),d
     classroom=classroom_for_owner(data.class_id,user,db);student=db.query(User).filter_by(email=data.email).first();created=False
     if student and student.role!=Role.STUDENT:raise HTTPException(409,"Email belongs to a non-student account")
     if not student:
-        student=User(id=uid(),name=data.name.strip(),email=data.email,password_hash="",role=Role.STUDENT,status=AccountStatus.ACTIVE,is_verified=True);set_access_code(student,data.access_code,db);db.add(student);created=True
+        student=User(id=uid(),name=data.name.strip(),email=data.email,password_hash="",role=Role.STUDENT,status=AccountStatus.ACTIVE,is_verified=True);set_access_code(student,data.access_code,db);db.add(student);db.flush();created=True
+    elif not teacher_owns_student(user,student.id,db):
+        # A global student can be shared only through the dedicated membership
+        # endpoint; a new teacher must never take over their profile or code.
+        raise HTTPException(409,"Student already exists. Add an existing student to the class without changing account details.")
     else:
         student.name=data.name.strip();set_access_code(student,data.access_code,db)
     if not db.get(ClassMembership,{"class_id":classroom.id,"student_id":student.id}):db.add(ClassMembership(class_id=classroom.id,student_id=student.id))
@@ -207,6 +228,7 @@ def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.T
     # imports may have omitted it or stored it on a 0-100 scale.
     q.confidence=min(1.0,max(0.0,float(q.confidence))) if q.confidence is not None else 0.0
     q.approved_at=datetime.now(timezone.utc)
+    db.flush()
     pending=db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first()
     if not pending: job.status=ImportStatus.APPROVED; job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete"}
     db.commit();return question_view(q)
@@ -222,7 +244,17 @@ def normalized_options(options):
 def canonical_answer(answer,options):
     """Store one stable answer format that matches the exam client's response shape."""
     if not isinstance(answer,dict):raise HTTPException(422,"Answer key must be an object")
-    raw=answer.get("option",answer.get("value",answer.get("correct_option")))
+    raw=answer.get("options",answer.get("option",answer.get("value",answer.get("correct_option"))))
+    if isinstance(raw,list):
+        selected=[]
+        for item in raw:
+            if isinstance(item,int) and 0<=item<len(options or []): selected.append(item);continue
+            if isinstance(item,str):
+                for index,option in enumerate(normalized_options(options)):
+                    if item.strip().lower() in {str(index),str(index+1),chr(65+index).lower(),option["value"].lower()}:
+                        selected.append(index);break
+        if selected:return {"options":sorted(set(selected))}
+        raise HTTPException(422,"Choose one or more valid options")
     if isinstance(raw,int) and 0<=raw<len(options or []):return {"option":raw}
     if isinstance(raw,str):
         for index,option in enumerate(normalized_options(options)):
@@ -326,7 +358,9 @@ async def import_class_students(class_id:str,file:UploadFile=File(...),user:User
         if student and student.role!=Role.STUDENT:
             result["errors"].append({"row":number,"email":email,"error":"Email belongs to a non-student account"});continue
         if not student:
-            student=User(id=uid(),name=name,email=email.lower(),password_hash="",role=Role.STUDENT,status=AccountStatus.ACTIVE,is_verified=True);set_access_code(student,code,db);db.add(student);result["created"]+=1
+            student=User(id=uid(),name=name,email=email.lower(),password_hash="",role=Role.STUDENT,status=AccountStatus.ACTIVE,is_verified=True);set_access_code(student,code,db);db.add(student);db.flush();result["created"]+=1
+        elif not teacher_owns_student(user,student.id,db):
+            result["errors"].append({"row":number,"email":email,"error":"Student belongs to another teacher; add membership without changing account details"});continue
         else:
             student.name=name;set_access_code(student,code,db);result["updated"]+=1
         if not db.get(ClassMembership,{"class_id":classroom.id,"student_id":student.id}):db.add(ClassMembership(class_id=classroom.id,student_id=student.id));result["linked"]+=1
@@ -336,7 +370,7 @@ async def import_class_students(class_id:str,file:UploadFile=File(...),user:User
 def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     if data.closes_at and data.opens_at and data.closes_at<=data.opens_at:raise HTTPException(422,"Closing time must be after opening time")
     test=Test(id=uid(),owner_id=user.id,title=data.title,subject=data.subject,duration_seconds=data.duration_seconds,opens_at=data.opens_at,closes_at=data.closes_at,max_attempts=data.max_attempts,results_policy=data.results_policy);db.add(test);db.flush()
-    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":snapshot_questions(db,data.question_ids),"duration_seconds":data.duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id);db.commit();return test_view(test,db)
+    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":snapshot_questions(db,data.question_ids,user.id),"duration_seconds":data.duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id);db.commit();return test_view(test,db)
 @app.get("/tests")
 def list_tests(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):return [test_view(t,db) for t in db.query(Test).filter_by(owner_id=user.id).order_by(Test.created_at.desc())]
 @app.get("/tests/{test_id}")
@@ -353,7 +387,8 @@ def publish_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN))
 @app.post("/tests/{test_id}/enrolments",status_code=201)
 def enrol(test_id:str,data:EnrolIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     t=db.get(Test,test_id);student=db.query(User).filter_by(email=data.email.lower(),role=Role.STUDENT).first()
-    if not t or t.owner_id!=user.id or not student:raise HTTPException(404,"Test or student not found")
+    if not t or (t.owner_id!=user.id and user.role!=Role.ADMIN) or not student:raise HTTPException(404,"Test or student not found")
+    if user.role==Role.TEACHER and not teacher_owns_student(user,student.id,db):raise HTTPException(404,"Test or student not found")
     if not db.get(Enrollment,{"test_id":t.id,"student_id":student.id}):db.add(Enrollment(test_id=t.id,student_id=student.id));audit(db,user.id,"student.enrolled","test",t.id,{"student_id":student.id});db.commit()
     return {"ok":True}
 def test_for_owner(test_id:str,user:User,db:Session)->Test:
@@ -368,8 +403,8 @@ def assigned_student_ids(test:Test,db:Session)->set[str]:
     class_ids=[row.class_id for row in db.query(TestClassAssignment).filter_by(test_id=test.id)]
     if class_ids:ids.update(row.student_id for row in db.query(ClassMembership).filter(ClassMembership.class_id.in_(class_ids)))
     return ids
-def student_can_access(test:Test,student_id:str,db:Session)->bool:
-    return student_id in assigned_student_ids(test,db)
+def student_can_access(test:Test|None,student_id:str,db:Session)->bool:
+    return bool(test) and student_id in assigned_student_ids(test,db)
 @app.put("/tests/{test_id}/classes")
 def replace_test_classes(test_id:str,data:TestClassAssignmentsIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     test=test_for_owner(test_id,user,db); class_ids=list(dict.fromkeys(data.class_ids))
@@ -426,7 +461,12 @@ def student_classes(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(
 def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     test=db.get(Test,test_id)
     if not test or not student_can_access(test,user.id,db):raise HTTPException(403,"You are not assigned to this assessment")
-    ensure_live(test); active=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id,submitted_at=None).first()
+    ensure_live(test)
+    # Serialize starts for this student/test on Postgres so concurrent browser
+    # requests cannot both pass the max-attempt count.
+    if db.bind and db.bind.dialect.name=="postgresql":
+        db.execute(__import__("sqlalchemy").text("SELECT pg_advisory_xact_lock(hashtext(:key))"),{"key":f"attempt:{test_id}:{user.id}"})
+    active=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id,submitted_at=None).first()
     if active:return attempt_view(active,db)
     prior=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id).count()
     if prior>=test.max_attempts:raise HTTPException(409,"Attempt limit reached")
@@ -435,12 +475,12 @@ def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessio
 @app.get("/attempts/{attempt_id}")
 def get_attempt(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
-    if not a or a.student_id!=user.id:raise HTTPException(404,"Attempt not found")
+    if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
     return attempt_view(a,db)
 @app.put("/attempts/{attempt_id}/responses/{question_id}")
 def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
-    if not a or a.student_id!=user.id or a.submitted_at:raise HTTPException(409,"Attempt cannot be changed")
+    if not a or a.student_id!=user.id or a.submitted_at or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(409,"Attempt cannot be changed")
     if datetime.now(timezone.utc)>=a.ends_at:raise HTTPException(409,"Attempt has expired")
     content=db.get(TestVersion,a.version_id).content
     if question_id not in {q["id"] for q in content["questions"]}:raise HTTPException(422,"Question is not part of this attempt")
@@ -452,8 +492,9 @@ def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depen
 @app.post("/attempts/{attempt_id}/submit")
 def submit(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
-    if not a or a.student_id!=user.id:raise HTTPException(404,"Attempt not found")
+    if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
     if a.submitted_at:return attempt_view(a,db)
+    if datetime.now(timezone.utc)>=a.ends_at:raise HTTPException(409,"Attempt has expired and cannot be submitted")
     version=db.get(TestVersion,a.version_id); responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};a.score,_=score(version.content,responses);a.submitted_at=datetime.now(timezone.utc);audit(db,user.id,"attempt.submitted","attempt",a.id);db.commit();return attempt_view(a,db)
 @app.get("/results/{attempt_id}")
 def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
