@@ -369,8 +369,9 @@ async def import_class_students(class_id:str,file:UploadFile=File(...),user:User
 @app.post("/tests",status_code=201)
 def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     if data.closes_at and data.opens_at and data.closes_at<=data.opens_at:raise HTTPException(422,"Closing time must be after opening time")
-    test=Test(id=uid(),owner_id=user.id,title=data.title,subject=data.subject,duration_seconds=data.duration_seconds,opens_at=data.opens_at,closes_at=data.closes_at,max_attempts=data.max_attempts,results_policy=data.results_policy);db.add(test);db.flush()
-    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":snapshot_questions(db,data.question_ids,user.id),"duration_seconds":data.duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id);db.commit();return test_view(test,db)
+    duration_seconds=data.duration_minutes*60
+    test=Test(id=uid(),owner_id=user.id,title=data.title,subject=data.subject,duration_seconds=duration_seconds,opens_at=data.opens_at,closes_at=data.closes_at,max_attempts=data.max_attempts,results_policy=data.results_policy);db.add(test);db.flush()
+    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":snapshot_questions(db,data.question_ids,user.id),"duration_seconds":duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id);db.commit();return test_view(test,db)
 @app.get("/tests")
 def list_tests(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):return [test_view(t,db) for t in db.query(Test).filter_by(owner_id=user.id).order_by(Test.created_at.desc())]
 @app.get("/tests/{test_id}")
