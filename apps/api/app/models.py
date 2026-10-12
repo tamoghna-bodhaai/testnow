@@ -8,7 +8,8 @@ class Role(str, enum.Enum): ADMIN="admin"; TEACHER="teacher"; STUDENT="student"
 class AccountStatus(str, enum.Enum): PENDING_CODE="pending_code"; ACTIVE="active"; SUSPENDED="suspended"
 class ImportStatus(str, enum.Enum): UPLOADED="uploaded"; PROCESSING="processing"; REVIEW="review"; FAILED="failed"; APPROVED="approved"
 class TestStatus(str, enum.Enum): DRAFT="draft"; PUBLISHED="published"; ARCHIVED="archived"
-class QuestionKind(str, enum.Enum): SINGLE="single_choice"; MULTIPLE="multiple_choice"; NUMERICAL="numerical"; INTEGER="integer"; ASSERTION="assertion_reason"; SUBJECTIVE="subjective"
+class QuestionKind(str, enum.Enum): SINGLE="single_choice"; MULTIPLE="multiple_choice"; NUMERICAL="numerical"; INTEGER="integer"; MATRIX="matrix_match"; ASSERTION="assertion_reason"; SUBJECTIVE="subjective"
+class QuestionScope(str, enum.Enum): PRIVATE="private"; GLOBAL="global"
 
 class Timestamped:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -47,10 +48,28 @@ class ImportJob(Timestamped, Base):
     answer_document_id: Mapped[str | None] = mapped_column(ForeignKey("source_documents.id"))
     status: Mapped[ImportStatus] = mapped_column(Enum(ImportStatus), default=ImportStatus.UPLOADED)
     error: Mapped[str | None] = mapped_column(Text); extraction_meta: Mapped[dict] = mapped_column(JSON, default=dict)
+class QuestionBank(Timestamped, Base):
+    __tablename__="question_banks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    slug: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    exam_code: Mapped[str] = mapped_column(String(80), index=True)
+    is_global: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+class TaxonomyNode(Timestamped, Base):
+    __tablename__="taxonomy_nodes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    bank_id: Mapped[str] = mapped_column(ForeignKey("question_banks.id", ondelete="CASCADE"), index=True)
+    parent_id: Mapped[str | None] = mapped_column(ForeignKey("taxonomy_nodes.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    name: Mapped[str] = mapped_column(String(200))
+    code: Mapped[str | None] = mapped_column(String(120))
+    __table_args__=(UniqueConstraint("bank_id", "parent_id", "kind", "name", name="uq_taxonomy_node_path"),)
 class Question(Timestamped, Base):
     __tablename__="questions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    bank_id: Mapped[str | None] = mapped_column(ForeignKey("question_banks.id"), index=True)
+    scope: Mapped[QuestionScope] = mapped_column(Enum(QuestionScope), default=QuestionScope.PRIVATE, nullable=False)
     import_job_id: Mapped[str | None] = mapped_column(ForeignKey("import_jobs.id"), index=True)
     source_number: Mapped[str | None] = mapped_column(String(32))
     kind: Mapped[QuestionKind] = mapped_column(Enum(QuestionKind))
@@ -58,7 +77,12 @@ class Question(Timestamped, Base):
     answer: Mapped[dict | None] = mapped_column(JSON); solution_markdown: Mapped[str | None] = mapped_column(Text)
     scoring: Mapped[dict] = mapped_column(JSON, default=lambda:{"correct":4,"incorrect":-1,"unanswered":0})
     diagrams: Mapped[list] = mapped_column(JSON, default=list); source_spans: Mapped[list] = mapped_column(JSON, default=list)
+    interaction: Mapped[dict] = mapped_column(JSON, default=dict)
     confidence: Mapped[float | None] = mapped_column(); approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+class QuestionTaxonomy(Base):
+    __tablename__="question_taxonomies"
+    question_id: Mapped[str] = mapped_column(ForeignKey("questions.id", ondelete="CASCADE"), primary_key=True)
+    taxonomy_node_id: Mapped[str] = mapped_column(ForeignKey("taxonomy_nodes.id", ondelete="CASCADE"), primary_key=True)
 class Test(Timestamped, Base):
     __tablename__="tests"
     id: Mapped[str] = mapped_column(String(36), primary_key=True); owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)

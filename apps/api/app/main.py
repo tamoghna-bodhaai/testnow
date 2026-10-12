@@ -7,7 +7,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
-from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, Response as AnswerResponse, Role, SourceDocument, Test, TestClassAssignment, TestStatus, TestVersion, User
+from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
 from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import audit, ensure_live, publish, score, snapshot_questions
@@ -266,15 +266,23 @@ def canonical_answer(answer,options):
 def question_view(q:Question):
     confidence=q.confidence
     if confidence is not None: confidence=min(1.0,max(0.0,float(confidence)))
-    return {"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":normalized_options(q.options),"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"confidence":confidence,"approved":bool(q.approved_at)}
+    return {"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":normalized_options(q.options),"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":q.interaction or {},"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":[]}
 @app.get("/questions")
 def questions(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
-    return [question_view(q) for q in db.query(Question).filter_by(owner_id=user.id).order_by(Question.created_at.desc())]
+    rows=db.query(Question).filter((Question.owner_id==user.id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
+    return [question_view(q) for q in rows]
+@app.get("/question-banks")
+def question_banks(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    return [{"id":b.id,"slug":b.slug,"name":b.name,"exam_code":b.exam_code,"is_global":b.is_global,"question_count":db.query(Question).filter_by(bank_id=b.id,scope=QuestionScope.GLOBAL).filter(Question.approved_at.is_not(None)).count()} for b in db.query(QuestionBank).filter_by(is_global=True).order_by(QuestionBank.name)]
+@app.get("/question-banks/{bank_id}/taxonomy")
+def bank_taxonomy(bank_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    if not db.get(QuestionBank,bank_id):raise HTTPException(404,"Question bank not found")
+    return [{"id":n.id,"parent_id":n.parent_id,"kind":n.kind,"name":n.name,"code":n.code} for n in db.query(TaxonomyNode).filter_by(bank_id=bank_id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
 @app.get("/media/questions/{question_id}/{index}")
 def question_media(question_id:str,index:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
     q=db.get(Question,question_id)
     if not q or index<0 or index>=len(q.diagrams):raise HTTPException(404,"Media not found")
-    allowed=q.owner_id==user.id or user.role==Role.ADMIN
+    allowed=q.owner_id==user.id or q.scope==QuestionScope.GLOBAL or user.role==Role.ADMIN
     if not allowed and user.role==Role.STUDENT:
         for a in db.query(Attempt).filter_by(student_id=user.id).all():
             version=db.get(TestVersion,a.version_id)
