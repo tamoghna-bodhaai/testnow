@@ -1,7 +1,7 @@
 from datetime import datetime
 import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from .models import QuestionKind, Role
+from .models import AccountStatus, QuestionKind, Role
 
 class APIModel(BaseModel): model_config=ConfigDict(from_attributes=True)
 EMAIL_PATTERN=re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -18,17 +18,10 @@ def normalise_email(value:str)->str:
         raise ValueError("Enter a valid email address")
     return email
 
-class RegisterIn(BaseModel):
-    name:str=Field(min_length=2,max_length=160)
-    email:str
-    password:str=Field(min_length=12,max_length=128)
-    role:Role
-
-    _normalise_email=field_validator("email")(normalise_email)
-
 class LoginIn(BaseModel):
     email:str
-    password:str
+    access_code:str=Field(pattern=r"^\d{5}$")
+    role:Role
 
     _normalise_email=field_validator("email")(normalise_email)
 class QuestionIn(BaseModel):
@@ -53,3 +46,23 @@ class RosterUpdate(BaseModel):
         return [normalise_email(email) for email in emails]
 class TestClassAssignmentsIn(BaseModel):
     class_ids:list[str]=Field(default_factory=list,max_length=100)
+class TeacherCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
+    email:str
+    access_code:str=Field(pattern=r"^\d{5}$")
+    _normalise_email=field_validator("email")(normalise_email)
+class TeacherUpdate(BaseModel):
+    name:str|None=Field(default=None,min_length=2,max_length=160)
+    email:str|None=None
+    access_code:str|None=Field(default=None,pattern=r"^\d{5}$")
+    status:AccountStatus|None=None
+    _normalise_email=field_validator("email")(normalise_email)
+class StudentCreate(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
+    email:str
+    access_code:str=Field(pattern=r"^\d{5}$")
+    class_id:str
+    _normalise_email=field_validator("email")(normalise_email)
+class StudentUpdate(BaseModel):
+    name:str|None=Field(default=None,min_length=2,max_length=160)
+    access_code:str|None=Field(default=None,pattern=r"^\d{5}$")

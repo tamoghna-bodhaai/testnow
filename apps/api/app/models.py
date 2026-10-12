@@ -5,6 +5,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
 class Role(str, enum.Enum): ADMIN="admin"; TEACHER="teacher"; STUDENT="student"
+class AccountStatus(str, enum.Enum): PENDING_CODE="pending_code"; ACTIVE="active"; SUSPENDED="suspended"
 class ImportStatus(str, enum.Enum): UPLOADED="uploaded"; PROCESSING="processing"; REVIEW="review"; FAILED="failed"; APPROVED="approved"
 class TestStatus(str, enum.Enum): DRAFT="draft"; PUBLISHED="published"; ARCHIVED="archived"
 class QuestionKind(str, enum.Enum): SINGLE="single_choice"; MULTIPLE="multiple_choice"; NUMERICAL="numerical"; INTEGER="integer"; ASSERTION="assertion_reason"; SUBJECTIVE="subjective"
@@ -17,8 +18,14 @@ class User(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(160))
-    password_hash: Mapped[str] = mapped_column(String(255))
+    # Retained temporarily for compatibility with the initial migration. New logins
+    # never read this column; access codes are Argon2 hashes just like passwords.
+    password_hash: Mapped[str] = mapped_column(String(255), default="")
+    access_code_hash: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[Role] = mapped_column(Enum(Role))
+    status: Mapped[AccountStatus] = mapped_column(Enum(AccountStatus), default=AccountStatus.PENDING_CODE, nullable=False)
+    access_code_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
 class Session(Timestamped, Base):
     __tablename__="sessions"

@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-import re
+import csv, io, re, time
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -7,15 +7,16 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
-from .models import Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, Response as AnswerResponse, Role, SourceDocument, Test, TestClassAssignment, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, RegisterIn, ResponseIn, RosterUpdate, TestClassAssignmentsIn, TestCreate
-from .security import COOKIE, current_user, hash_password, new_session, require, uid, verify_password
+from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, Response as AnswerResponse, Role, SourceDocument, Test, TestClassAssignment, TestStatus, TestVersion, User
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
+from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import audit, ensure_live, publish, score, snapshot_questions
 from .storage import digest, get, put, signed_get
 from .tasks import extract_import
 from .seed import ensure_demo_data
 
 app=FastAPI(title="TestNow API",version="1.0.0")
+LOGIN_ATTEMPTS:dict[str,list[float]]={}
 app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 @app.on_event("startup")
 def startup():
@@ -27,20 +28,39 @@ def startup():
         db=SessionLocal()
         try: ensure_demo_data(db)
         finally: db.close()
+    # The production administrator is deliberately configured, never derived from
+    # a public request. Local development may use seeded demo data instead.
+    configured_code=settings().super_admin_access_code
+    production=not ("localhost" in settings().database_url or settings().database_url.startswith("sqlite"))
+    if production and not configured_code:
+        raise RuntimeError("SUPER_ADMIN_ACCESS_CODE is required in production")
+    if configured_code and not re.fullmatch(r"\d{5}",configured_code):
+        raise RuntimeError("SUPER_ADMIN_ACCESS_CODE must be exactly five digits")
+    if configured_code:
+        from .db import SessionLocal
+        db=SessionLocal()
+        try:
+            email=settings().super_admin_email.lower()
+            admin=db.query(User).filter_by(email=email).first()
+            if not admin:
+                admin=User(id=uid(),name="Super Admin",email=email,password_hash="",access_code_hash=hash_password(configured_code),role=Role.ADMIN,status=AccountStatus.ACTIVE,is_verified=True,access_code_issued_at=datetime.now(timezone.utc))
+                db.add(admin);db.commit()
+            elif admin.role!=Role.ADMIN or admin.status!=AccountStatus.ACTIVE or not admin.access_code_hash:
+                admin.role=Role.ADMIN;admin.status=AccountStatus.ACTIVE;admin.access_code_hash=hash_password(configured_code);admin.access_code_issued_at=datetime.now(timezone.utc);db.commit()
+        finally: db.close()
 @app.get("/health")
 def health(db:Session=Depends(get_db)): db.execute(__import__("sqlalchemy").text("SELECT 1"));return {"status":"ok"}
 @app.get("/ready")
 def ready(db:Session=Depends(get_db)): db.execute(__import__("sqlalchemy").text("SELECT 1"));return {"status":"ready"}
 
-@app.post("/auth/register",status_code=201)
-def register(data:RegisterIn,response:Response,db:Session=Depends(get_db)):
-    if db.query(User).filter_by(email=data.email.lower()).first():raise HTTPException(409,"Email already registered")
-    user=User(id=uid(),name=data.name,email=data.email.lower(),password_hash=hash_password(data.password),role=data.role,is_verified=False);db.add(user);db.commit();new_session(response,db,user);audit(db,user.id,"user.registered","user",user.id);db.commit();return user_public(user)
 @app.post("/auth/login")
 def login(data:LoginIn,response:Response,db:Session=Depends(get_db)):
+    now=time.monotonic(); attempts=LOGIN_ATTEMPTS.setdefault(data.email.lower(),[]);attempts[:]=[stamp for stamp in attempts if now-stamp<300]
+    if len(attempts)>=10:raise HTTPException(429,"Too many sign-in attempts. Try again later")
     user=db.query(User).filter_by(email=data.email.lower()).first()
-    if not user or not verify_password(data.password,user.password_hash):raise HTTPException(401,"Invalid email or password")
-    new_session(response,db,user);return user_public(user)
+    if not user or user.role!=data.role or user.status!=AccountStatus.ACTIVE or not user.access_code_hash or not verify_password(data.access_code,user.access_code_hash):
+        attempts.append(now);raise HTTPException(401,"Invalid email, role, or access code")
+    LOGIN_ATTEMPTS.pop(data.email.lower(),None);user.last_login_at=datetime.now(timezone.utc);new_session(response,db,user);db.commit();return user_public(user)
 @app.post("/auth/logout",status_code=204)
 def logout(request:Request,response:Response,user:User=Depends(current_user),db:Session=Depends(get_db)):
     import hashlib
@@ -50,7 +70,81 @@ def logout(request:Request,response:Response,user:User=Depends(current_user),db:
     response.delete_cookie(COOKIE,path="/")
 @app.get("/auth/me")
 def me(user:User=Depends(current_user)):return user_public(user)
-def user_public(u:User):return {"id":u.id,"name":u.name,"email":u.email,"role":u.role.value,"is_verified":u.is_verified}
+def user_public(u:User):return {"id":u.id,"name":u.name,"email":u.email,"role":u.role.value,"status":u.status.value,"is_verified":u.is_verified,"last_login_at":u.last_login_at}
+
+def set_access_code(user:User, code:str, db:Session):
+    user.access_code_hash=hash_password(code);user.access_code_issued_at=datetime.now(timezone.utc);user.status=AccountStatus.ACTIVE;revoke_sessions(db,user.id)
+
+def teacher_view(teacher:User,db:Session):
+    classes=db.query(Classroom).filter_by(owner_id=teacher.id).all();class_ids=[row.id for row in classes]
+    student_ids={row.student_id for row in db.query(ClassMembership).filter(ClassMembership.class_id.in_(class_ids)).all()} if class_ids else set()
+    tests=db.query(Test).filter_by(owner_id=teacher.id).all();test_ids=[row.id for row in tests]
+    attempts=db.query(Attempt).filter(Attempt.test_id.in_(test_ids)).all() if test_ids else []
+    return {**user_public(teacher),"batch_count":len(classes),"student_count":len(student_ids),"test_count":len(tests),"attempt_count":len(attempts),"submitted_count":sum(1 for row in attempts if row.submitted_at)}
+
+@app.get("/admin/dashboard")
+def admin_dashboard(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    teachers=db.query(User).filter_by(role=Role.TEACHER).order_by(User.created_at.desc()).all()
+    return {"summary":{"teachers":len(teachers),"active_teachers":sum(1 for teacher in teachers if teacher.status==AccountStatus.ACTIVE),"suspended_teachers":sum(1 for teacher in teachers if teacher.status==AccountStatus.SUSPENDED),"students":db.query(User).filter_by(role=Role.STUDENT).count()},"teachers":[teacher_view(teacher,db) for teacher in teachers]}
+
+@app.get("/admin/teachers")
+def admin_teachers(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    return [teacher_view(teacher,db) for teacher in db.query(User).filter_by(role=Role.TEACHER).order_by(User.created_at.desc())]
+
+@app.post("/admin/teachers",status_code=201)
+def create_teacher(data:TeacherCreate,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    if db.query(User).filter_by(email=data.email).first():raise HTTPException(409,"Email already belongs to an account")
+    teacher=User(id=uid(),name=data.name.strip(),email=data.email,password_hash="",role=Role.TEACHER,status=AccountStatus.ACTIVE,is_verified=True)
+    set_access_code(teacher,data.access_code,db);db.add(teacher);audit(db,user.id,"teacher.created","user",teacher.id);db.commit();return teacher_view(teacher,db)
+
+@app.put("/admin/teachers/{teacher_id}")
+def update_teacher(teacher_id:str,data:TeacherUpdate,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    teacher=db.get(User,teacher_id)
+    if not teacher or teacher.role!=Role.TEACHER:raise HTTPException(404,"Teacher not found")
+    if data.email and data.email!=teacher.email:
+        if db.query(User).filter(User.email==data.email,User.id!=teacher.id).first():raise HTTPException(409,"Email already belongs to an account")
+        teacher.email=data.email
+    if data.name:teacher.name=data.name.strip()
+    if data.status:
+        if data.status==AccountStatus.PENDING_CODE:raise HTTPException(422,"Teachers must be active or suspended")
+        teacher.status=data.status
+        if data.status==AccountStatus.SUSPENDED:revoke_sessions(db,teacher.id)
+    if data.access_code:set_access_code(teacher,data.access_code,db)
+    audit(db,user.id,"teacher.updated","user",teacher.id,{"status":teacher.status.value});db.commit();return teacher_view(teacher,db)
+
+def teacher_owns_student(teacher:User,student_id:str,db:Session)->bool:
+    return db.query(ClassMembership).join(Classroom,ClassMembership.class_id==Classroom.id).filter(Classroom.owner_id==teacher.id,ClassMembership.student_id==student_id).first() is not None
+
+@app.get("/students")
+def list_students(user:User=Depends(require(Role.TEACHER)),db:Session=Depends(get_db)):
+    rows=db.query(User).join(ClassMembership,User.id==ClassMembership.student_id).join(Classroom,ClassMembership.class_id==Classroom.id).filter(Classroom.owner_id==user.id,User.role==Role.STUDENT).distinct().order_by(User.name).all()
+    return [user_public(row) for row in rows]
+
+@app.post("/students",status_code=201)
+def create_student(data:StudentCreate,user:User=Depends(require(Role.TEACHER)),db:Session=Depends(get_db)):
+    classroom=classroom_for_owner(data.class_id,user,db);student=db.query(User).filter_by(email=data.email).first();created=False
+    if student and student.role!=Role.STUDENT:raise HTTPException(409,"Email belongs to a non-student account")
+    if not student:
+        student=User(id=uid(),name=data.name.strip(),email=data.email,password_hash="",role=Role.STUDENT,status=AccountStatus.ACTIVE,is_verified=True);set_access_code(student,data.access_code,db);db.add(student);created=True
+    else:
+        student.name=data.name.strip();set_access_code(student,data.access_code,db)
+    if not db.get(ClassMembership,{"class_id":classroom.id,"student_id":student.id}):db.add(ClassMembership(class_id=classroom.id,student_id=student.id))
+    audit(db,user.id,"student.created" if created else "student.updated","user",student.id,{"class_id":classroom.id});db.commit();return {"student":user_public(student),"created":created}
+
+@app.put("/students/{student_id}")
+def update_student(student_id:str,data:StudentUpdate,user:User=Depends(require(Role.TEACHER)),db:Session=Depends(get_db)):
+    student=db.get(User,student_id)
+    if not student or student.role!=Role.STUDENT or not teacher_owns_student(user,student_id,db):raise HTTPException(404,"Student not found")
+    if data.name:student.name=data.name.strip()
+    if data.access_code:set_access_code(student,data.access_code,db)
+    audit(db,user.id,"student.updated","user",student.id);db.commit();return user_public(student)
+
+@app.delete("/students/{student_id}",status_code=204)
+def delete_student(student_id:str,user:User=Depends(require(Role.TEACHER)),db:Session=Depends(get_db)):
+    student=db.get(User,student_id)
+    if not student or student.role!=Role.STUDENT or not teacher_owns_student(user,student_id,db):raise HTTPException(404,"Student not found")
+    if db.query(ClassMembership).filter_by(student_id=student.id).count() or db.query(Attempt).filter_by(student_id=student.id).count():raise HTTPException(409,"Remove every batch membership and retain students with assessment history")
+    db.delete(student);audit(db,user.id,"student.deleted","user",student_id);db.commit()
 
 async def store_upload(file:UploadFile,user:User,db:Session)->SourceDocument:
     if file.content_type!="application/pdf":raise HTTPException(415,"Only PDF uploads are accepted")
@@ -205,7 +299,35 @@ def add_class_members(class_id:str,data:RosterUpdate,user:User=Depends(require(R
 def remove_class_member(class_id:str,student_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     classroom=classroom_for_owner(class_id,user,db);membership=db.get(ClassMembership,{"class_id":classroom.id,"student_id":student_id})
     if not membership:raise HTTPException(404,"Class member not found")
-    db.delete(membership);audit(db,user.id,"class.member_removed","class",classroom.id,{"student_id":student_id});db.commit()
+    db.delete(membership);db.flush();student=db.get(User,student_id)
+    deleted=False
+    if student and student.role==Role.STUDENT and not db.query(ClassMembership).filter_by(student_id=student_id).count() and not db.query(Attempt).filter_by(student_id=student_id).count():
+        db.delete(student);deleted=True
+    audit(db,user.id,"class.member_removed","class",classroom.id,{"student_id":student_id,"student_deleted":deleted});db.commit()
+
+@app.post("/classes/{class_id}/students/import")
+async def import_class_students(class_id:str,file:UploadFile=File(...),user:User=Depends(require(Role.TEACHER)),db:Session=Depends(get_db)):
+    classroom=classroom_for_owner(class_id,user,db)
+    if not (file.filename or "").lower().endswith(".csv"):raise HTTPException(415,"Upload a CSV file")
+    try:
+        rows=list(csv.DictReader(io.StringIO((await file.read()).decode("utf-8-sig"))))
+    except UnicodeDecodeError:raise HTTPException(422,"CSV must be UTF-8 encoded")
+    if not rows or not {"name","email","access_code"}.issubset({str(key).strip().lower() for key in (rows[0].keys() if rows else [])}):raise HTTPException(422,"CSV headers must be name,email,access_code")
+    result={"created":0,"updated":0,"linked":0,"errors":[]};seen=set()
+    for number,row in enumerate(rows,start=2):
+        normalized={str(key).strip().lower():str(value or "").strip() for key,value in row.items()}
+        name,email,code=normalized.get("name",""),normalized.get("email",""),normalized.get("access_code","")
+        if not name or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",email) or not re.fullmatch(r"\d{5}",code) or email.lower() in seen:
+            result["errors"].append({"row":number,"email":email or None,"error":"Expected unique name, valid email, and 5-digit access code"});continue
+        seen.add(email.lower());student=db.query(User).filter_by(email=email.lower()).first()
+        if student and student.role!=Role.STUDENT:
+            result["errors"].append({"row":number,"email":email,"error":"Email belongs to a non-student account"});continue
+        if not student:
+            student=User(id=uid(),name=name,email=email.lower(),password_hash="",role=Role.STUDENT,status=AccountStatus.ACTIVE,is_verified=True);set_access_code(student,code,db);db.add(student);result["created"]+=1
+        else:
+            student.name=name;set_access_code(student,code,db);result["updated"]+=1
+        if not db.get(ClassMembership,{"class_id":classroom.id,"student_id":student.id}):db.add(ClassMembership(class_id=classroom.id,student_id=student.id));result["linked"]+=1
+    audit(db,user.id,"class.students_imported","class",classroom.id,result);db.commit();return result
 
 @app.post("/tests",status_code=201)
 def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):

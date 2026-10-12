@@ -5,7 +5,7 @@ from argon2 import PasswordHasher
 from sqlalchemy.orm import Session
 from .db import get_db
 from .config import settings
-from .models import Role, Session as UserSession, User
+from .models import AccountStatus, Role, Session as UserSession, User
 
 hasher=PasswordHasher(); COOKIE="testnow_session"; SESSION_DAYS=14
 def hash_password(value:str)->str:return hasher.hash(value)
@@ -16,6 +16,8 @@ def new_session(response:Response, db:Session, user:User):
     raw=secrets.token_urlsafe(48); sid=hashlib.sha256(raw.encode()).hexdigest(); expires=datetime.now(timezone.utc)+timedelta(days=SESSION_DAYS)
     db.add(UserSession(id=sid,user_id=user.id,expires_at=expires)); db.commit()
     response.set_cookie(COOKIE,raw,httponly=True,secure=settings().cookie_secure,samesite="lax",max_age=SESSION_DAYS*86400,path="/")
+def revoke_sessions(db:Session,user_id:str):
+    db.query(UserSession).filter_by(user_id=user_id,revoked_at=None).update({UserSession.revoked_at:datetime.now(timezone.utc)},synchronize_session=False)
 def current_user(request:Request, db:Session=Depends(get_db))->User:
     raw=request.cookies.get(COOKIE)
     if not raw:raise HTTPException(status_code=401,detail="Authentication required")
@@ -23,6 +25,7 @@ def current_user(request:Request, db:Session=Depends(get_db))->User:
     if not row or row.revoked_at or row.expires_at<datetime.now(timezone.utc):raise HTTPException(status_code=401,detail="Session expired")
     user=db.get(User,row.user_id)
     if not user:raise HTTPException(status_code=401,detail="Authentication required")
+    if user.status!=AccountStatus.ACTIVE:raise HTTPException(status_code=403,detail="This account is not active")
     return user
 def require(*roles:Role):
     def inner(user:User=Depends(current_user)):

@@ -60,6 +60,6 @@ def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch)
     assert response.headers["cache-control"]=="private, max-age=300"
 
 def test_seeded_local_email_addresses_are_accepted_for_login_and_rosters():
-    assert LoginIn(email="student1@testnow.local",password="TestNowDev!2026").email=="student1@testnow.local"
+    assert LoginIn(email="student1@testnow.local",access_code="12345",role="student").email=="student1@testnow.local"
     roster=RosterUpdate(emails=["student1@testnow.local", " STUDENT2@TESTNOW.LOCAL "])
     assert roster.emails==["student1@testnow.local", "student2@testnow.local"]

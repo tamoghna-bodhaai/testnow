@@ -12,7 +12,11 @@ branch_labels=None
 depends_on=None
 
 def upgrade():
-    op.create_table("classrooms",
+    # 0001 historically used live metadata. On a fresh checkout that metadata may
+    # already include these tables, while existing installations still need them.
+    existing=sa.inspect(op.get_bind()).get_table_names()
+    if "classrooms" not in existing:
+      op.create_table("classrooms",
         sa.Column("id",sa.String(length=36),primary_key=True),
         sa.Column("owner_id",sa.String(length=36),sa.ForeignKey("users.id",ondelete="CASCADE"),nullable=False,index=True),
         sa.Column("name",sa.String(length=160),nullable=False),
@@ -20,19 +24,21 @@ def upgrade():
         sa.Column("created_at",sa.DateTime(timezone=True),server_default=sa.func.now(),nullable=False),
         sa.Column("updated_at",sa.DateTime(timezone=True),server_default=sa.func.now(),nullable=False),
         sa.UniqueConstraint("owner_id","name"),
-    )
-    op.create_table("class_memberships",
+      )
+    if "class_memberships" not in existing:
+      op.create_table("class_memberships",
         sa.Column("class_id",sa.String(length=36),sa.ForeignKey("classrooms.id",ondelete="CASCADE"),primary_key=True),
         sa.Column("student_id",sa.String(length=36),sa.ForeignKey("users.id",ondelete="CASCADE"),primary_key=True),
         sa.Column("created_at",sa.DateTime(timezone=True),server_default=sa.func.now(),nullable=False),
         sa.Column("updated_at",sa.DateTime(timezone=True),server_default=sa.func.now(),nullable=False),
-    )
-    op.create_table("test_class_assignments",
+      )
+    if "test_class_assignments" not in existing:
+      op.create_table("test_class_assignments",
         sa.Column("test_id",sa.String(length=36),sa.ForeignKey("tests.id",ondelete="CASCADE"),primary_key=True),
         sa.Column("class_id",sa.String(length=36),sa.ForeignKey("classrooms.id",ondelete="CASCADE"),primary_key=True),
         sa.Column("created_at",sa.DateTime(timezone=True),server_default=sa.func.now(),nullable=False),
         sa.Column("updated_at",sa.DateTime(timezone=True),server_default=sa.func.now(),nullable=False),
-    )
+      )
 
 def downgrade():
     op.drop_table("test_class_assignments")

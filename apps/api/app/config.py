@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 52_428_800
     cors_origins: str = "http://localhost:3000"
     seed_demo_data: bool = False
+    super_admin_email: str = "utils@bodhaai.tech"
+    super_admin_access_code: str | None = None
 
 @lru_cache
 def settings() -> Settings: return Settings()

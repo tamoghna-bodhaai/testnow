@@ -33,6 +33,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: testnow
       SESSION_SECRET: development-only-change-me
+      SUPER_ADMIN_ACCESS_CODE: ${SUPER_ADMIN_ACCESS_CODE:-12345}
       COOKIE_SECURE: "false"
       CORS_ORIGINS: http://localhost:3000
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
@@ -54,6 +55,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: testnow
       SESSION_SECRET: development-only-change-me
+      SUPER_ADMIN_ACCESS_CODE: ${SUPER_ADMIN_ACCESS_CODE:-12345}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
       OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
