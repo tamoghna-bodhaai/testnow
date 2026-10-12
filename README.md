@@ -10,8 +10,4 @@ TestNow is now a deployable monorepo: a Next.js assessment interface, FastAPI AP
 4. Apply migrations in production with `cd apps/api && alembic upgrade head`.
 
 
-## Railway
 
-Follow [infrastructure/railway.md](infrastructure/railway.md). Use Railway PostgreSQL, Redis, and object storage; only publish the Next.js web service.
-
-Production requires a sealed `SUPER_ADMIN_ACCESS_CODE` containing exactly five digits. The first API startup creates `utils@bodhaai.tech` as the super administrator. It manages teacher codes and statuses; teachers manage student codes and class/batch rosters.
