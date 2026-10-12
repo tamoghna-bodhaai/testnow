@@ -4,6 +4,8 @@ COPY package.json package-lock.json* ./
 COPY apps/web/package.json apps/web/package.json
 RUN npm install
 FROM deps AS build
+ARG API_INTERNAL_URL
+ENV API_INTERNAL_URL=$API_INTERNAL_URL
 COPY . .
 RUN npm run build:web
 FROM node:22-alpine
