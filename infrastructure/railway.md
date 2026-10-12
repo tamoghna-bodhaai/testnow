@@ -12,3 +12,5 @@ Create one Railway project with six services:
 Set `SESSION_SECRET`, `SUPER_ADMIN_ACCESS_CODE` (exactly five digits), `OPENROUTER_API_KEY`, all S3 keys, and error-monitoring DSNs as sealed variables. `SUPER_ADMIN_ACCESS_CODE` bootstraps `utils@bodhaai.tech` exactly once; it is never returned by the API. Point a custom domain at `web`; do not publish the API or worker. Configure a production alert for API readiness failure, Redis failure, Celery task failure, and import jobs remaining `processing` for more than ten minutes.
 
 Deploy `alembic upgrade head` before the web service rollout. Existing password accounts move to `pending_code` and cannot sign in until the super-admin reissues a five-digit access code. Keep `COOKIE_SECURE=true` and set `CORS_ORIGINS` only to the production web domain.
+
+The access-code launch migration intentionally removes all historical teacher/student accounts and assessment data while preserving the super-admin account. It is irreversible. Database object references are removed; use the storage provider's lifecycle policy to remove any now-orphaned uploaded source files.

@@ -58,7 +58,10 @@ def login(data:LoginIn,response:Response,db:Session=Depends(get_db)):
     now=time.monotonic(); attempts=LOGIN_ATTEMPTS.setdefault(data.email.lower(),[]);attempts[:]=[stamp for stamp in attempts if now-stamp<300]
     if len(attempts)>=10:raise HTTPException(429,"Too many sign-in attempts. Try again later")
     user=db.query(User).filter_by(email=data.email.lower()).first()
-    if not user or user.role!=data.role or user.status!=AccountStatus.ACTIVE or not user.access_code_hash or not verify_password(data.access_code,user.access_code_hash):
+    # The super-admin intentionally uses the teacher-facing login choice so the
+    # privileged portal is not discoverable from the public interface.
+    role_matches=bool(user) and (user.role==data.role or (data.role==Role.TEACHER and user.role==Role.ADMIN))
+    if not user or not role_matches or user.status!=AccountStatus.ACTIVE or not user.access_code_hash or not verify_password(data.access_code,user.access_code_hash):
         attempts.append(now);raise HTTPException(401,"Invalid email, role, or access code")
     LOGIN_ATTEMPTS.pop(data.email.lower(),None);user.last_login_at=datetime.now(timezone.utc);new_session(response,db,user);db.commit();return user_public(user)
 @app.post("/auth/logout",status_code=204)
