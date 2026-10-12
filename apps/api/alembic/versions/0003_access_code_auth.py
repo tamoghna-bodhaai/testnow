@@ -15,6 +15,11 @@ def upgrade():
     columns={column["name"] for column in sa.inspect(op.get_bind()).get_columns("users")}
     status_type=sa.Enum("pending_code","active","suspended", name="accountstatus")
     status_type.create(op.get_bind(), checkfirst=True)
+    # PostgreSQL cannot use a newly added enum value in the same transaction.
+    # Commit the type change before the data migration below uses pending_code.
+    if op.get_bind().dialect.name == "postgresql":
+        with op.get_context().autocommit_block():
+            op.execute("ALTER TYPE accountstatus ADD VALUE IF NOT EXISTS 'pending_code'")
     if "access_code_hash" not in columns:op.add_column("users", sa.Column("access_code_hash", sa.String(length=255), nullable=True))
     if "status" not in columns:op.add_column("users", sa.Column("status", status_type, nullable=True))
     if "access_code_issued_at" not in columns:op.add_column("users", sa.Column("access_code_issued_at", sa.DateTime(timezone=True), nullable=True))
