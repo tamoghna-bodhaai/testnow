@@ -62,7 +62,7 @@ CHAPTER_ALIASES = {
     "differential calculus 1": "Differential Calculus-1",
     "differential calculus 2": "Differential Calculus-2",
     "vectors": "Vector",
-    "matrices and determinants": "M atrices & Determinants",
+    "matrices and determinants": "Matrices & Determinants",
     "thermodynamics thermochemistry": "Thermochemistry & Thermodynamics",
     "oxygen containing organic compounds i": "Oxygen Containing Organic Compound-I",
     "oxygen containing organic compounds ii": "Oxygen Containing Organic Compound-II",
@@ -94,6 +94,25 @@ SOLUTION_HEADER = re.compile(
 def compact(value: str) -> str:
     value = value.replace("&", " and ").replace("-", " ")
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def canonical_chapter(subject: str, value: str) -> str:
+    """Return the single display name used for an extracted chapter heading.
+
+    LLM/native extraction occasionally introduces a space inside the first word
+    (for example ``M atrices``).  Taxonomy paths are exact-string unique, so
+    normalise before creating nodes rather than allowing that to become a second
+    dropdown option.
+    """
+    cleaned = re.sub(r"\s+", " ", value or "").strip(" :|-")
+    cleaned = re.sub(r"\b([A-Za-z])\s+(?=[A-Za-z]{2,}\b)", r"\1", cleaned)
+    if subject != "Mathematics" or not cleaned:
+        return cleaned
+    key = compact(cleaned)
+    if key in CHAPTER_ALIASES:
+        return CHAPTER_ALIASES[key]
+    # Accept canonical names too, including their punctuation variants.
+    return next((name for name in dict.fromkeys(CHAPTER_ALIASES.values()) if compact(name) == key), cleaned)
 
 
 def title_for_page(text: str, names: list[str]) -> str | None:
@@ -398,9 +417,18 @@ def extract_entries(document: fitz.Document, chapter_names: list[str]) -> list[d
     return entries
 
 
-def map_pdf(db: Session, path: Path, publish: bool) -> dict[str, int]:
+def map_pdf(
+    db: Session,
+    path: Path,
+    publish: bool,
+    bank: QuestionBank | None = None,
+) -> dict[str, int]:
     subject = subject_from_filename(path.name)
-    bank = db.query(QuestionBank).filter_by(slug=BANK_SLUG).one()
+    # A full OpenRouter seed is built in an invisible staging bank before it is
+    # promoted.  Resolve the caller-provided bank in that flow; the CLI keeps
+    # the historic global-bank default for standalone mapping runs.
+    if bank is None:
+        bank = db.query(QuestionBank).filter_by(slug=BANK_SLUG).one()
     by_name, normalized = subject_chapters(db, bank.id, subject)
     chapter_names = [name for name in by_name if compact(name) not in {"physics", "chemistry", "mathematics"}]
     document = fitz.open(path)
@@ -421,7 +449,15 @@ def map_pdf(db: Session, path: Path, publish: bool) -> dict[str, int]:
             keyed[key] = max(candidates, key=lambda item: len(item["solution"]))
 
     source_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
-    source = db.query(SourceDocument).filter_by(sha256=source_checksum).first()
+    # Checksums can legitimately recur when an earlier seed was interrupted or
+    # replaced.  Restrict the lookup to this bank's source prefix so an old
+    # document record cannot make every current-bank question look unrelated.
+    source = (
+        db.query(SourceDocument)
+        .filter_by(sha256=source_checksum)
+        .filter(SourceDocument.object_key.like(f"seed-sources/{bank.id}/%"))
+        .first()
+    )
     source_id = source.id if source else None
     answer_key_page = next(i + 1 for i, page in enumerate(document) if "ANSWER KEY" in page.get_text("text", sort=True).upper())
 

@@ -14,3 +14,14 @@ def put(key:str,data:bytes,content_type:str):
 def get(key:str)->bytes:return client().get_object(Bucket=settings().s3_bucket,Key=key)["Body"].read()
 def signed_get(key:str,seconds:int=300)->str:return client().generate_presigned_url("get_object",Params={"Bucket":settings().s3_bucket,"Key":key},ExpiresIn=seconds)
 def digest(data:bytes)->str:return hashlib.sha256(data).hexdigest()
+def delete_prefix(prefix:str):
+    """Delete only objects under one known seed prefix, including paginated keys."""
+    c=client(); bucket=settings().s3_bucket; token=None
+    while True:
+        args={"Bucket":bucket,"Prefix":prefix}
+        if token: args["ContinuationToken"]=token
+        page=c.list_objects_v2(**args)
+        keys=[{"Key":item["Key"]} for item in page.get("Contents",[])]
+        if keys:c.delete_objects(Bucket=bucket,Delete={"Objects":keys,"Quiet":True})
+        if not page.get("IsTruncated"):break
+        token=page.get("NextContinuationToken")

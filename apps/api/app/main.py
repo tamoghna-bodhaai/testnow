@@ -1,16 +1,16 @@
 from datetime import datetime, timedelta, timezone
 import csv, io, re
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
-from sqlalchemy import or_
+from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
-from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
+from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
 from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
-from .services import audit, ensure_live, publish, score, snapshot_questions
+from .services import audit, ensure_live, publish, score, safe_question_kind, snapshot_questions
 from .storage import client as storage_client, digest, get, put, signed_get
 from .tasks import extract_import
 from .seed import ensure_demo_data
@@ -263,14 +263,19 @@ def canonical_answer(answer,options):
     # Numerical / subjective answer keys keep their reviewed structured value.
     if raw is not None:return {"value":raw}
     raise HTTPException(422,"Choose a valid option or provide an answer value")
-def question_view(q:Question):
+def question_view(q:Question, db:Session|None=None):
     confidence=q.confidence
     if confidence is not None: confidence=min(1.0,max(0.0,float(confidence)))
-    return {"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":normalized_options(q.options),"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":q.interaction or {},"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":[]}
+    taxonomy=[]
+    if db and q.bank_id:
+        taxonomy=[{"id":node.id,"parent_id":node.parent_id,"kind":node.kind,"name":node.name,"code":node.code} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==q.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
+    options=normalized_options(q.options); kind=safe_question_kind(q.kind,options)
+    answer=None if kind=="subjective" and len(options)<2 else q.answer
+    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":q.interaction or {},"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":taxonomy}
 @app.get("/questions")
 def questions(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     rows=db.query(Question).filter((Question.owner_id==user.id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
-    return [question_view(q) for q in rows]
+    return [question_view(q,db) for q in rows]
 @app.get("/question-banks")
 def question_banks(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     return [{"id":b.id,"slug":b.slug,"name":b.name,"exam_code":b.exam_code,"is_global":b.is_global,"question_count":db.query(Question).filter_by(bank_id=b.id,scope=QuestionScope.GLOBAL).filter(Question.approved_at.is_not(None)).count()} for b in db.query(QuestionBank).filter_by(is_global=True).order_by(QuestionBank.name)]
@@ -278,6 +283,65 @@ def question_banks(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Sessio
 def bank_taxonomy(bank_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     if not db.get(QuestionBank,bank_id):raise HTTPException(404,"Question bank not found")
     return [{"id":n.id,"parent_id":n.parent_id,"kind":n.kind,"name":n.name,"code":n.code} for n in db.query(TaxonomyNode).filter_by(bank_id=bank_id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
+def global_bank_query(db:Session,bank_id:str,subject_id:str|None=None,chapter_id:str|None=None,published:bool=True):
+    """One-row-per-question query shared by listing and live availability."""
+    query=db.query(Question).filter(Question.bank_id==bank_id,Question.scope==QuestionScope.GLOBAL)
+    if published:query=query.filter(Question.approved_at.is_not(None))
+    # Correlated predicates avoid joining question rows (which contain JSON
+    # fields) and keep counts correct even if taxonomy links are duplicated.
+    if subject_id:
+        query=query.filter(exists().where(
+            QuestionTaxonomy.question_id==Question.id,
+            QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id,
+            TaxonomyNode.id==subject_id,
+            TaxonomyNode.kind=="subject",
+        ))
+    if chapter_id:
+        query=query.filter(exists().where(
+            QuestionTaxonomy.question_id==Question.id,
+            QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id,
+            TaxonomyNode.id==chapter_id,
+            TaxonomyNode.kind=="chapter",
+        ))
+    return query
+@app.get("/question-banks/{bank_id}/question-counts")
+def bank_question_counts(
+    bank_id:str,
+    subject_id:str|None=None,
+    chapter_id:str|None=None,
+    user:User=Depends(require(Role.TEACHER,Role.ADMIN)),
+    db:Session=Depends(get_db),
+):
+    """Published question availability, grouped by type for the active taxonomy filter."""
+    bank=db.get(QuestionBank,bank_id)
+    if not bank or not bank.is_global:raise HTTPException(404,"Question bank not found")
+    query=global_bank_query(db,bank_id,subject_id,chapter_id)
+    rows=query.with_entities(Question.kind,func.count(Question.id)).group_by(Question.kind).all()
+    counts={kind.value:int(total) for kind,total in rows}
+    return {"total":sum(counts.values()),"counts":counts}
+@app.get("/question-banks/{bank_id}/questions")
+def bank_questions(
+    bank_id:str,
+    subject_id:str|None=None,
+    chapter_id:str|None=None,
+    kinds:list[str]=Query(default=[]),
+    page:int=Query(default=1,ge=1),
+    page_size:int=Query(default=25,ge=1,le=100),
+    include_review:bool=False,
+    user:User=Depends(require(Role.TEACHER,Role.ADMIN)),
+    db:Session=Depends(get_db),
+):
+    """Paginated global-bank selection.  Filters always stay server side."""
+    bank=db.get(QuestionBank,bank_id)
+    if not bank or not bank.is_global:raise HTTPException(404,"Question bank not found")
+    if include_review and user.role!=Role.ADMIN:raise HTTPException(403,"Only administrators can inspect unpublished bank questions")
+    valid_kinds={kind.value for kind in QuestionKind}
+    if unknown:=set(kinds)-valid_kinds:raise HTTPException(422,f"Unsupported question type: {sorted(unknown)[0]}")
+    query=global_bank_query(db,bank_id,subject_id,chapter_id,published=not include_review)
+    if kinds:query=query.filter(Question.kind.in_([QuestionKind(value) for value in kinds]))
+    total=query.count()
+    rows=query.order_by(Question.created_at.desc(),Question.id).offset((page-1)*page_size).limit(page_size).all()
+    return {"items":[question_view(row,db) for row in rows],"page":page,"page_size":page_size,"total":total,"has_more":page*page_size<total}
 @app.get("/media/questions/{question_id}/{index}")
 def question_media(question_id:str,index:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
     q=db.get(Question,question_id)

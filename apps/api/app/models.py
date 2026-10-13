@@ -72,6 +72,9 @@ class Question(Timestamped, Base):
     scope: Mapped[QuestionScope] = mapped_column(Enum(QuestionScope), default=QuestionScope.PRIVATE, nullable=False)
     import_job_id: Mapped[str | None] = mapped_column(ForeignKey("import_jobs.id"), index=True)
     source_number: Mapped[str | None] = mapped_column(String(32))
+    # Stable identity for an externally seeded record.  Manual and teacher-imported
+    # questions deliberately leave this null.
+    source_key: Mapped[str | None] = mapped_column(String(255), index=True)
     kind: Mapped[QuestionKind] = mapped_column(Enum(QuestionKind))
     stem_markdown: Mapped[str] = mapped_column(Text); options: Mapped[list] = mapped_column(JSON, default=list)
     answer: Mapped[dict | None] = mapped_column(JSON); solution_markdown: Mapped[str | None] = mapped_column(Text)
@@ -79,6 +82,7 @@ class Question(Timestamped, Base):
     diagrams: Mapped[list] = mapped_column(JSON, default=list); source_spans: Mapped[list] = mapped_column(JSON, default=list)
     interaction: Mapped[dict] = mapped_column(JSON, default=dict)
     confidence: Mapped[float | None] = mapped_column(); approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__=(UniqueConstraint("bank_id", "source_key", name="uq_question_bank_source_key"),)
 class QuestionTaxonomy(Base):
     __tablename__="question_taxonomies"
     question_id: Mapped[str] = mapped_column(ForeignKey("questions.id", ondelete="CASCADE"), primary_key=True)

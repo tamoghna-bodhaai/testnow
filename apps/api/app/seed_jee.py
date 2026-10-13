@@ -67,7 +67,7 @@ def chapter_for(text:str, fallback:str)->str:
         if re.search(r"Advanced Problem Package",line,re.I):
             cleaned=re.sub(r"^.*?Advanced Problem Package\s*", "", line, flags=re.I).strip(" -|")
             if len(cleaned)>3:return cleaned[:180]
-        match=re.search(r"APP \| (?:Physics|Chemistry)\s+\d+\s+(.+)$",line,re.I)
+        match=re.search(r"APP \| (?:Physics|Chemistry|Mathematics)\s+\d+\s+(.+)$",line,re.I)
         if match:
             cleaned=match.group(1).strip(" -|")
             if len(cleaned)>3:return cleaned[:180]

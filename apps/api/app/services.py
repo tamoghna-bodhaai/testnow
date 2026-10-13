@@ -4,6 +4,13 @@ from sqlalchemy.orm import Session
 from .models import Attempt, Question, QuestionScope, Response, Test, TestVersion, TestStatus
 from .security import uid
 
+CHOICE_KINDS={"single_choice","multiple_choice","assertion_reason"}
+
+def safe_question_kind(kind:object, options:object)->str:
+    """Avoid delivering legacy optionless records as unanswerable MCQs."""
+    value=getattr(kind,"value",kind)
+    return "subjective" if value in CHOICE_KINDS and len(options or [])<2 else str(value)
+
 def audit(db:Session, actor:str|None, action:str, entity_type:str, entity_id:str, data:dict|None=None):
     from .models import AuditEvent
     db.add(AuditEvent(id=uid(),actor_id=actor,action=action,entity_type=entity_type,entity_id=entity_id,data=data or {}))
@@ -11,7 +18,11 @@ def snapshot_questions(db:Session, ids:list[str], owner_id:str)->list[dict]:
     found=db.query(Question).filter(Question.id.in_(ids),Question.approved_at.is_not(None)).filter((Question.owner_id==owner_id)|(Question.scope==QuestionScope.GLOBAL)).all()
     by_id={q.id:q for q in found}
     if len(by_id)!=len(set(ids)):raise HTTPException(422,"Every selected question must be teacher-approved")
-    return [{"id":q.id,"source_number":q.source_number,"kind":q.kind.value,"stem_markdown":q.stem_markdown,"options":q.options,"answer":q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"interaction":q.interaction} for qid in ids for q in [by_id[qid]]]
+    content=[]
+    for qid in ids:
+        q=by_id[qid]; kind=safe_question_kind(q.kind,q.options)
+        content.append({"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":q.options,"answer":None if kind=="subjective" and len(q.options or [])<2 else q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"interaction":q.interaction})
+    return content
 def publish(db:Session,test:Test,actor_id:str,question_ids:list[str]):
     content={"questions":snapshot_questions(db,question_ids,test.owner_id),"duration_seconds":test.duration_seconds,"results_policy":test.results_policy}
     number=(db.query(TestVersion).filter_by(test_id=test.id).count()+1); version=TestVersion(id=uid(),test_id=test.id,ordinal=number,content=content,published_at=datetime.now(timezone.utc))
@@ -33,6 +44,11 @@ def answers_match(question:dict,given:dict|None)->bool:
         except (TypeError,ValueError): return False
     if kind=="matrix_match":
         return given.get("matches")==expected.get("matches")
+    if kind=="multiple_choice":
+        try:
+            return sorted(set(given.get("options",[])))==sorted(set(expected.get("options",[])))
+        except TypeError:
+            return False
     return given==expected
 def score(content:dict,responses:dict[str,dict|None])->tuple[float,list[dict]]:
     total=0.0; review=[]

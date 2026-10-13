@@ -35,6 +35,14 @@ def normalize_item(item:dict)->dict:
 def normalize_answer(answer,options:list[dict]):
     """Convert provider answer variants to the response shape used for scoring."""
     if not isinstance(answer,dict):return None
+    # Matrix answers do not use the multiple-choice option array.  Preserve the
+    # labelled row-to-column map in the exact shape expected by the exam UI.
+    if isinstance(answer.get("matches"),dict):
+        matches={}
+        for row,choices in answer["matches"].items():
+            if isinstance(choices,list) and str(row).strip():
+                matches[str(row).strip()]=sorted({str(choice).strip() for choice in choices if str(choice).strip()})
+        return {"matches":matches} if matches else None
     raw=answer.get("options",answer.get("option",answer.get("value",answer.get("correct_option"))))
     if isinstance(raw,list):
         selected=[]

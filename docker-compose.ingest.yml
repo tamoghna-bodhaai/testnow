@@ -1,0 +1,47 @@
+# Isolated, port-free services for building the local JEE bank.  This file is
+# intentionally separate from docker-compose.yml, so it cannot attach to or
+# expose the production-shaped development ports.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: testnow
+      POSTGRES_USER: testnow
+      POSTGRES_PASSWORD: testnow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testnow -d testnow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+  objectstore:
+    image: chrislusf/seaweedfs:latest
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      S3_BUCKET: testnow
+  api:
+    build: ./apps/api
+    environment:
+      DATABASE_URL: postgresql+psycopg://testnow:testnow@postgres:5432/testnow
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://objectstore:8333
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: testnow
+      SESSION_SECRET: local-ingestion-only
+      SUPER_ADMIN_ACCESS_CODE: "12345"
+      COOKIE_SECURE: "false"
+      CORS_ORIGINS: http://localhost:3000
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
+      OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-120}
+      SEED_DEMO_DATA: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      objectstore:
+        condition: service_started

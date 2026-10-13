@@ -22,20 +22,29 @@ The seed flag defaults to `false` and is rejected by the API in production. The 
 
 The old `server.py`, `app.js`, and static assets are intentionally retained as the non-deployed prototype reference. They are not part of the Railway deployment.
 
-## Native JEE seed bank
+## Text-first JEE seed bank
 
-The three supplied clean JEE Advanced worksheets can be seeded without a model or
-network extraction. The native importer uses PDF text for question/type/chapter
-segmentation and saves a rendered source crop with every question, retaining
-graphs and figures. It creates global **review** records; answer keys must be
-reviewed before a question is published to all teachers.
+Use the OpenRouter seeder for the supplied clean JEE Advanced worksheets. It
+stores a Markdown/LaTex question record, type, chapter, verified answer and
+worked solution; it saves an image only when the model identifies a bounded
+diagram. It never uses a full-question crop as the question itself.
+
+First run its no-write estimate. The final command stages the replacement,
+checks that no existing global-bank question is referenced by a saved test,
+and swaps it only after extraction and answer/solution verification succeed.
+Questions below the confidence gate remain unpublished for review.
 
 After bringing up the API dependencies and applying migrations, run this inside
 the API container (or an environment with the same database and object-store
 settings):
 
 ```bash
-python -m app.seed_jee --owner-email utils@bodhaai.tech \
+python -m app.seed_jee_openrouter --owner-email utils@bodhaai.tech --replace --dry-run \
+  /imports/CHEMISTRY_STAR_BATCH_JEE_ADVANCED_ASSIGNMENTS_clean.pdf \
+  /imports/MATHS_STAR_BATCH_JEE_ADVANCED_ASSIGNMENTS_clean.pdf \
+  /imports/PHYSICS_STAR_BATCH_JEE_ADVANCED_ASSIGNMENTS_clean.pdf
+
+python -m app.seed_jee_openrouter --owner-email utils@bodhaai.tech --replace \
   /imports/CHEMISTRY_STAR_BATCH_JEE_ADVANCED_ASSIGNMENTS_clean.pdf \
   /imports/MATHS_STAR_BATCH_JEE_ADVANCED_ASSIGNMENTS_clean.pdf \
   /imports/PHYSICS_STAR_BATCH_JEE_ADVANCED_ASSIGNMENTS_clean.pdf
