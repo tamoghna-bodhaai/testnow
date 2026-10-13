@@ -53,6 +53,24 @@ python -m app.seed_jee_openrouter --owner-email utils@bodhaai.tech --replace \
 The PDFs are intentionally not committed to the repository. Mount or copy them
 to `/imports` in the API environment before running the command.
 
+## Physics Bank 2
+
+The existing global records are retained as **Question Bank 1**. To create the
+separate generic-JEE **Physics Bank 2**, copy only the 23 supplied PDF files
+(not their DOCX companions) into `/imports`, then run this inside the API
+environment after migrations:
+
+```bash
+python -m app.import_physics_bank2 --owner-email utils@bodhaai.tech \
+  /imports/*.pdf
+```
+
+The import uses the answer keys embedded in each PDF and makes questions with a
+parsed answer immediately selectable. Worked solutions are retained when found,
+but are not required for publication. The command is idempotent and never
+modifies Question Bank 1. Use `--dry-run` first to estimate the extraction
+work without changing the database or object storage.
+
 ## Railway
 
 Follow [infrastructure/railway.md](infrastructure/railway.md). Use Railway PostgreSQL, Redis, and object storage; only publish the Next.js web service.

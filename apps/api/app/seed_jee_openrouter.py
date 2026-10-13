@@ -262,12 +262,12 @@ def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocum
     db.add(q); db.flush(); db.add(QuestionTaxonomy(question_id=q.id, taxonomy_node_id=subject_node.id)); db.add(QuestionTaxonomy(question_id=q.id, taxonomy_node_id=chapter.id)); return True
 
 
-def publish_verified(db: Session, bank: QuestionBank, threshold: float) -> dict[str, int]:
+def publish_verified(db: Session, bank: QuestionBank, threshold: float, allow_missing_solution: bool = False) -> dict[str, int]:
     now=datetime.now(timezone.utc); result={"published":0,"review":0}
     for q in db.query(Question).filter_by(bank_id=bank.id, scope=QuestionScope.GLOBAL):
-        ready=bool(q.answer and q.solution_markdown and q.confidence is not None and q.confidence >= threshold and q.source_spans)
+        ready=bool(q.answer and (q.solution_markdown or allow_missing_solution) and q.confidence is not None and q.confidence >= threshold and q.source_spans)
         q.approved_at=now if ready else None
-        interaction=dict(q.interaction or {}); interaction["seed_status"]="published_confidence_gated" if ready else "review_required"
+        interaction=dict(q.interaction or {}); interaction["seed_status"]=("published_confidence_gated" if q.solution_markdown else "published_answer_key_gated") if ready else "review_required"
         q.interaction=interaction; result["published" if ready else "review"]+=1
     db.commit(); return result
 
@@ -279,6 +279,10 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Report model windows and estimate only; no model, database, or object-store writes")
     parser.add_argument("--pages-per-request", type=int, default=2, choices=range(1, MAX_WINDOW_PAGES + 1))
     parser.add_argument("--publish-threshold", type=float, default=PUBLISH_THRESHOLD)
+    parser.add_argument("--bank-slug", default=BANK_SLUG, help="Target global bank slug")
+    parser.add_argument("--bank-name", default="JEE Advanced Question Bank", help="Target global bank display name")
+    parser.add_argument("--exam-code", default="JEE_ADVANCED", help="Target global bank exam classification")
+    parser.add_argument("--publish-without-solution", action="store_true", help="Publish answer-keyed questions even when no worked solution was extracted")
     args=parser.parse_args()
     if not 0 <= args.publish_threshold <= 1: raise SystemExit("--publish-threshold must be between 0 and 1")
     for path in args.pdfs:
@@ -299,14 +303,14 @@ def main() -> None:
         try:
             owner=db.query(User).filter_by(email=args.owner_email.lower()).first()
             if not owner: raise SystemExit("Seed owner does not exist")
-            bank=db.query(QuestionBank).filter_by(slug=BANK_SLUG).first(); previous_bank=None
+            bank=db.query(QuestionBank).filter_by(slug=args.bank_slug).first(); previous_bank=None
             if bank and args.replace:
                 # Extract into an invisible staging bank first.  A failed model
                 # call therefore never wipes a teacher's currently usable bank.
                 preflight_replace(db, bank); previous_bank=bank
-                bank=QuestionBank(id=uid(),slug=f"{BANK_SLUG}-staging-{uid()[:8]}",name="JEE Advanced Question Bank (staging)",exam_code="JEE_ADVANCED",is_global=False); db.add(bank); db.commit()
+                bank=QuestionBank(id=uid(),slug=f"{args.bank_slug}-staging-{uid()[:8]}",name=f"{args.bank_name} (staging)",exam_code=args.exam_code,is_global=False); db.add(bank); db.commit()
             if not bank:
-                bank=QuestionBank(id=uid(),slug=BANK_SLUG,name="JEE Advanced Question Bank",exam_code="JEE_ADVANCED",is_global=True); db.add(bank); db.commit()
+                bank=QuestionBank(id=uid(),slug=args.bank_slug,name=args.bank_name,exam_code=args.exam_code,is_global=True); db.add(bank); db.commit()
             total=0; usage={"prompt_tokens":0,"completion_tokens":0}
             for path,document,limit in zip(args.pdfs,documents,limits):
                 subject=subject_from_filename(path.name); source=source_document(db,owner,bank,path)
@@ -320,12 +324,12 @@ def main() -> None:
                 # The verified answer key/worked solution remains authoritative;
                 # the VLM's text is retained, but it cannot publish by itself.
                 print(f"Mapping answer key and solutions for {path.name}: {map_pdf(db, path, False, bank)}")
-            result=publish_verified(db,bank,args.publish_threshold)
+            result=publish_verified(db,bank,args.publish_threshold,args.publish_without_solution)
             if previous_bank:
                 if not db.query(Question).filter_by(bank_id=bank.id).first():
                     raise RuntimeError("Staging extraction created no questions; keeping the current bank untouched")
                 replace_bank(db,previous_bank)
-                bank.slug=BANK_SLUG; bank.name="JEE Advanced Question Bank"; bank.is_global=True; db.commit()
+                bank.slug=args.bank_slug; bank.name=args.bank_name; bank.exam_code=args.exam_code; bank.is_global=True; db.commit()
             print(json.dumps({"created_or_resumed":total,"usage":usage,"publication":result,"bank_id":bank.id},indent=2))
         finally: db.close()
     finally:

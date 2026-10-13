@@ -422,6 +422,7 @@ def map_pdf(
     path: Path,
     publish: bool,
     bank: QuestionBank | None = None,
+    publish_without_solution: bool = False,
 ) -> dict[str, int]:
     subject = subject_from_filename(path.name)
     # A full OpenRouter seed is built in an invisible staging bank before it is
@@ -523,14 +524,19 @@ def map_pdf(
             interaction["seed_status"] = "source_answer_conflict"
             question.interaction = interaction
             continue
-        if answer and entry:
+        if answer and (entry or publish_without_solution):
             needs_options = question.kind in {QuestionKind.SINGLE, QuestionKind.MULTIPLE, QuestionKind.ASSERTION} and len(question.options or []) < 4
             if needs_options:
-                interaction["seed_status"] = "answer_and_solution_mapped_options_missing"
+                interaction["seed_status"] = "answer_mapped_options_missing"
                 stats["options_missing"] += 1
                 question.interaction = interaction
                 continue
-            interaction["seed_status"] = "published_from_native_answer_and_solution" if publish else "answer_and_solution_mapped"
+            verified_solution = bool(entry)
+            interaction["seed_status"] = (
+                "published_from_native_answer_and_solution" if publish and verified_solution else
+                "published_from_native_answer_key" if publish else
+                "answer_and_solution_mapped" if verified_solution else "answer_mapped"
+            )
             if question.kind == QuestionKind.MATRIX:
                 matrix_items = list(answer["matches"])
                 # Offer the full labeled choice range, not just the correct
@@ -579,15 +585,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Map JEE native seed records to their worksheet solutions")
     parser.add_argument("pdfs", nargs="+", type=Path)
     parser.add_argument("--owner-email", required=True, help="Checked to prevent accidental use before seed setup")
-    parser.add_argument("--publish", action="store_true", help="Publish only questions with a parsed concrete answer")
+    parser.add_argument("--publish", action="store_true", help="Publish only questions with a parsed concrete answer and solution")
+    parser.add_argument("--publish-without-solution", action="store_true", help="Allow --publish when an answer key is present but a worked solution is absent")
+    parser.add_argument("--bank-slug", default=BANK_SLUG, help="Target global bank slug")
     args = parser.parse_args()
     db = SessionLocal()
     try:
         if not db.query(User).filter_by(email=args.owner_email.lower()).first():
             raise SystemExit("Seed owner does not exist")
+        bank = db.query(QuestionBank).filter_by(slug=args.bank_slug).one_or_none()
+        if not bank:
+            raise SystemExit(f"Question bank {args.bank_slug!r} does not exist")
         totals = {"source_questions": 0, "mapped_answer": 0, "mapped_solution": 0, "published": 0, "answer_missing": 0, "solution_missing": 0, "options_missing": 0, "non_question_source_pages": 0}
         for path in args.pdfs:
-            result = map_pdf(db, path, args.publish)
+            result = map_pdf(db, path, args.publish, bank, args.publish_without_solution)
             print(f"{path.name}: {result}")
             for key, value in result.items():
                 totals[key] += value
