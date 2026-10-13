@@ -423,8 +423,9 @@ def map_pdf(
     publish: bool,
     bank: QuestionBank | None = None,
     publish_without_solution: bool = False,
+    subject: str | None = None,
 ) -> dict[str, int]:
-    subject = subject_from_filename(path.name)
+    subject = subject or subject_from_filename(path.name)
     # A full OpenRouter seed is built in an invisible staging bank before it is
     # promoted.  Resolve the caller-provided bank in that flow; the CLI keeps
     # the historic global-bank default for standalone mapping runs.

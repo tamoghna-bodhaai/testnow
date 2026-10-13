@@ -324,7 +324,7 @@ def main() -> None:
                     db.commit()
                 # The verified answer key/worked solution remains authoritative;
                 # the VLM's text is retained, but it cannot publish by itself.
-                print(f"Mapping answer key and solutions for {path.name}: {map_pdf(db, path, False, bank)}")
+                print(f"Mapping answer key and solutions for {path.name}: {map_pdf(db, path, False, bank, subject=args.subject)}")
             result=publish_verified(db,bank,args.publish_threshold,args.publish_without_solution)
             if previous_bank:
                 if not db.query(Question).filter_by(bank_id=bank.id).first():
