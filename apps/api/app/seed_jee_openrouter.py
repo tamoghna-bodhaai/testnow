@@ -282,6 +282,7 @@ def main() -> None:
     parser.add_argument("--bank-slug", default=BANK_SLUG, help="Target global bank slug")
     parser.add_argument("--bank-name", default="JEE Advanced Question Bank", help="Target global bank display name")
     parser.add_argument("--exam-code", default="JEE_ADVANCED", help="Target global bank exam classification")
+    parser.add_argument("--subject", choices=("Physics", "Chemistry", "Mathematics"), help="Subject for every supplied source; otherwise infer it from the filename")
     parser.add_argument("--publish-without-solution", action="store_true", help="Publish answer-keyed questions even when no worked solution was extracted")
     args=parser.parse_args()
     if not 0 <= args.publish_threshold <= 1: raise SystemExit("--publish-threshold must be between 0 and 1")
@@ -313,7 +314,7 @@ def main() -> None:
                 bank=QuestionBank(id=uid(),slug=args.bank_slug,name=args.bank_name,exam_code=args.exam_code,is_global=True); db.add(bank); db.commit()
             total=0; usage={"prompt_tokens":0,"completion_tokens":0}
             for path,document,limit in zip(args.pdfs,documents,limits):
-                subject=subject_from_filename(path.name); source=source_document(db,owner,bank,path)
+                subject=args.subject or subject_from_filename(path.name); source=source_document(db,owner,bank,path)
                 for core,visible in page_windows(limit,args.pages_per_request):
                     print(f"Extracting {path.name}: core pages {core[0]}-{core[-1]}", flush=True)
                     items,window_usage=extract_window(document,subject,core,visible)
