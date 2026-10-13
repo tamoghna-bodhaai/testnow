@@ -1,6 +1,6 @@
 """Normalise duplicate Mathematics chapter names.
 
-Revision ID: 0009_normalize_mathematics_taxonomy
+Revision ID: 0009_math_taxonomy
 Revises: 0008_seed_question_identity
 """
 from alembic import op
@@ -8,7 +8,7 @@ import sqlalchemy as sa
 import re
 
 
-revision = "0009_normalize_mathematics_taxonomy"
+revision = "0009_math_taxonomy"
 down_revision = "0008_seed_question_identity"
 branch_labels = None
 depends_on = None
