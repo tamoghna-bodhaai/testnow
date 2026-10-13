@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import SessionLocal
 from .map_jee_solutions import canonical_chapter, map_pdf
-from .models import Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode, TestVersion, User
+from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode, TestVersion, User
 from .security import uid
 from .seed_jee import BANK_SLUG, find_or_create_node, subject_from_filename
 from .storage import delete_prefix, put
@@ -185,6 +185,35 @@ def source_document(db: Session, owner: User, bank: QuestionBank, path: Path) ->
     return source
 
 
+def seed_checkpoint(db: Session, owner: User, bank: QuestionBank, source: SourceDocument) -> ImportJob:
+    """Persist the last fully committed core page so an interrupted seed resumes safely."""
+    job = db.query(ImportJob).filter_by(question_document_id=source.id).order_by(ImportJob.created_at.desc()).first()
+    if job:
+        return job
+    completed = 0
+    for question in db.query(Question).filter_by(bank_id=bank.id):
+        interaction = question.interaction or {}
+        if interaction.get("source_document_id") == source.id:
+            completed = max(completed, int(interaction.get("source_page") or 0))
+    job = ImportJob(
+        id=uid(), owner_id=owner.id, question_document_id=source.id,
+        status=ImportStatus.PROCESSING,
+        extraction_meta={"seed_checkpoint": {"extracted_through_page": completed, "answers_mapped": False}},
+    )
+    db.add(job); db.commit()
+    return job
+
+
+def checkpoint_meta(job: ImportJob) -> dict:
+    return dict((job.extraction_meta or {}).get("seed_checkpoint") or {})
+
+
+def save_checkpoint(db: Session, job: ImportJob, **changes: object) -> None:
+    meta = checkpoint_meta(job); meta.update(changes)
+    job.extraction_meta = {**(job.extraction_meta or {}), "seed_checkpoint": meta}
+    db.commit()
+
+
 def page_windows(limit: int, pages_per_request: int) -> Iterable[tuple[list[int], list[int]]]:
     for start in range(1, limit + 1, pages_per_request):
         core = list(range(start, min(limit + 1, start + pages_per_request)))
@@ -288,20 +317,21 @@ def main() -> None:
     if not 0 <= args.publish_threshold <= 1: raise SystemExit("--publish-threshold must be between 0 and 1")
     for path in args.pdfs:
         if not path.is_file() or path.suffix.lower() != ".pdf": raise SystemExit(f"Not a readable PDF: {path}")
-    documents=[fitz.open(path) for path in args.pdfs]
-    try:
-        # Answer-key and worked-solution pages are evidence for verification, not
-        # question-source pages.  Sending them to the VLM would create duplicate
-        # solution records and inflate spend.
-        limits=[next(index for index,page in enumerate(doc) if "ANSWER KEY" in page.get_text("text",sort=True).upper()) for doc in documents]
-        windows=sum(sum(1 for _ in page_windows(limit, args.pages_per_request)) for limit in limits)
-        if args.dry_run:
-            # Conservative estimate: roughly 2.5k image/native input tokens per
-            # visible page and 900 output tokens per requested page.
-            visible=sum(len(visible) for doc,limit in zip(documents,limits) for _,visible in page_windows(limit,args.pages_per_request))
-            print(json.dumps({"mode":"dry-run","question_pages":sum(limits),"requests":windows,"visible_page_images":visible,"estimated_input_tokens":visible*2500,"estimated_output_tokens":sum(limits)*900,"model":settings().openrouter_model,"replace_requested":args.replace},indent=2)); return
-        db=SessionLocal()
+    # Keep only one PDF open at a time.  These documents are large and a seed
+    # can run for hours; holding all 23 in memory invites a container restart.
+    limits: list[int] = []
+    for path in args.pdfs:
+        document = fitz.open(path)
         try:
+            limits.append(next(index for index, page in enumerate(document) if "ANSWER KEY" in page.get_text("text", sort=True).upper()))
+        finally:
+            document.close()
+    windows=sum(sum(1 for _ in page_windows(limit, args.pages_per_request)) for limit in limits)
+    if args.dry_run:
+        visible=sum(len(visible) for limit in limits for _, visible in page_windows(limit, args.pages_per_request))
+        print(json.dumps({"mode":"dry-run","question_pages":sum(limits),"requests":windows,"visible_page_images":visible,"estimated_input_tokens":visible*2500,"estimated_output_tokens":sum(limits)*900,"model":settings().openrouter_model,"replace_requested":args.replace},indent=2)); return
+    db=SessionLocal()
+    try:
             owner=db.query(User).filter_by(email=args.owner_email.lower()).first()
             if not owner: raise SystemExit("Seed owner does not exist")
             bank=db.query(QuestionBank).filter_by(slug=args.bank_slug).first(); previous_bank=None
@@ -313,18 +343,29 @@ def main() -> None:
             if not bank:
                 bank=QuestionBank(id=uid(),slug=args.bank_slug,name=args.bank_name,exam_code=args.exam_code,is_global=True); db.add(bank); db.commit()
             total=0; usage={"prompt_tokens":0,"completion_tokens":0}
-            for path,document,limit in zip(args.pdfs,documents,limits):
-                subject=args.subject or subject_from_filename(path.name); source=source_document(db,owner,bank,path)
-                for core,visible in page_windows(limit,args.pages_per_request):
-                    print(f"Extracting {path.name}: core pages {core[0]}-{core[-1]}", flush=True)
-                    items,window_usage=extract_window(document,subject,core,visible)
-                    for key in usage: usage[key]+=int(window_usage.get(key,0) or 0)
-                    for item in items:
-                        if isinstance(item,dict) and store_item(db,bank,owner,source,subject,document,item,core,args.publish_threshold): total+=1
-                    db.commit()
-                # The verified answer key/worked solution remains authoritative;
-                # the VLM's text is retained, but it cannot publish by itself.
-                print(f"Mapping answer key and solutions for {path.name}: {map_pdf(db, path, False, bank, subject=args.subject)}")
+            for path, limit in zip(args.pdfs, limits):
+                document = fitz.open(path)
+                try:
+                    subject=args.subject or subject_from_filename(path.name); source=source_document(db,owner,bank,path)
+                    job = seed_checkpoint(db, owner, bank, source); progress = checkpoint_meta(job)
+                    completed_through = int(progress.get("extracted_through_page") or 0)
+                    for core,visible in page_windows(limit,args.pages_per_request):
+                        if core[-1] <= completed_through:
+                            continue
+                        print(f"Extracting {path.name}: core pages {core[0]}-{core[-1]}", flush=True)
+                        items,window_usage=extract_window(document,subject,core,visible)
+                        for key in usage: usage[key]+=int(window_usage.get(key,0) or 0)
+                        for item in items:
+                            if isinstance(item,dict) and store_item(db,bank,owner,source,subject,document,item,core,args.publish_threshold): total+=1
+                        db.commit()
+                        save_checkpoint(db, job, extracted_through_page=core[-1])
+                    # The verified answer key/worked solution remains authoritative;
+                    # the VLM's text is retained, but it cannot publish by itself.
+                    if not checkpoint_meta(job).get("answers_mapped"):
+                        print(f"Mapping answer key and solutions for {path.name}: {map_pdf(db, path, False, bank, subject=args.subject)}")
+                        save_checkpoint(db, job, answers_mapped=True)
+                finally:
+                    document.close()
             result=publish_verified(db,bank,args.publish_threshold,args.publish_without_solution)
             if previous_bank:
                 if not db.query(Question).filter_by(bank_id=bank.id).first():
@@ -332,9 +373,7 @@ def main() -> None:
                 replace_bank(db,previous_bank)
                 bank.slug=args.bank_slug; bank.name=args.bank_name; bank.exam_code=args.exam_code; bank.is_global=True; db.commit()
             print(json.dumps({"created_or_resumed":total,"usage":usage,"publication":result,"bank_id":bank.id},indent=2))
-        finally: db.close()
-    finally:
-        for document in documents: document.close()
+    finally: db.close()
 
 
 if __name__ == "__main__": main()

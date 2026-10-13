@@ -204,9 +204,9 @@ def resolve_chapter(raw: str | None, by_name: dict[str, str], normalized: dict[s
 
 def answer_for(kind: QuestionKind, raw: str) -> dict | None:
     raw = raw.upper().replace(" ", "")
-    if kind in {QuestionKind.SINGLE, QuestionKind.ASSERTION} and re.fullmatch(r"[A-D]", raw):
+    if kind in {QuestionKind.SINGLE, QuestionKind.ASSERTION} and re.fullmatch(r"[A-E]", raw):
         return {"option": ord(raw) - ord("A")}
-    if kind == QuestionKind.MULTIPLE and re.fullmatch(r"[A-D]{1,4}", raw):
+    if kind == QuestionKind.MULTIPLE and re.fullmatch(r"[A-E]{1,5}", raw):
         return {"options": sorted({ord(letter) - ord("A") for letter in raw})}
     if kind == QuestionKind.MATRIX:
         pairs = re.findall(r"([A-Z])\s*[-–→]\s*([A-Z](?:\s*,\s*[A-Z])*)", raw, re.I)
@@ -228,9 +228,9 @@ def kind_from_source_answer(current: QuestionKind, raw: str) -> QuestionKind:
     compact_raw = re.sub(r"\s+", "", raw).upper()
     if re.search(r"\[[^]]*[A-D]\s*[-–→]", raw, re.I):
         return QuestionKind.MATRIX
-    if re.fullmatch(r"[A-D]{2,4}", compact_raw):
+    if re.fullmatch(r"[A-E]{2,5}", compact_raw):
         return QuestionKind.MULTIPLE
-    if re.fullmatch(r"[A-D]", compact_raw):
+    if re.fullmatch(r"[A-E]", compact_raw):
         return current if current == QuestionKind.ASSERTION else QuestionKind.SINGLE
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", compact_raw):
         return current if current in {QuestionKind.INTEGER, QuestionKind.NUMERICAL} else QuestionKind.NUMERICAL
