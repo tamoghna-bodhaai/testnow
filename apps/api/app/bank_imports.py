@@ -150,7 +150,12 @@ def run_bank_import(job_id: str) -> None:
             answer_text="\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(answer_raw)).pages)
         else:answer_text=""
         if not settings().openrouter_api_key:raise RuntimeError("OPENROUTER_API_KEY is not configured")
-        chunk_size=max(1,settings().bank_import_chunk_pages);ranges=list(range(0,page_count,chunk_size));numbers=set();flagged=0;saved=0
+        # Resume from the last durable page checkpoint.  Questions from prior
+        # batches remain in place and source-key checks make a replay safe.
+        checkpoint=max(0,min(page_count,int(meta.get("processed_pages") or 0)))
+        chunk_size=max(1,settings().bank_import_chunk_pages);ranges=list(range(checkpoint,page_count,chunk_size));numbers=set()
+        saved=db.query(Question).filter_by(import_job_id=job.id).count()
+        flagged=sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"))
         for chunk_index,start in enumerate(ranges,1):
             control=_control_state(db,job_id)
             if control:
@@ -159,13 +164,13 @@ def run_bank_import(job_id: str) -> None:
                 job.error="Cancelled by administrator" if control=="cancelled" else None
                 job.extraction_meta={**(job.extraction_meta or {}),"phase":"Cancelled" if control=="cancelled" else "Paused by administrator","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1};db.commit();return
             end=min(page_count,start+chunk_size);native="\n".join(f"--- PAGE {i+1} ---\n{reader.pages[i].extract_text() or ''}" for i in range(start,end))
-            content=[{"type":"text","text":f"Subject: {subject}. Extract only complete exam questions beginning on source pages {start+1}-{end}; preserve the original source page numbers. Detect chapter/subtopic. Native text:\n{native[:100000]}"}]
+            content=[{"type":"text","text":f"Subject: {subject}. Extract EVERY complete exam question that begins on source pages {start+1}-{end}; do not summarize, sample, combine, or stop after a handful of questions. Preserve each printed number and original source page. Detect chapter/subtopic. A question that starts here may continue onto the next page; include its complete visible content and span. Native text:\n{native[:100000]}"}]
             for page_no in range(start,end):
                 png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
                 content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
             if answer_text:content[0]["text"]+="\nANSWER/SOLUTION SOURCE (authoritative):\n"+answer_text[:50000]
             job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged};db.commit()
-            payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"stream":False}
+            payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
             response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow Bank Importer"},json=payload,timeout=settings().openrouter_timeout_seconds);response.raise_for_status()
             parsed=json.loads(response.json()["choices"][0]["message"]["content"]);added, new_flags=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers);saved+=added;flagged+=new_flags
             job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged};db.commit()

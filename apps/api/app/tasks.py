@@ -108,57 +108,57 @@ def diagrams_for_item(item:dict,native_regions:list[dict]):
     return diagrams
 @celery_app.task(bind=True,autoretry_for=(Exception,),retry_backoff=True,max_retries=2)
 def extract_import(self, job_id:str):
-    db:Session=SessionLocal(); job=db.get(ImportJob,job_id)
+    db:Session=SessionLocal(); rendered=None; job=db.get(ImportJob,job_id)
     try:
-      job.status=ImportStatus.PROCESSING; job.extraction_meta={"phase":"Reading the question paper"}; db.commit(); doc=db.get(SourceDocument, job.question_document_id); raw=get(doc.object_key)
+      meta=dict(job.extraction_meta or {})
+      job.status=ImportStatus.PROCESSING; job.extraction_meta={**meta,"phase":"Reading the question paper"}; db.commit(); doc=db.get(SourceDocument, job.question_document_id); raw=get(doc.object_key)
       reader=PdfReader(BytesIO(raw))
       if len(reader.pages)>settings().max_pdf_pages: raise ValueError(f"PDF exceeds the {settings().max_pdf_pages}-page limit")
-      text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages)); paper_title=infer_paper_title(reader,text,doc.filename)
-      # Full rendered pages are the VLM input. We preserve mathematical layout and diagrams,
-      # while native extraction acts only as context for reading order and recovery checks.
+      page_count=len(reader.pages)
+      if not page_count: raise ValueError("The PDF contains no pages")
+      title_text="\n".join(f"\n--- PAGE {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(reader.pages[:3])); paper_title=infer_paper_title(reader,title_text,doc.filename)
       rendered=fitz.open(stream=raw,filetype="pdf")
       native_regions=native_image_regions(rendered)
-      vision_content=[{"type":"text","text":f"Extract every question from this paper. Native layout context:\n{text[:100000]}"}]
-      rendered_bytes=0
-      for page_number,page in enumerate(rendered,1):
-          png=page.get_pixmap(matrix=fitz.Matrix(1.5,1.5),alpha=False).tobytes("png")
-          rendered_bytes+=len(png)
-          if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("PDF rendered pages exceed the extraction size limit")
-          vision_content.append({"type":"text","text":f"Source page {page_number}"})
-          vision_content.append({"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}})
       key_text=""
       if job.answer_document_id:
           key_doc=db.get(SourceDocument,job.answer_document_id)
           key_text="\nANSWER KEY DOCUMENT:\n"+"\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(get(key_doc.object_key))).pages)
-          vision_content[0]["text"]+=key_text[:40000]
       if not settings().openrouter_api_key: raise RuntimeError("OPENROUTER_API_KEY is not configured")
-      job.extraction_meta={"phase":"Extracting structured questions"}; db.commit()
       import httpx
-      payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":vision_content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"stream":False}
-      response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow"},json=payload,timeout=settings().openrouter_timeout_seconds); response.raise_for_status()
-      parsed=json.loads(response.json()["choices"][0]["message"]["content"]); numbers=set()
-      job.extraction_meta={"phase":"Saving extracted questions"}; db.commit()
-      for item in parsed["questions"]:
-        item=normalize_item(item)
-        validate(item)
-        if item["number"] in numbers:raise ValueError("Duplicate source question number")
-        numbers.add(item["number"]); kind=QuestionKind(item["kind"])
-        diagrams=[]
-        for n,diagram in enumerate(diagrams_for_item(item,native_regions)):
-          # VLM gives {page, bbox:[x0,y0,x1,y1]} in original PDF-point coordinates.
-          try:
-            page_no=int(diagram["page"])-1; x0,y0,x1,y1=diagram["bbox"]; page=rendered[page_no]
-            clip=fitz.Rect(float(x0),float(y0),float(x1),float(y1)) & page.rect
-            if clip.is_empty: raise ValueError("empty diagram box")
-            png=page.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png")
-            key=f"diagrams/{job.id}/{item['number']}-{n}.png";put(key,png,"image/png")
-            diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
-          except Exception: continue
-        db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=item["number"],kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item["solution_markdown"],confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams))
-      job.status=ImportStatus.REVIEW; job.extraction_meta={"model":settings().openrouter_model,"paper_title":paper_title,"question_count":len(parsed["questions"]),"phase":"Ready for review"};db.commit()
+      checkpoint=max(0,min(page_count,int(meta.get("processed_pages") or 0)))
+      numbers={str(value) for (value,) in db.query(Question.source_number).filter_by(import_job_id=job.id).all() if value}
+      chunk_size=max(1,settings().teacher_import_chunk_pages)
+      for start in range(checkpoint,page_count,chunk_size):
+        end=min(page_count,start+chunk_size)
+        native="\n".join(f"--- PAGE {page+1} ---\n{reader.pages[page].extract_text() or ''}" for page in range(start,end))
+        vision_content=[{"type":"text","text":f"Extract EVERY complete question beginning on source pages {start+1}-{end}; do not summarize or stop after a sample. Preserve printed numbers and source-page spans. Native layout context:\n{native[:100000]}{key_text[:40000]}"}]
+        rendered_bytes=0
+        for page_number in range(start,end):
+          png=rendered[page_number].get_pixmap(matrix=fitz.Matrix(1.25,1.25),alpha=False).tobytes("png")
+          rendered_bytes+=len(png)
+          if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("A rendered extraction batch exceeds the configured size limit")
+          vision_content.extend([{"type":"text","text":f"Source page {page_number+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}])
+        job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"question_count":len(numbers)};db.commit()
+        payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":vision_content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
+        response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow"},json=payload,timeout=settings().openrouter_timeout_seconds); response.raise_for_status()
+        for item in json.loads(response.json()["choices"][0]["message"]["content"]).get("questions",[]):
+          item=normalize_item(item);validate(item);number=str(item["number"])
+          if number in numbers: continue
+          numbers.add(number);kind=QuestionKind(item["kind"]);diagrams=[]
+          for n,diagram in enumerate(diagrams_for_item(item,native_regions)):
+            try:
+              page_no=int(diagram["page"])-1; x0,y0,x1,y1=diagram["bbox"]; page=rendered[page_no];clip=fitz.Rect(float(x0),float(y0),float(x1),float(y1)) & page.rect
+              if clip.is_empty: continue
+              key=f"diagrams/{job.id}/{number}-{n}.png";put(key,page.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png"),"image/png");diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
+            except Exception: continue
+          db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item["solution_markdown"],confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams))
+        job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers)};db.commit()
+      job.status=ImportStatus.REVIEW; job.extraction_meta={**meta,"model":settings().openrouter_model,"paper_title":paper_title,"processed_pages":page_count,"total_pages":page_count,"question_count":len(numbers),"phase":"Ready for review"};db.commit()
     except Exception as exc:
       job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit();raise
-    finally:db.close()
+    finally:
+      if rendered: rendered.close()
+      db.close()
 
 @celery_app.task(bind=True)
 def extract_bank_import(self, job_id: str):

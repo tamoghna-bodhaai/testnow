@@ -21,11 +21,15 @@ class Settings(BaseSettings):
     max_upload_bytes: int = 209_715_200
     # Long papers are processed in bounded batches instead of being rejected.
     # This is intentionally separate from the upload-size limit.
-    bank_import_chunk_pages: int = 20
-    # Retained for the older teacher-import path until it uses the same
-    # batching worker.  The admin bank path has no hard page-count rejection.
-    max_pdf_pages: int = 1000
-    max_rendered_pdf_bytes: int = 20_000_000
+    # Small visual batches preserve question boundaries and leave enough model
+    # output budget for every question on dense coaching-material pages.
+    bank_import_chunk_pages: int = 4
+    teacher_import_chunk_pages: int = 4
+    # Large papers are chunked; these remain safety guards, not practical
+    # extraction limits for a normal question bank.
+    max_pdf_pages: int = 5_000
+    max_rendered_pdf_bytes: int = 200_000_000
+    openrouter_max_output_tokens: int = 16_384
     cors_origins: str = "http://localhost:3000"
     seed_demo_data: bool = False
     super_admin_email: str = "utils@bodhaai.tech"
