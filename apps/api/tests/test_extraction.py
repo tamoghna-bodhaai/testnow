@@ -4,7 +4,7 @@ import pytest
 from app.bank_imports import _node, _pdf_bytes
 from app.models import QuestionBank, QuestionKind, SourceDocument, TaxonomyNode
 from app.seed_jee_openrouter import normalize_choice_kind
-from app.tasks import answer_from_key, normalize_item, page_unit_content, prepare_item_for_ingestion, validate
+from app.tasks import answer_from_key, embedded_answer_key_text, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, validate
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db import Base
@@ -45,14 +45,23 @@ def test_flattened_labeled_options_are_recovered_as_a_choice_question():
 
 def test_page_unit_owns_only_the_primary_page_and_has_continuation_context():
     content=page_unit_content(["Question 7", "options continue here", "Question 8"],0,"answer key")
-    assert "BEGINS on primary source page 1" in content
+    assert "BEGINS on primary source pages 1-1" in content
     assert "CONTINUATION CONTEXT PAGE 2" in content
     assert "Question 8" not in content
 
 def test_native_answer_key_lookup_maps_only_explicit_numbered_choice():
     options=[{"value":"a","markdown":"one"},{"value":"b","markdown":"two"}]
     assert answer_from_key("42",options,"41. A\n42. (B)\n43. A") == {"option":1}
+    assert answer_from_key("44",[],"44. -2.5") == {"value":"-2.5"}
     assert answer_from_key("42",options,"The answer to 42 may be B in some versions.") is None
+
+def test_sparse_pages_are_batched_but_dense_pages_are_bounded():
+    pages=["cover", "index", "1. a\n2. b\n3. c\n4. d\n5. e\n6. f\n7. g\n8. h\n9. i", "10. j"]
+    assert extraction_units(pages) == [(0,3),(3,4)]
+
+def test_combined_document_answer_key_pages_are_detected():
+    pages=["1. Question text", "ANSWER KEY\n1. A\n2. B\n3. C\n4. D\n5. A\n6. B"]
+    assert "1. A" in embedded_answer_key_text(pages)
 
 def test_docx_conversion_uses_generated_pdf_despite_javaldx_warning(monkeypatch):
     source=SourceDocument(id="source",owner_id="owner",filename="paper.docx",object_key="source.docx",sha256="x",media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",size_bytes=4)

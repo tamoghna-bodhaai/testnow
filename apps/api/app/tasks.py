@@ -20,6 +20,9 @@ SPAN_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bb
 SCHEMA={"name":"exam_questions","strict":True,"schema":{"type":"object","additionalProperties":False,"required":["questions"],"properties":{"questions":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["number","chapter","topic","kind","stem_markdown","options","answer","solution_markdown","confidence","source_spans","diagrams"],"properties":{"number":{"type":"string"},"chapter":{"type":"string"},"topic":{"type":"string"},"kind":{"type":"string","enum":["single_choice","multiple_choice","numerical","integer","matrix_match","assertion_reason","subjective"]},"stem_markdown":{"type":"string"},"options":{"type":"array","items":OPTION_SCHEMA},"answer":{"type":["object","null"]},"solution_markdown":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"source_spans":{"type":"array","items":SPAN_SCHEMA},"diagrams":{"type":"array","items":DIAGRAM_SCHEMA}}}}}}}
 
 _INLINE_OPTION=re.compile(r"(?:^|\n)\s*(?:\(?([A-Ha-h])\)|([A-Ha-h])[.)])\s*(.+?)(?=(?:\n\s*(?:\(?[A-Ha-h]\)|[A-Ha-h][.)])\s*)|$)",re.S)
+_QUESTION_START=re.compile(r"(?m)^\s*(?:q(?:uestion)?\s*)?\d{1,4}\s*[.)]")
+_ANSWER_HEADING=re.compile(r"\b(?:answer\s*key|answers?\b|solutions?\b|answer\s*&\s*solution)",re.I)
+_ANSWER_CELL=re.compile(r"(?<!\d)\d{1,4}(?!\d)\s*(?:[.)-]\s*)?\(?[A-H]\)?(?=\s|$)",re.I)
 
 def options_embedded_in_stem(stem:object)->tuple[str,list[dict]]:
     """Recover choices when a provider flattened a visibly labelled MCQ.
@@ -95,14 +98,21 @@ def answer_from_key(number:object, options:list[dict], key_text:str)->dict|None:
     fallback accepts only a question-number followed immediately by one of the
     displayed A-H labels, so prose in a solution cannot become a false key.
     """
-    if not key_text or not options:return None
-    label=r"(?:^|[\n\r])\s*(?:q(?:uestion)?\s*)?"+re.escape(str(number).strip())+r"\s*(?:[).:-]\s*)?(?:ans(?:wer)?\s*[:=-]?\s*)?\(?([A-H])\)?\b"
-    match=re.search(label,key_text,re.I)
-    if not match:return None
-    choice=match.group(1).lower()
-    for index,option in enumerate(options):
-        if choice in {str(index+1),str(option.get("value","")).lower(),chr(97+index)}:
-            return {"option":index}
+    if not key_text:return None
+    prefix=r"(?<!\d)(?:q(?:uestion)?\s*)?"+re.escape(str(number).strip())+r"(?!\d)\s*(?:[).:-]\s*)?(?:ans(?:wer)?\s*[:=-]?\s*)?"
+    match=re.search(prefix+r"\(?([A-H])\)?(?=\s|$)",key_text,re.I)
+    if match:
+        choice=match.group(1).lower()
+        for index,option in enumerate(options):
+            if choice in {str(index+1),str(option.get("value","")).lower(),chr(97+index)}:
+                return {"option":index}
+    # Numerical/integer keys conventionally contain a literal after their
+    # printed question number.  Preserve it as the value scoring shape.
+    numeric=re.search(prefix+r"([-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[-+]?\d+)?)\b",key_text,re.I)
+    if numeric:
+        value=numeric.group(1)
+        if value.isdigit() and 1<=int(value)<=len(options):return {"option":int(value)-1}
+        return {"value":value}
     return None
 def validate(item:dict):
     if not item.get("stem_markdown"):raise ValueError("Blank question stem")
@@ -153,20 +163,35 @@ def best_page_text(raw:bytes, reader:PdfReader, rendered:fitz.Document)->list[st
         result.append(mupdf_text if len(mupdf_text)>len(pypdf_text) else pypdf_text)
     return result
 
-def page_unit_content(page_texts:list[str], start:int, key_text:str)->str:
-    """Return one owned source page plus a read-only continuation page.
+def extraction_units(page_texts:list[str], max_pages:int=8, max_questions:int=9)->list[tuple[int,int]]:
+    """Batch sparse pages, but isolate dense pages before JSON gets truncated."""
+    units=[];start=0
+    while start<len(page_texts):
+        end=start;questions=0
+        while end<len(page_texts) and end-start<max_pages:
+            found=len(_QUESTION_START.findall(page_texts[end]))
+            if end>start and questions and questions+found>max_questions:break
+            questions+=found;end+=1
+        units.append((start,end));start=end
+    return units
 
-    Owning one page bounds structured output on dense papers.  The following
-    page is context only, so a question that crosses a page break is complete
-    without being emitted a second time on the following unit.
-    """
-    primary=page_texts[start] if start<len(page_texts) else ""
-    continuation=page_texts[start+1] if start+1<len(page_texts) else ""
-    text=(f"Extract every question that BEGINS on primary source page {start+1}. "
+def embedded_answer_key_text(page_texts:list[str])->str:
+    """Locate answer-table pages in a combined question-and-solution PDF."""
+    candidates=[]
+    for index,text in enumerate(page_texts):
+        cells=len(_ANSWER_CELL.findall(text))
+        if _ANSWER_HEADING.search(text) or cells>=6:candidates.append(index)
+    return "\n".join(page_texts[index] for index in candidates)
+
+def page_unit_content(page_texts:list[str], start:int, key_text:str, end:int|None=None)->str:
+    """Return owned source pages plus one read-only continuation page."""
+    end=end or start+1
+    primary="\n".join(f"PRIMARY PAGE {index+1}:\n{page_texts[index][:70000]}" for index in range(start,min(end,len(page_texts))))
+    continuation=page_texts[end] if end<len(page_texts) else ""
+    text=(f"Extract every question that BEGINS on primary source pages {start+1}-{end}. "
           f"The following page, when present, is continuation context only: never emit a question that begins there. "
-          f"Do not stop after a sample; return every complete question beginning on the primary page. "
-          f"PRIMARY PAGE {start+1}:\n{primary[:70000]}")
-    if continuation:text+=f"\n\nCONTINUATION CONTEXT PAGE {start+2}:\n{continuation[:30000]}"
+          f"Do not stop after a sample; return every complete question beginning on the primary pages.\n{primary}")
+    if continuation:text+=f"\n\nCONTINUATION CONTEXT PAGE {end+1}:\n{continuation[:30000]}"
     if key_text:text+=f"\n\nANSWER KEY DOCUMENT (authoritative):\n{key_text[:40000]}"
     return text
 
@@ -263,6 +288,9 @@ def extract_import(self, job_id:str):
       if job.answer_document_id:
           key_doc=db.get(SourceDocument,job.answer_document_id)
           key_text="\nANSWER KEY DOCUMENT:\n"+"\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(get(key_doc.object_key))).pages)
+      # Combined books often append a compact answer table.  Use it for native
+      # answer lookup even when no separately uploaded key exists.
+      answer_lookup_text=key_text or embedded_answer_key_text(page_texts)
       if not settings().openrouter_api_key: raise RuntimeError("OPENROUTER_API_KEY is not configured")
       checkpoint=max(0,min(page_count,int(meta.get("processed_pages") or 0)))
       # Question numbers repeat across sections in many papers.  Couple the
@@ -270,13 +298,14 @@ def extract_import(self, job_id:str):
       # safe to replay after a worker interruption.
       numbers={(str(number),int((spans or [{}])[0].get("page") or 0)) for number,spans in db.query(Question.source_number,Question.source_spans).filter_by(import_job_id=job.id).all() if number}
       failed_pages=list(meta.get("failed_pages") or [])
-      for start in range(checkpoint,page_count):
-        end=start+1
-        vision_content=[{"type":"text","text":page_unit_content(page_texts,start,key_text)}]
+      units=[unit for unit in extraction_units(page_texts) if unit[1]>checkpoint]
+      for start,end in units:
+        if start<checkpoint:start=checkpoint
+        vision_content=[{"type":"text","text":page_unit_content(page_texts,start,key_text,end)}]
         rendered_bytes=0
         # Include one continuation page visually too.  It provides options and
         # diagrams that cross a page break, but only the primary page owns IDs.
-        for page_number in range(start,min(page_count,start+2)):
+        for page_number in range(start,min(page_count,end+1)):
           png=rendered[page_number].get_pixmap(matrix=fitz.Matrix(1.25,1.25),alpha=False).tobytes("png")
           rendered_bytes+=len(png)
           if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("A rendered extraction batch exceeds the configured size limit")
@@ -297,12 +326,12 @@ def extract_import(self, job_id:str):
           if item is None:
             skipped+=1;continue
           if not item.get("answer"):
-            item["answer"]=answer_from_key(item.get("number"),item.get("options") or [],key_text)
+            item["answer"]=answer_from_key(item.get("number"),item.get("options") or [],answer_lookup_text)
           number=str(item["number"])
           owned_page=int((item.get("source_spans") or [{}])[0].get("page") or start+1)
           # Reject a model returning continuation-owned records, rather than
           # depending on a global number dedupe that loses valid questions.
-          if owned_page!=start+1 or (number,owned_page) in numbers: continue
+          if owned_page not in range(start+1,end+1) or (number,owned_page) in numbers: continue
           numbers.add((number,owned_page));kind=QuestionKind(item["kind"]);diagrams=[]
           for n,diagram in enumerate(diagrams_for_item(item,native_regions)):
             try:

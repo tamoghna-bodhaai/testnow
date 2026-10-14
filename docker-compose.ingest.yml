@@ -35,7 +35,7 @@ services:
       COOKIE_SECURE: "false"
       CORS_ORIGINS: http://localhost:3000
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-qwen/qwen3.5-122b-a10b}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-120}
       SEED_DEMO_DATA: "false"
     depends_on:

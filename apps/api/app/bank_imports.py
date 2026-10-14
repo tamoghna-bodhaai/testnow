@@ -16,7 +16,7 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
-from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, diagrams_for_item, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
+from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, diagrams_for_item, embedded_answer_key_text, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
 
 
 def _pdf_bytes(source: SourceDocument) -> bytes:
@@ -104,7 +104,7 @@ def _control_state(db, job_id: str) -> str | None:
     return None
 
 
-def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers, owned_page:int|None=None, answer_text:str=""):
+def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers, owned_pages:set[int]|None=None, answer_text:str=""):
     flagged=0; saved=0; skipped=0
     # Serialize the small taxonomy/write phase per bank.  This prevents two
     # source jobs from creating a second NULL-parent subject simultaneously.
@@ -119,11 +119,11 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
         # page span makes its identity stable, while repeated batch output is
         # discarded by the source-key check below.
         page=(item.get("source_spans") or [{}])[0].get("page")
-        if owned_page is not None and int(page or owned_page)!=owned_page:
+        if owned_pages is not None and int(page or min(owned_pages)) not in owned_pages:
             # The trailing context page is supplied to complete a split
             # question, but ownership remains with the page where it starts.
             continue
-        page=page or owned_page
+        page=page or (min(owned_pages) if owned_pages else None)
         source_key=f"{source.sha256}:{number}:{page or 'unknown'}"
         if source_key in seen_numbers or db.query(Question.id).filter_by(bank_id=bank.id,source_key=source_key).first():
             continue
@@ -167,6 +167,7 @@ def run_bank_import(job_id: str) -> None:
             answer_source=db.get(SourceDocument,job.answer_document_id);answer_raw=_pdf_bytes(answer_source)
             answer_text="\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(answer_raw)).pages)
         else:answer_text=""
+        answer_lookup_text=answer_text or embedded_answer_key_text(page_texts)
         if not settings().openrouter_api_key:raise RuntimeError("OPENROUTER_API_KEY is not configured")
         # Resume from the last durable page checkpoint.  Questions from prior
         # batches remain in place and source-key checks make a replay safe.
@@ -174,19 +175,19 @@ def run_bank_import(job_id: str) -> None:
         # A page is the durable ownership unit.  It prevents response-output
         # truncation on 100+ question source files and gives retries a precise
         # restart point without changing the surrounding Celery infrastructure.
-        ranges=list(range(checkpoint,page_count));numbers=set()
+        ranges=[unit for unit in extraction_units(page_texts) if unit[1]>checkpoint];numbers=set()
         saved=db.query(Question).filter_by(import_job_id=job.id).count()
         flagged=sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"));skipped=int(meta.get("skipped_count") or 0);failed_pages=list(meta.get("failed_pages") or [])
-        for chunk_index,start in enumerate(ranges,1):
+        for chunk_index,(start,end) in enumerate(ranges,1):
+            if start<checkpoint:start=checkpoint
             control=_control_state(db,job_id)
             if control:
                 job=db.get(ImportJob,job_id)
                 job.status=ImportStatus.FAILED if control=="cancelled" else ImportStatus.UPLOADED
                 job.error="Cancelled by administrator" if control=="cancelled" else None
                 job.extraction_meta={**(job.extraction_meta or {}),"phase":"Cancelled" if control=="cancelled" else "Paused by administrator","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1};db.commit();return
-            end=start+1
-            content=[{"type":"text","text":f"Subject: {subject}. {page_unit_content(page_texts,start,answer_text)}"}]
-            for page_no in range(start,min(page_count,start+2)):
+            content=[{"type":"text","text":f"Subject: {subject}. {page_unit_content(page_texts,start,answer_text,end)}"}]
+            for page_no in range(start,min(page_count,end+1)):
                 png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
                 content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
             job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};db.commit()
@@ -196,7 +197,7 @@ def run_bank_import(job_id: str) -> None:
             except Exception as page_error:
                 failed_pages.append({"page":start+1,"error":str(page_error)[:300]})
                 job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
-            added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,start+1,answer_text);saved+=added;flagged+=new_flags;skipped+=new_skipped
+            added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,set(range(start+1,end+1)),answer_lookup_text);saved+=added;flagged+=new_flags;skipped+=new_skipped
             job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
         job.status=ImportStatus.REVIEW if flagged or failed_pages else ImportStatus.APPROVED
         phase="Needs anomaly review" if flagged or failed_pages else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication")
