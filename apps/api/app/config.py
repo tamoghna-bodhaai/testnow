@@ -19,7 +19,12 @@ class Settings(BaseSettings):
     # Applies per source file.  The web relay is configured to the same 200 MB
     # ceiling, so large chapter documents are rejected consistently.
     max_upload_bytes: int = 209_715_200
-    max_pdf_pages: int = 60
+    # Long papers are processed in bounded batches instead of being rejected.
+    # This is intentionally separate from the upload-size limit.
+    bank_import_chunk_pages: int = 20
+    # Retained for the older teacher-import path until it uses the same
+    # batching worker.  The admin bank path has no hard page-count rejection.
+    max_pdf_pages: int = 1000
     max_rendered_pdf_bytes: int = 20_000_000
     cors_origins: str = "http://localhost:3000"
     seed_demo_data: bool = False

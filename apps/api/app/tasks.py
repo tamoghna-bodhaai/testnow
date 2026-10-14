@@ -160,7 +160,9 @@ def extract_import(self, job_id:str):
       job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit();raise
     finally:db.close()
 
-@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=2)
+@celery_app.task(bind=True)
 def extract_bank_import(self, job_id: str):
     from .bank_imports import run_bank_import
-    run_bank_import(job_id)
+    # The bank importer records a durable terminal state itself.  Retrying every
+    # exception made permanent validation failures look like live processing.
+    return run_bank_import(job_id)

@@ -251,6 +251,44 @@ def retry_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMI
     db.commit();extract_bank_import.delay(job.id)
     return import_view(job,db)
 
+@app.get("/admin/question-banks/{bank_id}/imports/{job_id}")
+def get_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    return {**import_view(job,db),"questions":[question_view(q,db) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.created_at.desc()).all()]}
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/pause")
+def pause_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    if job.status not in {ImportStatus.UPLOADED,ImportStatus.PROCESSING}:raise HTTPException(409,"Only queued or processing imports can be paused")
+    job.extraction_meta={**(job.extraction_meta or {}),"pause_requested":True,"phase":"Pause requested — finishing the current page batch"}
+    audit(db,user.id,"question_bank.import_paused","import",job.id,{"bank_id":bank_id});db.commit();return import_view(job,db)
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/resume",status_code=202)
+def resume_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    if not (job.extraction_meta or {}).get("pause_requested"):raise HTTPException(409,"This import is not paused")
+    job.status=ImportStatus.UPLOADED;job.error=None;job.extraction_meta={**(job.extraction_meta or {}),"pause_requested":False,"phase":"Queued to resume"}
+    audit(db,user.id,"question_bank.import_resumed","import",job.id,{"bank_id":bank_id});db.commit();extract_bank_import.delay(job.id);return import_view(job,db)
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/cancel")
+def cancel_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    if job.status not in {ImportStatus.UPLOADED,ImportStatus.PROCESSING}:raise HTTPException(409,"Only queued or processing imports can be cancelled")
+    job.extraction_meta={**(job.extraction_meta or {}),"cancel_requested":True,"phase":"Cancellation requested — finishing the current page batch"}
+    audit(db,user.id,"question_bank.import_cancelled","import",job.id,{"bank_id":bank_id});db.commit();return import_view(job,db)
+
+@app.delete("/admin/question-banks/{bank_id}/imports/{job_id}",status_code=204)
+def delete_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    if job.status in {ImportStatus.UPLOADED,ImportStatus.PROCESSING}:raise HTTPException(409,"Cancel or pause this running import before removing it")
+    db.query(Question).filter_by(import_job_id=job.id).delete(synchronize_session=False)
+    db.delete(job);audit(db,user.id,"question_bank.import_deleted","import",job_id,{"bank_id":bank_id});db.commit()
+
 @app.post("/admin/question-banks/{bank_id}/publish")
 def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     bank=db.get(QuestionBank,bank_id)
@@ -389,7 +427,7 @@ def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.T
     db.commit();return question_view(q)
 def import_view(job:ImportJob,db:Session|None=None):
     source=db.get(SourceDocument,job.question_document_id) if db else None
-    return {"id":job.id,"status":job.status.value,"error":job.error,"meta":job.extraction_meta,"created_at":job.created_at,"filename":source.filename if source else None}
+    return {"id":job.id,"status":job.status.value,"error":job.error,"meta":job.extraction_meta,"created_at":job.created_at,"filename":source.filename if source else None,"source_id":source.id if source else None}
 def normalized_options(options):
     output=[]
     for index,option in enumerate(options or []):
