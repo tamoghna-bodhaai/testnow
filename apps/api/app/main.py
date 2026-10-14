@@ -8,11 +8,11 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
 from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionBankCreate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import audit, ensure_live, publish, score, safe_question_kind, snapshot_questions
 from .storage import client as storage_client, digest, get, put, signed_get
-from .tasks import extract_import
+from .tasks import extract_import, extract_bank_import
 from .seed import ensure_demo_data
 
 app=FastAPI(title="TestNow API",version="1.0.0")
@@ -106,6 +106,92 @@ def teacher_view(teacher:User,db:Session):
 def admin_dashboard(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     teachers=db.query(User).filter_by(role=Role.TEACHER).order_by(User.created_at.desc()).all()
     return {"summary":{"teachers":len(teachers),"active_teachers":sum(1 for teacher in teachers if teacher.status==AccountStatus.ACTIVE),"suspended_teachers":sum(1 for teacher in teachers if teacher.status==AccountStatus.SUSPENDED),"students":db.query(User).filter_by(role=Role.STUDENT).count()},"teachers":[teacher_view(teacher,db) for teacher in teachers]}
+
+def bank_view(bank:QuestionBank,db:Session):
+    questions=db.query(Question).filter_by(bank_id=bank.id,scope=QuestionScope.GLOBAL)
+    jobs=db.query(ImportJob).filter_by(bank_id=bank.id)
+    return {"id":bank.id,"slug":bank.slug,"name":bank.name,"exam_code":bank.exam_code,"status":bank.status,"revision":bank.revision,"is_global":bank.is_global,"question_count":questions.count(),"published_count":questions.filter(Question.approved_at.is_not(None)).count(),"import_count":jobs.count(),"flagged_count":sum(1 for q in questions if (q.interaction or {}).get("ingestion_issues"))}
+
+def bank_slug(value:str,db:Session)->str:
+    base=re.sub(r"[^a-z0-9]+","-",value.lower()).strip("-")[:60] or "question-bank"; candidate=base;index=2
+    while db.query(QuestionBank).filter_by(slug=candidate).first():candidate=f"{base[:54]}-{index}";index+=1
+    return candidate
+
+@app.get("/admin/question-banks")
+def admin_question_banks(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    return [bank_view(bank,db) for bank in db.query(QuestionBank).order_by(QuestionBank.created_at.desc())]
+
+@app.post("/admin/question-banks",status_code=201)
+def create_question_bank(data:QuestionBankCreate,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=QuestionBank(id=uid(),slug=bank_slug(data.name,db),name=data.name.strip(),exam_code=(data.exam_code or "GENERAL").strip() or "GENERAL",is_global=False,status="draft",revision=1)
+    db.add(bank);audit(db,user.id,"question_bank.created","question_bank",bank.id,{"name":bank.name});db.commit();return bank_view(bank,db)
+
+@app.get("/admin/question-banks/{bank_id}")
+def admin_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id)
+    if not bank:raise HTTPException(404,"Question bank not found")
+    jobs=db.query(ImportJob).filter_by(bank_id=bank.id).order_by(ImportJob.created_at.desc()).all()
+    questions=db.query(Question).filter_by(bank_id=bank.id).order_by(Question.created_at.desc()).all()
+    return {**bank_view(bank,db),"imports":[import_view(job,db) for job in jobs],"questions":[question_view(q,db) for q in questions]}
+
+def source_stem(filename:str)->str:
+    value=re.sub(r"\.(pdf|docx)$","",filename,flags=re.I)
+    value=re.sub(r"(answer[_ -]?key|answers?|solutions?)","",value,flags=re.I)
+    return re.sub(r"[^a-z0-9]+","",value.lower())
+
+async def store_bank_source(file:UploadFile,user:User,bank:QuestionBank,db:Session)->SourceDocument:
+    name=re.sub(r"[^A-Za-z0-9._ -]","_",file.filename or "source")
+    extension=name.rsplit(".",1)[-1].lower() if "." in name else ""
+    if extension not in {"pdf","docx"}:raise HTTPException(415,"Only PDF and DOCX source files are accepted")
+    raw=await file.read()
+    if not raw or len(raw)>settings().max_upload_bytes:raise HTTPException(422,"Invalid or oversized source document")
+    if extension=="pdf" and not raw.startswith(b"%PDF"):raise HTTPException(422,"Invalid PDF")
+    checksum=digest(raw);existing=db.query(SourceDocument).filter(SourceDocument.sha256==checksum,SourceDocument.object_key.like(f"bank-sources/{bank.id}/%")).first()
+    if existing:return existing
+    media="application/pdf" if extension=="pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    source=SourceDocument(id=uid(),owner_id=user.id,filename=name,object_key=f"bank-sources/{bank.id}/{uid()}-{name}",sha256=checksum,media_type=media,size_bytes=len(raw));put(source.object_key,raw,media);db.add(source);db.flush();return source
+
+@app.post("/admin/question-banks/{bank_id}/imports",status_code=202)
+async def create_bank_imports(bank_id:str,subject:str,question_files:list[UploadFile]=File(...),answer_files:list[UploadFile]=File(default=[]),user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id)
+    if not bank or bank.status=="published":raise HTTPException(409,"Create a revision import for a published bank")
+    subject=subject.strip()
+    if not subject:raise HTTPException(422,"Subject is required")
+    questions=[await store_bank_source(file,user,bank,db) for file in question_files]
+    answers=[await store_bank_source(file,user,bank,db) for file in answer_files]
+    answer_by_stem={source_stem(item.filename):item for item in answers}; jobs=[]
+    for source in questions:
+        paired=answer_by_stem.get(source_stem(source.filename)) or (answers[0] if len(questions)==len(answers)==1 else None)
+        meta={"subject":subject,"source_role":"combined" if not paired else "question","pairing":"matched" if paired else "missing_answer_source","phase":"Queued for extraction"}
+        job=ImportJob(id=uid(),owner_id=user.id,bank_id=bank.id,question_document_id=source.id,answer_document_id=paired.id if paired else None,status=ImportStatus.UPLOADED,extraction_meta=meta);db.add(job);jobs.append(job)
+    bank.status="processing";audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"files":len(questions)});db.commit()
+    for job in jobs:extract_bank_import.delay(job.id)
+    return {"bank":bank_view(bank,db),"imports":[import_view(job,db) for job in jobs]}
+
+@app.post("/admin/question-banks/{bank_id}/questions/{question_id}/resolve")
+def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    q=db.get(Question,question_id);bank=db.get(QuestionBank,bank_id)
+    if not bank or not q or q.bank_id!=bank.id:raise HTTPException(404,"Question not found")
+    if q.kind in {QuestionKind.SINGLE,QuestionKind.MULTIPLE,QuestionKind.ASSERTION} and len(data.options)<2:raise HTTPException(422,"Choice questions need at least two options")
+    # Review edits may correct rendered content and scoring, but must never
+    # erase the immutable source spans/diagram provenance captured at ingest.
+    for name,value in data.model_dump().items():
+        if name not in {"source_spans","diagrams","interaction"}:setattr(q,name,value)
+    if q.kind!=QuestionKind.SUBJECTIVE and not q.answer:raise HTTPException(422,"A reviewed answer is required")
+    q.interaction={**(q.interaction or {}),"ingestion_issues":[],"reviewed_by":user.id};q.approved_at=datetime.now(timezone.utc)
+    job=db.get(ImportJob,q.import_job_id)
+    if job and not db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first():job.status=ImportStatus.APPROVED;job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete","flagged_count":0}
+    db.commit();return question_view(q,db)
+
+@app.post("/admin/question-banks/{bank_id}/publish")
+def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id)
+    if not bank:raise HTTPException(404,"Question bank not found")
+    jobs=db.query(ImportJob).filter_by(bank_id=bank.id).all();questions=db.query(Question).filter_by(bank_id=bank.id).all()
+    if not jobs:raise HTTPException(422,"Upload at least one source document before publishing")
+    if any(job.status!=ImportStatus.APPROVED for job in jobs):raise HTTPException(422,"Resolve failed or pending imports before publishing")
+    if not questions or any(not q.approved_at or (q.interaction or {}).get("ingestion_issues") for q in questions):raise HTTPException(422,"Resolve every flagged question before publishing")
+    bank.is_global=True;bank.status="published";audit(db,user.id,"question_bank.published","question_bank",bank.id,{"questions":len(questions)});db.commit();return bank_view(bank,db)
 
 @app.get("/admin/teachers")
 def admin_teachers(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
@@ -283,7 +369,7 @@ def question_banks(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Sessio
 def bank_taxonomy(bank_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     if not db.get(QuestionBank,bank_id):raise HTTPException(404,"Question bank not found")
     return [{"id":n.id,"parent_id":n.parent_id,"kind":n.kind,"name":n.name,"code":n.code} for n in db.query(TaxonomyNode).filter_by(bank_id=bank_id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
-def global_bank_query(db:Session,bank_id:str,subject_id:str|None=None,chapter_id:str|None=None,published:bool=True):
+def global_bank_query(db:Session,bank_id:str,subject_id:str|None=None,chapter_id:str|None=None,subtopic_id:str|None=None,published:bool=True):
     """One-row-per-question query shared by listing and live availability."""
     query=db.query(Question).filter(Question.bank_id==bank_id,Question.scope==QuestionScope.GLOBAL)
     if published:query=query.filter(Question.approved_at.is_not(None))
@@ -303,19 +389,27 @@ def global_bank_query(db:Session,bank_id:str,subject_id:str|None=None,chapter_id
             TaxonomyNode.id==chapter_id,
             TaxonomyNode.kind=="chapter",
         ))
+    if subtopic_id:
+        query=query.filter(exists().where(
+            QuestionTaxonomy.question_id==Question.id,
+            QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id,
+            TaxonomyNode.id==subtopic_id,
+            TaxonomyNode.kind=="topic",
+        ))
     return query
 @app.get("/question-banks/{bank_id}/question-counts")
 def bank_question_counts(
     bank_id:str,
     subject_id:str|None=None,
     chapter_id:str|None=None,
+    subtopic_id:str|None=None,
     user:User=Depends(require(Role.TEACHER,Role.ADMIN)),
     db:Session=Depends(get_db),
 ):
     """Published question availability, grouped by type for the active taxonomy filter."""
     bank=db.get(QuestionBank,bank_id)
     if not bank or not bank.is_global:raise HTTPException(404,"Question bank not found")
-    query=global_bank_query(db,bank_id,subject_id,chapter_id)
+    query=global_bank_query(db,bank_id,subject_id,chapter_id,subtopic_id)
     rows=query.with_entities(Question.kind,func.count(Question.id)).group_by(Question.kind).all()
     counts={kind.value:int(total) for kind,total in rows}
     return {"total":sum(counts.values()),"counts":counts}
@@ -324,6 +418,7 @@ def bank_questions(
     bank_id:str,
     subject_id:str|None=None,
     chapter_id:str|None=None,
+    subtopic_id:str|None=None,
     kinds:list[str]=Query(default=[]),
     page:int=Query(default=1,ge=1),
     page_size:int=Query(default=25,ge=1,le=100),
@@ -337,7 +432,7 @@ def bank_questions(
     if include_review and user.role!=Role.ADMIN:raise HTTPException(403,"Only administrators can inspect unpublished bank questions")
     valid_kinds={kind.value for kind in QuestionKind}
     if unknown:=set(kinds)-valid_kinds:raise HTTPException(422,f"Unsupported question type: {sorted(unknown)[0]}")
-    query=global_bank_query(db,bank_id,subject_id,chapter_id,published=not include_review)
+    query=global_bank_query(db,bank_id,subject_id,chapter_id,subtopic_id,published=not include_review)
     if kinds:query=query.filter(Question.kind.in_([QuestionKind(value) for value in kinds]))
     total=query.count()
     rows=query.order_by(Question.created_at.desc(),Question.id).offset((page-1)*page_size).limit(page_size).all()

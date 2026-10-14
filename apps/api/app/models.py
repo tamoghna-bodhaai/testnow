@@ -46,6 +46,7 @@ class ImportJob(Timestamped, Base):
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     question_document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id"))
     answer_document_id: Mapped[str | None] = mapped_column(ForeignKey("source_documents.id"))
+    bank_id: Mapped[str | None] = mapped_column(ForeignKey("question_banks.id", ondelete="CASCADE"), index=True)
     status: Mapped[ImportStatus] = mapped_column(Enum(ImportStatus), default=ImportStatus.UPLOADED)
     error: Mapped[str | None] = mapped_column(Text); extraction_meta: Mapped[dict] = mapped_column(JSON, default=dict)
 class QuestionBank(Timestamped, Base):
@@ -55,6 +56,10 @@ class QuestionBank(Timestamped, Base):
     name: Mapped[str] = mapped_column(String(160))
     exam_code: Mapped[str] = mapped_column(String(80), index=True)
     is_global: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Draft banks and revisions are deliberately private until a super admin
+    # publishes a fully reviewed release.
+    status: Mapped[str] = mapped_column(String(24), default="draft", nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 class TaxonomyNode(Timestamped, Base):
     __tablename__="taxonomy_nodes"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

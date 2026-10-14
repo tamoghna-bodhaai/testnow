@@ -80,10 +80,8 @@ extracting bounded diagrams. It never stores a whole-question image in place of
 question text. Chemistry question files are paired with their corresponding
 answer-and-solution files; an exact duplicate solution file is skipped.
 
-Either mount the folder containing the `physics`, `chemistry`, and `maths`
-subdirectories at `/imports/docx-conversion`, or upload that hierarchy to
-`imports/qbank3-docx/` in the configured object-storage bucket. Then run inside
-the API image:
+Mount the folder containing the `physics`, `chemistry`, and `maths`
+subdirectories at `/imports/docx-conversion`, then run inside the API image:
 
 ```bash
 python -m app.import_qbank3_docx --owner-email utils@bodhaai.tech --dry-run \
@@ -91,9 +89,6 @@ python -m app.import_qbank3_docx --owner-email utils@bodhaai.tech --dry-run \
 
 python -m app.import_qbank3_docx --owner-email utils@bodhaai.tech \
   /imports/docx-conversion
-
-python -m app.import_qbank3_docx --owner-email utils@bodhaai.tech \
-  --s3-prefix imports/qbank3-docx
 ```
 
 The importer is safe to resume. It publishes validated records into the global
