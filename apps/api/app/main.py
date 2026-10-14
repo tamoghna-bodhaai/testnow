@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import csv, io, re
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import exists, func, or_
@@ -189,7 +189,7 @@ async def store_bank_source(file:UploadFile,user:User,bank:QuestionBank,db:Sessi
     source=SourceDocument(id=uid(),owner_id=user.id,filename=name,object_key=f"bank-sources/{bank.id}/{uid()}-{name}",sha256=checksum,media_type=media,size_bytes=len(raw));put(source.object_key,raw,media);db.add(source);db.flush();return source
 
 @app.post("/admin/question-banks/{bank_id}/imports",status_code=202)
-async def create_bank_imports(bank_id:str,subject:str,question_files:list[UploadFile]=File(...),answer_files:list[UploadFile]=File(default=[]),user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:list[UploadFile]=File(...),answer_files:list[UploadFile]=File(default=[]),user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     bank=db.get(QuestionBank,bank_id)
     if not bank or bank.status=="published":raise HTTPException(409,"Create a revision import for a published bank")
     subject=subject.strip()
