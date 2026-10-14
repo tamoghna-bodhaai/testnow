@@ -29,6 +29,9 @@ class QuestionIn(BaseModel):
 class QuestionBankCreate(BaseModel):
     name:str=Field(min_length=2,max_length=160)
     exam_code:str|None=Field(default=None,max_length=80)
+class QuestionBankUpdate(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
+    exam_code:str|None=Field(default=None,max_length=80)
 class QuestionOut(QuestionIn): id:str; approved:bool=False; bank_id:str|None=None; scope:str="private"; taxonomy:list[dict]=Field(default_factory=list)
 class AnswerKeyIn(BaseModel): answer:dict=Field(min_length=1); confidence:float|None=Field(default=None,ge=0,le=1)
 class TestCreate(BaseModel): title:str=Field(min_length=2,max_length=255); subject:str=Field(min_length=2,max_length=120); duration_minutes:int=Field(ge=1); opens_at:datetime|None=None; closes_at:datetime|None=None; max_attempts:int=Field(default=1,ge=1,le=10); results_policy:dict=Field(default_factory=lambda:{"mode":"immediate"}); question_ids:list[str]=Field(min_length=1)

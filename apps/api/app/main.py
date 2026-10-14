@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
 from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionBankCreate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import audit, ensure_live, publish, score, safe_question_kind, snapshot_questions
 from .storage import client as storage_client, digest, get, put, signed_get
@@ -119,7 +119,7 @@ def bank_slug(value:str,db:Session)->str:
 
 @app.get("/admin/question-banks")
 def admin_question_banks(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
-    return [bank_view(bank,db) for bank in db.query(QuestionBank).order_by(QuestionBank.created_at.desc())]
+    return [bank_view(bank,db) for bank in db.query(QuestionBank).filter(QuestionBank.status!="deleted").order_by(QuestionBank.created_at.desc())]
 
 @app.post("/admin/question-banks",status_code=201)
 def create_question_bank(data:QuestionBankCreate,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
@@ -129,10 +129,47 @@ def create_question_bank(data:QuestionBankCreate,user:User=Depends(require(Role.
 @app.get("/admin/question-banks/{bank_id}")
 def admin_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     bank=db.get(QuestionBank,bank_id)
-    if not bank:raise HTTPException(404,"Question bank not found")
+    if not bank or bank.status=="deleted":raise HTTPException(404,"Question bank not found")
     jobs=db.query(ImportJob).filter_by(bank_id=bank.id).order_by(ImportJob.created_at.desc()).all()
-    questions=db.query(Question).filter_by(bank_id=bank.id).order_by(Question.created_at.desc()).all()
+    # Keep the management view responsive for large published banks.  The
+    # summary retains the total count; this is the newest reviewable slice.
+    questions=db.query(Question).filter_by(bank_id=bank.id).order_by(Question.created_at.desc()).limit(100).all()
     return {**bank_view(bank,db),"imports":[import_view(job,db) for job in jobs],"questions":[question_view(q,db) for q in questions]}
+
+@app.put("/admin/question-banks/{bank_id}")
+def update_question_bank(bank_id:str,data:QuestionBankUpdate,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id)
+    if not bank or bank.status=="deleted":raise HTTPException(404,"Question bank not found")
+    bank.name=data.name.strip();bank.exam_code=(data.exam_code or "GENERAL").strip() or "GENERAL"
+    audit(db,user.id,"question_bank.updated","question_bank",bank.id,{"name":bank.name,"exam_code":bank.exam_code});db.commit()
+    return bank_view(bank,db)
+
+@app.post("/admin/question-banks/{bank_id}/revision",status_code=201)
+def create_question_bank_revision(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    original=db.get(QuestionBank,bank_id)
+    if not original or original.status!="published":raise HTTPException(409,"Only a published bank can be revised")
+    revision=QuestionBank(id=uid(),slug=bank_slug(f"{original.name} revision {original.revision + 1}",db),name=original.name,exam_code=original.exam_code,is_global=False,status="draft",revision=original.revision+1)
+    db.add(revision);db.flush()
+    node_ids={}
+    for node in db.query(TaxonomyNode).filter_by(bank_id=original.id).order_by(TaxonomyNode.created_at):
+        copied=TaxonomyNode(id=uid(),bank_id=revision.id,parent_id=node_ids.get(node.parent_id),kind=node.kind,name=node.name,code=node.code);db.add(copied);node_ids[node.id]=copied.id
+    db.flush()
+    for question in db.query(Question).filter_by(bank_id=original.id).all():
+        copied=Question(id=uid(),owner_id=user.id,bank_id=revision.id,scope=QuestionScope.GLOBAL,import_job_id=None,source_number=question.source_number,source_key=f"revision-{revision.revision}-{question.id}",kind=question.kind,stem_markdown=question.stem_markdown,options=question.options,answer=question.answer,solution_markdown=question.solution_markdown,scoring=question.scoring,diagrams=question.diagrams,source_spans=question.source_spans,interaction={**(question.interaction or {}),"copied_from_bank":original.id},confidence=question.confidence,approved_at=question.approved_at)
+        db.add(copied);db.flush()
+        for link in db.query(QuestionTaxonomy).filter_by(question_id=question.id):
+            if link.taxonomy_node_id in node_ids:db.add(QuestionTaxonomy(question_id=copied.id,taxonomy_node_id=node_ids[link.taxonomy_node_id]))
+    audit(db,user.id,"question_bank.revision_created","question_bank",revision.id,{"from":original.id,"revision":revision.revision});db.commit()
+    return bank_view(revision,db)
+
+@app.delete("/admin/question-banks/{bank_id}",status_code=204)
+def delete_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id)
+    if not bank or bank.status=="deleted":raise HTTPException(404,"Question bank not found")
+    # A soft delete keeps published test attempts and audit history valid while
+    # immediately removing the bank from teachers and the admin workspace.
+    bank.status="deleted";bank.is_global=False
+    audit(db,user.id,"question_bank.deleted","question_bank",bank.id,{"name":bank.name});db.commit()
 
 def source_stem(filename:str)->str:
     value=re.sub(r"\.(pdf|docx)$","",filename,flags=re.I)
@@ -188,7 +225,8 @@ def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:
     bank=db.get(QuestionBank,bank_id)
     if not bank:raise HTTPException(404,"Question bank not found")
     jobs=db.query(ImportJob).filter_by(bank_id=bank.id).all();questions=db.query(Question).filter_by(bank_id=bank.id).all()
-    if not jobs:raise HTTPException(422,"Upload at least one source document before publishing")
+    copied_revision=any((q.interaction or {}).get("copied_from_bank") for q in questions)
+    if not jobs and not copied_revision:raise HTTPException(422,"Upload at least one source document before publishing")
     if any(job.status!=ImportStatus.APPROVED for job in jobs):raise HTTPException(422,"Resolve failed or pending imports before publishing")
     if not questions or any(not q.approved_at or (q.interaction or {}).get("ingestion_issues") for q in questions):raise HTTPException(422,"Resolve every flagged question before publishing")
     bank.is_global=True;bank.status="published";audit(db,user.id,"question_bank.published","question_bank",bank.id,{"questions":len(questions)});db.commit();return bank_view(bank,db)
