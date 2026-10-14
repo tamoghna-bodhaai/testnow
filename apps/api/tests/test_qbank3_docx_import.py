@@ -38,9 +38,15 @@ def test_chapter_without_solution_is_kept_for_unscored_import(tmp_path: Path):
     assert chemistry_pairs([question])[0] == [(question, None)]
 
 
-def test_invalid_choice_and_latex_are_rejected_before_publication():
-    with pytest.raises(ValueError, match="fewer"):
-        validate_item({"kind": "single_choice", "options": [{"value": "a", "markdown": "one"}], "stem_markdown": "A question stem"})
+def test_incomplete_choice_is_retained_as_unscored_subjective_content():
+    kind, options, stem, normalized_from = validate_item({"kind": "single_choice", "options": [{"value": "a", "markdown": "one"}], "stem_markdown": "A question stem"})
+    assert kind == QuestionKind.SUBJECTIVE
+    assert options == []
+    assert stem == "A question stem"
+    assert normalized_from == QuestionKind.SINGLE
+
+
+def test_malformed_latex_is_rejected_before_publication():
     with pytest.raises(ValueError, match="malformed"):
         validate_item({"kind": "numerical", "options": [], "stem_markdown": "$$$ x = 1"})
 

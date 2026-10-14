@@ -301,15 +301,25 @@ def normal_options(value: object) -> list[dict]:
     return result
 
 
-def validate_item(item: dict) -> tuple[QuestionKind, list[dict], str]:
+def validate_item(item: dict) -> tuple[QuestionKind, list[dict], str, QuestionKind | None]:
+    """Validate an extracted item without throwing away a usable stem.
+
+    A layout/model pass can occasionally identify a choice heading while
+    omitting its choices.  That is not a safely scorable choice question, but
+    it is still valid exam material.  Keep it as unscored subjective content
+    and retain the normalization in provenance rather than aborting an entire
+    source chapter.
+    """
     kind = QuestionKind(str(item.get("kind")))
+    original_kind: QuestionKind | None = None
     options = normal_options(item.get("options"))
     stem = str(item.get("stem_markdown") or "").strip()
     if len(stem) < 8 or "$$$" in stem:
         raise ValueError("blank or malformed-LaTeX question stem")
     if kind in {QuestionKind.SINGLE, QuestionKind.MULTIPLE, QuestionKind.ASSERTION} and len(options) < 2:
-        raise ValueError("choice question has fewer than two options")
-    return kind, options, stem
+        original_kind = kind
+        kind, options = QuestionKind.SUBJECTIVE, []
+    return kind, options, stem, original_kind
 
 
 def attach_diagrams(document: fitz.Document, bank: QuestionBank, source: SourceDocument, item: dict, number: str, default_role: str = "question") -> list[dict]:
@@ -332,7 +342,7 @@ def attach_diagrams(document: fitz.Document, bank: QuestionBank, source: SourceD
 
 
 def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocument, subject: str, document: fitz.Document, item: dict, core: list[int], missing_solution: bool, answers: dict[str, dict] | None = None, answer_source: SourceDocument | None = None, answer_document: fitz.Document | None = None) -> bool:
-    kind, options, stem = validate_item(item)
+    kind, options, stem, normalized_from = validate_item(item)
     number = str(item.get("number") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", number):
         raise ValueError("invalid printed question number")
@@ -357,11 +367,13 @@ def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocum
     chapter_node = node(db, bank, subject_node.id, "chapter", chapter_name)
     topic_node = node(db, bank, chapter_node.id, "topic", topic_name) if topic_name else None
     mapped = (answers or {}).get(number, {})
-    answer = normalize_answer(mapped.get("answer", item.get("answer")), options)
+    answer = None if kind == QuestionKind.SUBJECTIVE else normalize_answer(mapped.get("answer", item.get("answer")), options)
     solution = str(mapped.get("solution_markdown", item.get("solution_markdown")) or "").strip() or None
     if missing_solution:
         kind, options, answer, solution = QuestionKind.SUBJECTIVE, [], None, None
     interaction = {"seed_mode": "docx_text_first", "source_document_id": source.id, "answer_document_id": answer_source.id if answer_source else source.id, "source_page": spans[0]["page"], "missing_solution_source": missing_solution, "diagram_validation": "bounded_figure_only", "model": settings().openrouter_model}
+    if normalized_from:
+        interaction["type_normalized_from_incomplete_choice"] = normalized_from.value
     diagrams = attach_diagrams(document, bank, source, item, number)
     if answer_document is not None and answer_source is not None and mapped:
         diagrams.extend(attach_diagrams(answer_document, bank, answer_source, mapped, number, "solution"))
