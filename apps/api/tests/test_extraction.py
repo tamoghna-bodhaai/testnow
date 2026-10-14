@@ -4,7 +4,7 @@ import pytest
 from app.bank_imports import _node, _pdf_bytes
 from app.models import QuestionBank, QuestionKind, SourceDocument, TaxonomyNode
 from app.seed_jee_openrouter import normalize_choice_kind
-from app.tasks import normalize_item, prepare_item_for_ingestion, validate
+from app.tasks import answer_from_key, normalize_item, page_unit_content, prepare_item_for_ingestion, validate
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db import Base
@@ -36,6 +36,24 @@ def test_invalid_model_record_is_skipped_without_raising():
     assert item is None
     assert issues == ["invalid_record:Malformed LaTex delimiters"]
 
+def test_flattened_labeled_options_are_recovered_as_a_choice_question():
+    item=normalize_item({"kind":"subjective","stem_markdown":"What is x?\n(A) 1\n(B) 2\n(C) 3\n(D) 4","options":[],"answer":{"value":"B"},"confidence":1})
+    assert item["kind"] == "single_choice"
+    assert item["stem_markdown"] == "What is x?"
+    assert [option["markdown"] for option in item["options"]] == ["1","2","3","4"]
+    assert item["answer"] == {"option":1}
+
+def test_page_unit_owns_only_the_primary_page_and_has_continuation_context():
+    content=page_unit_content(["Question 7", "options continue here", "Question 8"],0,"answer key")
+    assert "BEGINS on primary source page 1" in content
+    assert "CONTINUATION CONTEXT PAGE 2" in content
+    assert "Question 8" not in content
+
+def test_native_answer_key_lookup_maps_only_explicit_numbered_choice():
+    options=[{"value":"a","markdown":"one"},{"value":"b","markdown":"two"}]
+    assert answer_from_key("42",options,"41. A\n42. (B)\n43. A") == {"option":1}
+    assert answer_from_key("42",options,"The answer to 42 may be B in some versions.") is None
+
 def test_docx_conversion_uses_generated_pdf_despite_javaldx_warning(monkeypatch):
     source=SourceDocument(id="source",owner_id="owner",filename="paper.docx",object_key="source.docx",sha256="x",media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",size_bytes=4)
     monkeypatch.setattr("app.bank_imports.get",lambda _:b"PK\x03\x04")
@@ -53,3 +71,10 @@ def test_duplicate_root_taxonomy_does_not_abort_an_import():
     second=TaxonomyNode(id="second",bank_id="bank",parent_id=None,kind="subject",name="Physics")
     db.add_all([first,second]); db.commit()
     assert _node(db,"bank",None,"subject","Physics").id in {"first","second"}
+
+def test_taxonomy_normalization_reuses_cosmetic_chapter_variants():
+    engine=create_engine("sqlite+pysqlite:///:memory:"); Base.metadata.create_all(engine); db=sessionmaker(bind=engine)()
+    db.add(QuestionBank(id="bank",slug="bank",name="Bank",exam_code="test")); db.commit()
+    subject=_node(db,"bank",None,"subject","Physics")
+    original=_node(db,"bank",subject.id,"chapter","Wave Optics")
+    assert _node(db,"bank",subject.id,"chapter","wave-optics").id == original.id

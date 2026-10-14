@@ -7,7 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import fitz, httpx
+import fitz
 from pypdf import PdfReader
 from sqlalchemy.exc import IntegrityError
 
@@ -16,7 +16,7 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
-from .tasks import SCHEMA, SYSTEM, diagrams_for_item, native_image_regions, prepare_item_for_ingestion
+from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, diagrams_for_item, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
 
 
 def _pdf_bytes(source: SourceDocument) -> bytes:
@@ -49,6 +49,13 @@ def _node(db, bank_id: str, parent_id: str | None, kind: str, name: str) -> Taxo
     # selecting one stable row keeps those historic records importable.
     row=db.query(TaxonomyNode).filter_by(bank_id=bank_id,parent_id=parent_id,kind=kind,name=name).order_by(TaxonomyNode.created_at,TaxonomyNode.id).first()
     if row:return row
+    # Models often vary case, whitespace, ampersands, or punctuation between
+    # pages.  Resolve those cosmetic variants to the existing taxonomy node so
+    # the bank never grows duplicate chapters/subtopics during a long import.
+    canonical=lambda value:re.sub(r"[^a-z0-9]+","",str(value).lower())
+    key=canonical(name)
+    for candidate in db.query(TaxonomyNode).filter_by(bank_id=bank_id,parent_id=parent_id,kind=kind).order_by(TaxonomyNode.created_at,TaxonomyNode.id):
+        if canonical(candidate.name)==key:return candidate
     row=TaxonomyNode(id=uid(),bank_id=bank_id,parent_id=parent_id,kind=kind,name=name);db.add(row);db.flush();return row
 
 
@@ -97,7 +104,7 @@ def _control_state(db, job_id: str) -> str | None:
     return None
 
 
-def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers):
+def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers, owned_page:int|None=None, answer_text:str=""):
     flagged=0; saved=0; skipped=0
     # Serialize the small taxonomy/write phase per bank.  This prevents two
     # source jobs from creating a second NULL-parent subject simultaneously.
@@ -112,8 +119,13 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
         # page span makes its identity stable, while repeated batch output is
         # discarded by the source-key check below.
         page=(item.get("source_spans") or [{}])[0].get("page")
+        if owned_page is not None and int(page or owned_page)!=owned_page:
+            # The trailing context page is supplied to complete a split
+            # question, but ownership remains with the page where it starts.
+            continue
+        page=page or owned_page
         source_key=f"{source.sha256}:{number}:{page or 'unknown'}"
-        if source_key in seen_numbers or db.query(Question.id).filter_by(bank_id=bank.id,source_key=source_key).first() or db.query(Question.id).filter_by(import_job_id=job.id,source_number=number).first():
+        if source_key in seen_numbers or db.query(Question.id).filter_by(bank_id=bank.id,source_key=source_key).first():
             continue
         seen_numbers.add(source_key);kind=QuestionKind(item["kind"]);diagrams=[]
         for index,diagram in enumerate(diagrams_for_item(item,regions)):
@@ -123,6 +135,8 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
                 key=f"bank-diagrams/{bank.id}/{job.id}/{number}-{page_no + 1}-{index}.png";put(key,page_obj.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png"),"image/png")
                 diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
             except Exception:continue
+        if not item.get("answer"):
+            item["answer"]=answer_from_key(number,item.get("options") or [],answer_text)
         answer=_answer_from_solution(item);issues=_issues(item,answer,diagrams);flagged+=bool(issues)
         chapter=_node(db,bank.id,subject_node.id,"chapter",str(item.get("chapter") or "Unmapped chapter"));topic_name=str(item.get("topic") or "").strip();topic=_node(db,bank.id,chapter.id,"topic",topic_name) if topic_name else None
         interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"answer_inferred_from_solution":bool(answer and not item.get("answer"))}
@@ -147,7 +161,8 @@ def run_bank_import(job_id: str) -> None:
         job.status=ImportStatus.PROCESSING;job.extraction_meta={**meta,"phase":"Reading source"};db.commit()
         raw=_pdf_bytes(source);reader=PdfReader(BytesIO(raw));page_count=len(reader.pages)
         if not page_count:raise ValueError("The document contains no pages")
-        rendered=fitz.open(stream=raw,filetype="pdf");regions=native_image_regions(rendered)
+        rendered=fitz.open(stream=raw,filetype="pdf");regions=native_image_regions(rendered)+native_vector_regions(rendered)
+        page_texts=best_page_text(raw,reader,rendered)
         if job.answer_document_id:
             answer_source=db.get(SourceDocument,job.answer_document_id);answer_raw=_pdf_bytes(answer_source)
             answer_text="\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(answer_raw)).pages)
@@ -156,9 +171,12 @@ def run_bank_import(job_id: str) -> None:
         # Resume from the last durable page checkpoint.  Questions from prior
         # batches remain in place and source-key checks make a replay safe.
         checkpoint=max(0,min(page_count,int(meta.get("processed_pages") or 0)))
-        chunk_size=max(1,settings().bank_import_chunk_pages);ranges=list(range(checkpoint,page_count,chunk_size));numbers=set()
+        # A page is the durable ownership unit.  It prevents response-output
+        # truncation on 100+ question source files and gives retries a precise
+        # restart point without changing the surrounding Celery infrastructure.
+        ranges=list(range(checkpoint,page_count));numbers=set()
         saved=db.query(Question).filter_by(import_job_id=job.id).count()
-        flagged=sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"));skipped=int(meta.get("skipped_count") or 0)
+        flagged=sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"));skipped=int(meta.get("skipped_count") or 0);failed_pages=list(meta.get("failed_pages") or [])
         for chunk_index,start in enumerate(ranges,1):
             control=_control_state(db,job_id)
             if control:
@@ -166,20 +184,23 @@ def run_bank_import(job_id: str) -> None:
                 job.status=ImportStatus.FAILED if control=="cancelled" else ImportStatus.UPLOADED
                 job.error="Cancelled by administrator" if control=="cancelled" else None
                 job.extraction_meta={**(job.extraction_meta or {}),"phase":"Cancelled" if control=="cancelled" else "Paused by administrator","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1};db.commit();return
-            end=min(page_count,start+chunk_size);native="\n".join(f"--- PAGE {i+1} ---\n{reader.pages[i].extract_text() or ''}" for i in range(start,end))
-            content=[{"type":"text","text":f"Subject: {subject}. Extract EVERY complete exam question that begins on source pages {start+1}-{end}; do not summarize, sample, combine, or stop after a handful of questions. Preserve each printed number and original source page. Detect chapter/subtopic. A question that starts here may continue onto the next page; include its complete visible content and span. Native text:\n{native[:100000]}"}]
-            for page_no in range(start,end):
+            end=start+1
+            content=[{"type":"text","text":f"Subject: {subject}. {page_unit_content(page_texts,start,answer_text)}"}]
+            for page_no in range(start,min(page_count,start+2)):
                 png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
                 content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
-            if answer_text:content[0]["text"]+="\nANSWER/SOLUTION SOURCE (authoritative):\n"+answer_text[:50000]
             job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};db.commit()
             payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
-            response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow Bank Importer"},json=payload,timeout=settings().openrouter_timeout_seconds);response.raise_for_status()
-            parsed=json.loads(response.json()["choices"][0]["message"]["content"]);added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers);saved+=added;flagged+=new_flags;skipped+=new_skipped
-            job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};meta=dict(job.extraction_meta);db.commit()
-        job.status=ImportStatus.REVIEW if flagged else ImportStatus.APPROVED
-        phase="Needs anomaly review" if flagged else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication")
-        job.extraction_meta={**meta,"phase":phase,"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"model":settings().openrouter_model};db.commit()
+            try:
+                parsed=request_extraction(payload,"TestNow Bank Importer")
+            except Exception as page_error:
+                failed_pages.append({"page":start+1,"error":str(page_error)[:300]})
+                job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
+            added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,start+1,answer_text);saved+=added;flagged+=new_flags;skipped+=new_skipped
+            job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
+        job.status=ImportStatus.REVIEW if flagged or failed_pages else ImportStatus.APPROVED
+        phase="Needs anomaly review" if flagged or failed_pages else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication")
+        job.extraction_meta={**meta,"phase":phase,"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages,"model":settings().openrouter_model};db.commit()
     except Exception as exc:
         db.rollback()
         failed_job=db.get(ImportJob,job_id)
