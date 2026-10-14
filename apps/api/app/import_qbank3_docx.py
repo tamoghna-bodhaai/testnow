@@ -34,7 +34,7 @@ from .db import SessionLocal
 from .models import (Question, QuestionBank, QuestionKind, QuestionScope,
                      QuestionTaxonomy, SourceDocument, TaxonomyNode, User)
 from .security import uid
-from .storage import put
+from .storage import client, get, put
 from .tasks import normalize_answer
 
 BANK_SLUG = "qbank-3"
@@ -138,6 +138,32 @@ def discover(root: Path) -> dict[str, list[Path]]:
         if not result[directory]:
             raise ValueError(f"No DOCX files found in {root / directory}")
     return result
+
+
+def download_s3_prefix(prefix: str, destination: Path) -> Path:
+    """Materialise only DOCX objects from an explicit, fixed import prefix."""
+    prefix = prefix.strip("/") + "/"
+    token: str | None = None
+    keys: list[str] = []
+    while True:
+        request = {"Bucket": settings().s3_bucket, "Prefix": prefix}
+        if token:
+            request["ContinuationToken"] = token
+        page = client().list_objects_v2(**request)
+        keys.extend(item["Key"] for item in page.get("Contents", []) if item["Key"].lower().endswith(".docx"))
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+    if not keys:
+        raise ValueError(f"No DOCX objects found under s3://{prefix}")
+    for key in sorted(keys):
+        relative = Path(key.removeprefix(prefix))
+        if key == prefix or relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 2 or relative.parts[0] not in SUBJECTS:
+            raise ValueError(f"Unexpected DOCX key outside qbank subject folders: {key}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(get(key))
+    return destination
 
 
 def chemistry_pairs(files: Iterable[Path]) -> tuple[list[tuple[Path, Path | None]], list[Path]]:
@@ -382,36 +408,39 @@ def import_source(db: Session, bank: QuestionBank, owner: User, path: Path, solu
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create Question Bank 3 from the supplied DOCX corpus")
-    parser.add_argument("root", type=Path, help="Directory containing physics, chemistry, and maths DOCX folders")
+    parser.add_argument("root", nargs="?", type=Path, help="Directory containing physics, chemistry, and maths DOCX folders")
     parser.add_argument("--owner-email", required=True)
+    parser.add_argument("--s3-prefix", help="Read the DOCX hierarchy directly from this object-storage prefix")
     parser.add_argument("--dry-run", action="store_true", help="Inspect source pairing and conversion feasibility without writes or model calls")
     args = parser.parse_args()
-    files = discover(args.root)
-    chemistry, duplicates = chemistry_pairs(files["chemistry"])
-    sources = [(path, None, False) for path in files["physics"] + files["maths"]]
-    sources.extend((question, solution, solution is None) for question, solution in chemistry)
-    report = {"bank_slug": BANK_SLUG, "supplied_documents": sum(len(value) for value in files.values()), "question_sources": len(sources), "by_subject": {SUBJECTS[key]: len(value) for key, value in files.items()}, "chemistry_pairs": sum(solution is not None for _, solution in chemistry), "chemistry_missing_solution": [question.name for question, solution in chemistry if solution is None], "duplicate_solution_documents": [path.name for path in duplicates]}
-    if args.dry_run:
-        with TemporaryDirectory(prefix="qbank3-docx-check-") as directory:
-            for path, solution, _ in sources:
-                convert_to_pdf(path, Path(directory) / hashlib.sha256(str(path).encode()).hexdigest()[:12])
-                if solution:
-                    convert_to_pdf(solution, Path(directory) / hashlib.sha256(str(solution).encode()).hexdigest()[:12])
-        print(json.dumps({"mode": "dry-run", **report}, indent=2)); return
-    db = SessionLocal()
-    try:
-        owner = db.query(User).filter_by(email=args.owner_email.lower()).one_or_none()
-        if not owner:
-            raise SystemExit("Seed owner does not exist")
-        bank = ensure_bank(db, owner); counts: Counter = Counter()
-        with TemporaryDirectory(prefix="qbank3-docx-") as directory:
-            for path, solution, missing_solution in sources:
-                print(f"Importing {path.name}", flush=True)
-                counts.update(import_source(db, bank, owner, path, solution, missing_solution, Path(directory)))
-        print(json.dumps({**report, "bank_id": bank.id, "created_by_type": dict(sorted(counts.items()))}, indent=2))
-    finally:
-        db.close()
-
-
+    if bool(args.root) == bool(args.s3_prefix):
+        raise SystemExit("Specify exactly one local root or --s3-prefix")
+    with TemporaryDirectory(prefix="qbank3-docx-source-") as source_directory:
+        root = download_s3_prefix(args.s3_prefix, Path(source_directory)) if args.s3_prefix else args.root
+        files = discover(root)
+        chemistry, duplicates = chemistry_pairs(files["chemistry"])
+        sources = [(path, None, False) for path in files["physics"] + files["maths"]]
+        sources.extend((question, solution, solution is None) for question, solution in chemistry)
+        report = {"bank_slug": BANK_SLUG, "source_prefix": args.s3_prefix, "supplied_documents": sum(len(value) for value in files.values()), "question_sources": len(sources), "by_subject": {SUBJECTS[key]: len(value) for key, value in files.items()}, "chemistry_pairs": sum(solution is not None for _, solution in chemistry), "chemistry_missing_solution": [question.name for question, solution in chemistry if solution is None], "duplicate_solution_documents": [path.name for path in duplicates]}
+        if args.dry_run:
+            with TemporaryDirectory(prefix="qbank3-docx-check-") as directory:
+                for path, solution, _ in sources:
+                    convert_to_pdf(path, Path(directory) / hashlib.sha256(str(path).encode()).hexdigest()[:12])
+                    if solution:
+                        convert_to_pdf(solution, Path(directory) / hashlib.sha256(str(solution).encode()).hexdigest()[:12])
+            print(json.dumps({"mode": "dry-run", **report}, indent=2)); return
+        db = SessionLocal()
+        try:
+            owner = db.query(User).filter_by(email=args.owner_email.lower()).one_or_none()
+            if not owner:
+                raise SystemExit("Seed owner does not exist")
+            bank = ensure_bank(db, owner); counts: Counter = Counter()
+            with TemporaryDirectory(prefix="qbank3-docx-") as directory:
+                for path, solution, missing_solution in sources:
+                    print(f"Importing {path.name}", flush=True)
+                    counts.update(import_source(db, bank, owner, path, solution, missing_solution, Path(directory)))
+            print(json.dumps({**report, "bank_id": bank.id, "created_by_type": dict(sorted(counts.items()))}, indent=2))
+        finally:
+            db.close()
 if __name__ == "__main__":
     main()
