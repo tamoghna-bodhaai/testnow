@@ -71,6 +71,32 @@ but are not required for publication. The command is idempotent and never
 modifies Question Bank 1. Use `--dry-run` first to estimate the extraction
 work without changing the database or object storage.
 
+## Question Bank 3 DOCX corpus
+
+Question Bank 3 imports the physics, chemistry, and maths DOCX corpus as
+structured Markdown/LaTeX questions. The original DOCX files are retained for
+audit; LibreOffice creates temporary PDFs only to preserve page geometry while
+extracting bounded diagrams. It never stores a whole-question image in place of
+question text. Chemistry question files are paired with their corresponding
+answer-and-solution files; an exact duplicate solution file is skipped.
+
+Mount the folder containing the `physics`, `chemistry`, and `maths`
+subdirectories at `/imports/docx-conversion`, then run inside the API image:
+
+```bash
+python -m app.import_qbank3_docx --owner-email utils@bodhaai.tech --dry-run \
+  /imports/docx-conversion
+
+python -m app.import_qbank3_docx --owner-email utils@bodhaai.tech \
+  /imports/docx-conversion
+```
+
+The importer is safe to resume. It publishes validated records into the global
+**Question Bank 3** (`qbank-3`) immediately, grouped by subject, chapter, topic,
+and existing question type. Chemistry Chapter 4 remains in the bank as
+unscored subjective material because its matching answer-and-solution source
+was not supplied.
+
 ## Railway
 
 Follow [infrastructure/railway.md](infrastructure/railway.md). Use Railway PostgreSQL, Redis, and object storage; only publish the Next.js web service.
