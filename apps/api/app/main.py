@@ -191,7 +191,7 @@ async def store_bank_source(file:UploadFile,user:User,bank:QuestionBank,db:Sessi
 @app.post("/admin/question-banks/{bank_id}/imports",status_code=202)
 async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:list[UploadFile]=File(...),answer_files:list[UploadFile]=File(default=[]),user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     bank=db.get(QuestionBank,bank_id)
-    if not bank or bank.status=="published":raise HTTPException(409,"Create a revision import for a published bank")
+    if not bank or bank.status=="deleted":raise HTTPException(404,"Question bank not found")
     subject=subject.strip()
     if not subject:raise HTTPException(422,"Subject is required")
     # Browsers include an empty file part for an unselected picker.  Ignore it
@@ -221,7 +221,10 @@ async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:l
             continue
         meta={"subject":subject,"source_role":"combined" if not paired else "question","pairing":"matched" if paired else "missing_answer_source","phase":"Queued for extraction"}
         job=ImportJob(id=uid(),owner_id=user.id,bank_id=bank.id,question_document_id=source.id,answer_document_id=paired.id if paired else None,status=ImportStatus.UPLOADED,extraction_meta=meta);db.add(job);jobs.append(job);jobs_to_dispatch.append(job)
-    bank.status="processing";audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"files":len(seen_source_ids)});db.commit()
+    # A live bank remains available while new documents are extracted.  Any
+    # clean or subsequently reviewed questions join that same published bank.
+    if bank.status!="published":bank.status="processing"
+    audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"files":len(seen_source_ids)});db.commit()
     for job in jobs_to_dispatch:extract_bank_import.delay(job.id)
     return {"bank":bank_view(bank,db),"imports":[import_view(job,db) for job in jobs]}
 
@@ -293,12 +296,13 @@ def delete_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADM
 def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     bank=db.get(QuestionBank,bank_id)
     if not bank:raise HTTPException(404,"Question bank not found")
-    jobs=db.query(ImportJob).filter_by(bank_id=bank.id).all();questions=db.query(Question).filter_by(bank_id=bank.id).all()
-    copied_revision=any((q.interaction or {}).get("copied_from_bank") for q in questions)
-    if not jobs and not copied_revision:raise HTTPException(422,"Upload at least one source document before publishing")
-    if any(job.status!=ImportStatus.APPROVED for job in jobs):raise HTTPException(422,"Resolve failed or pending imports before publishing")
-    if not questions or any(not q.approved_at or (q.interaction or {}).get("ingestion_issues") for q in questions):raise HTTPException(422,"Resolve every flagged question before publishing")
-    bank.is_global=True;bank.status="published";audit(db,user.id,"question_bank.published","question_bank",bank.id,{"questions":len(questions)});db.commit();return bank_view(bank,db)
+    questions=db.query(Question).filter_by(bank_id=bank.id).all()
+    approved=[question for question in questions if question.approved_at and not (question.interaction or {}).get("ingestion_issues")]
+    if not approved:raise HTTPException(422,"Approve at least one extracted question before publishing")
+    # Publishing is deliberately incremental: unresolved records remain in the
+    # review queue and become available to teachers as soon as they are approved.
+    bank.is_global=True;bank.status="published"
+    audit(db,user.id,"question_bank.published","question_bank",bank.id,{"published_questions":len(approved),"pending_questions":len(questions)-len(approved)});db.commit();return bank_view(bank,db)
 
 @app.get("/admin/teachers")
 def admin_teachers(user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
