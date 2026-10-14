@@ -16,7 +16,7 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
-from .tasks import SCHEMA, SYSTEM, diagrams_for_item, native_image_regions, normalize_item, validate
+from .tasks import SCHEMA, SYSTEM, diagrams_for_item, native_image_regions, prepare_item_for_ingestion
 
 
 def _pdf_bytes(source: SourceDocument) -> bytes:
@@ -53,7 +53,7 @@ def _node(db, bank_id: str, parent_id: str | None, kind: str, name: str) -> Taxo
 
 
 def _issues(item: dict, answer: object, diagrams: list[dict]) -> list[str]:
-    issues=[]
+    issues=list(item.get("_ingestion_issues") or [])
     if not answer and item.get("kind") != "subjective":issues.append("missing_answer")
     if float(item.get("confidence") or 0)<.75:issues.append("low_confidence")
     if "$$$" in str(item.get("stem_markdown") or ""):issues.append("invalid_latex")
@@ -98,13 +98,16 @@ def _control_state(db, job_id: str) -> str | None:
 
 
 def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers):
-    flagged=0; saved=0
+    flagged=0; saved=0; skipped=0
     # Serialize the small taxonomy/write phase per bank.  This prevents two
     # source jobs from creating a second NULL-parent subject simultaneously.
     db.query(QuestionBank).filter_by(id=bank.id).with_for_update().one()
     subject_node=_node(db,bank.id,None,"subject",subject)
-    for item in items:
-        item=normalize_item(item);validate(item);number=str(item["number"]).strip()
+    for raw_item in items:
+        item,preflight_issues=prepare_item_for_ingestion(raw_item)
+        if item is None:
+            skipped+=1;continue
+        item["_ingestion_issues"]=preflight_issues;number=str(item["number"]).strip()
         # A source can contain a repeated number at a section boundary.  The
         # page span makes its identity stable, while repeated batch output is
         # discarded by the source-key check below.
@@ -130,7 +133,7 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
         for taxonomy in (subject_node,chapter,topic):
             if taxonomy:db.add(QuestionTaxonomy(question_id=q.id,taxonomy_node_id=taxonomy.id))
         saved+=1
-    return saved, flagged
+    return saved, flagged, skipped
 
 
 def run_bank_import(job_id: str) -> None:
@@ -155,7 +158,7 @@ def run_bank_import(job_id: str) -> None:
         checkpoint=max(0,min(page_count,int(meta.get("processed_pages") or 0)))
         chunk_size=max(1,settings().bank_import_chunk_pages);ranges=list(range(checkpoint,page_count,chunk_size));numbers=set()
         saved=db.query(Question).filter_by(import_job_id=job.id).count()
-        flagged=sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"))
+        flagged=sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"));skipped=int(meta.get("skipped_count") or 0)
         for chunk_index,start in enumerate(ranges,1):
             control=_control_state(db,job_id)
             if control:
@@ -169,13 +172,14 @@ def run_bank_import(job_id: str) -> None:
                 png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
                 content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
             if answer_text:content[0]["text"]+="\nANSWER/SOLUTION SOURCE (authoritative):\n"+answer_text[:50000]
-            job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged};db.commit()
+            job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};db.commit()
             payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
             response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow Bank Importer"},json=payload,timeout=settings().openrouter_timeout_seconds);response.raise_for_status()
-            parsed=json.loads(response.json()["choices"][0]["message"]["content"]);added, new_flags=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers);saved+=added;flagged+=new_flags
-            job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged};db.commit()
+            parsed=json.loads(response.json()["choices"][0]["message"]["content"]);added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers);saved+=added;flagged+=new_flags;skipped+=new_skipped
+            job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};meta=dict(job.extraction_meta);db.commit()
         job.status=ImportStatus.REVIEW if flagged else ImportStatus.APPROVED
-        job.extraction_meta={**meta,"phase":"Needs anomaly review" if flagged else "Validated and ready for bank publication","processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"model":settings().openrouter_model};db.commit()
+        phase="Needs anomaly review" if flagged else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication")
+        job.extraction_meta={**meta,"phase":phase,"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"model":settings().openrouter_model};db.commit()
     except Exception as exc:
         db.rollback()
         failed_job=db.get(ImportJob,job_id)

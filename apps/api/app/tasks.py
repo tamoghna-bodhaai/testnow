@@ -63,8 +63,28 @@ def normalize_answer(answer,options:list[dict]):
     return {"value":raw} if raw is not None else None
 def validate(item:dict):
     if not item.get("stem_markdown"):raise ValueError("Blank question stem")
-    if item["kind"] in ("single_choice","multiple_choice") and len(item.get("options",[]))<2:raise ValueError("Choice question requires two options")
+    if item["kind"] in ("single_choice","multiple_choice","assertion_reason") and len(item.get("options",[]))<2:raise ValueError("Choice question requires two options")
     if "$$$" in item["stem_markdown"]:raise ValueError("Malformed LaTex delimiters")
+
+def prepare_item_for_ingestion(raw_item:dict)->tuple[dict|None,list[str]]:
+    """Make a model record safe to persist without letting one bad record stop a job.
+
+    A choice item with missing choices is a recoverable classification error: keep
+    its source text as a written question and require human review.  Other invalid
+    records are skipped by the caller, which records their count in the job meta.
+    """
+    try:
+        item=normalize_item(raw_item)
+    except (AttributeError, TypeError, ValueError) as exc:
+        return None,[f"invalid_record:{str(exc) or exc.__class__.__name__}"]
+    issues=[]
+    if item.get("kind") in ("single_choice","multiple_choice","assertion_reason") and len(item.get("options") or [])<2:
+        item["kind"]="subjective";item["answer"]=None;issues.append("choice_options_missing")
+    try:
+        validate(item)
+    except (KeyError, TypeError, ValueError) as exc:
+        return None,issues+[f"invalid_record:{str(exc) or exc.__class__.__name__}"]
+    return item,issues
 
 def infer_paper_title(reader:PdfReader, text:str, fallback:str)->str:
     metadata=reader.metadata or {}
@@ -141,8 +161,12 @@ def extract_import(self, job_id:str):
         job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"question_count":len(numbers)};db.commit()
         payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":vision_content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
         response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":"TestNow"},json=payload,timeout=settings().openrouter_timeout_seconds); response.raise_for_status()
-        for item in json.loads(response.json()["choices"][0]["message"]["content"]).get("questions",[]):
-          item=normalize_item(item);validate(item);number=str(item["number"])
+        skipped=0
+        for raw_item in json.loads(response.json()["choices"][0]["message"]["content"]).get("questions",[]):
+          item,_=prepare_item_for_ingestion(raw_item)
+          if item is None:
+            skipped+=1;continue
+          number=str(item["number"])
           if number in numbers: continue
           numbers.add(number);kind=QuestionKind(item["kind"]);diagrams=[]
           for n,diagram in enumerate(diagrams_for_item(item,native_regions)):
@@ -152,7 +176,7 @@ def extract_import(self, job_id:str):
               key=f"diagrams/{job.id}/{number}-{n}.png";put(key,page.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png"),"image/png");diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
             except Exception: continue
           db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item["solution_markdown"],confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams))
-        job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers)};db.commit()
+        job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"skipped_count":int(meta.get("skipped_count") or 0)+skipped};meta=dict(job.extraction_meta);db.commit()
       job.status=ImportStatus.REVIEW; job.extraction_meta={**meta,"model":settings().openrouter_model,"paper_title":paper_title,"processed_pages":page_count,"total_pages":page_count,"question_count":len(numbers),"phase":"Ready for review"};db.commit()
     except Exception as exc:
       job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit();raise

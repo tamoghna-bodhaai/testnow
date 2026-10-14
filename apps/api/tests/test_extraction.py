@@ -4,7 +4,7 @@ import pytest
 from app.bank_imports import _node, _pdf_bytes
 from app.models import QuestionBank, QuestionKind, SourceDocument, TaxonomyNode
 from app.seed_jee_openrouter import normalize_choice_kind
-from app.tasks import normalize_item, validate
+from app.tasks import normalize_item, prepare_item_for_ingestion, validate
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db import Base
@@ -24,6 +24,17 @@ def test_optionless_choice_record_becomes_subjective():
 def test_choice_record_with_choices_keeps_its_type():
     options=[{"value":"a","markdown":"first"},{"value":"b","markdown":"second"}]
     assert normalize_choice_kind(QuestionKind.MULTIPLE, options) == QuestionKind.MULTIPLE
+
+def test_optionless_choice_is_recovered_and_flagged_instead_of_failing_import():
+    item,issues=prepare_item_for_ingestion({"kind":"single_choice","stem_markdown":"Solve $x$","options":[],"answer":{"option":0}})
+    assert item["kind"] == "subjective"
+    assert item["answer"] is None
+    assert issues == ["choice_options_missing"]
+
+def test_invalid_model_record_is_skipped_without_raising():
+    item,issues=prepare_item_for_ingestion({"kind":"numerical","stem_markdown":"$$$ x","options":[]})
+    assert item is None
+    assert issues == ["invalid_record:Malformed LaTex delimiters"]
 
 def test_docx_conversion_uses_generated_pdf_despite_javaldx_warning(monkeypatch):
     source=SourceDocument(id="source",owner_id="owner",filename="paper.docx",object_key="source.docx",sha256="x",media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",size_bytes=4)
