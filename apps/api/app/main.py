@@ -194,15 +194,35 @@ async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:l
     if not bank or bank.status=="published":raise HTTPException(409,"Create a revision import for a published bank")
     subject=subject.strip()
     if not subject:raise HTTPException(422,"Subject is required")
+    # Browsers include an empty file part for an unselected picker.  Ignore it
+    # server-side as well as client-side so the API is safe to call directly.
+    question_files=[file for file in question_files if file.filename]
+    answer_files=[file for file in answer_files if file.filename]
+    if not question_files:raise HTTPException(422,"Choose at least one PDF or DOCX question document")
     questions=[await store_bank_source(file,user,bank,db) for file in question_files]
     answers=[await store_bank_source(file,user,bank,db) for file in answer_files]
-    answer_by_stem={source_stem(item.filename):item for item in answers}; jobs=[]
+    answer_by_stem={source_stem(item.filename):item for item in answers}; jobs=[]; jobs_to_dispatch=[]
+    seen_source_ids=set()
     for source in questions:
+        if source.id in seen_source_ids:continue
+        seen_source_ids.add(source.id)
         paired=answer_by_stem.get(source_stem(source.filename)) or (answers[0] if len(questions)==len(answers)==1 else None)
+        existing_job=db.query(ImportJob).filter_by(bank_id=bank.id,question_document_id=source.id).order_by(ImportJob.created_at.desc()).first()
+        if existing_job:
+            # Resume a job that failed before this importer became idempotent.
+            # Existing questions are skipped by the worker; any missing ones are
+            # completed without creating a second copy of the source document.
+            if existing_job.status==ImportStatus.FAILED:
+                existing_job.status=ImportStatus.UPLOADED;existing_job.error=None
+                if paired:existing_job.answer_document_id=paired.id
+                existing_job.extraction_meta={**(existing_job.extraction_meta or {}),"subject":subject,"phase":"Queued to resume the failed import"}
+                jobs_to_dispatch.append(existing_job)
+            jobs.append(existing_job)
+            continue
         meta={"subject":subject,"source_role":"combined" if not paired else "question","pairing":"matched" if paired else "missing_answer_source","phase":"Queued for extraction"}
-        job=ImportJob(id=uid(),owner_id=user.id,bank_id=bank.id,question_document_id=source.id,answer_document_id=paired.id if paired else None,status=ImportStatus.UPLOADED,extraction_meta=meta);db.add(job);jobs.append(job)
-    bank.status="processing";audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"files":len(questions)});db.commit()
-    for job in jobs:extract_bank_import.delay(job.id)
+        job=ImportJob(id=uid(),owner_id=user.id,bank_id=bank.id,question_document_id=source.id,answer_document_id=paired.id if paired else None,status=ImportStatus.UPLOADED,extraction_meta=meta);db.add(job);jobs.append(job);jobs_to_dispatch.append(job)
+    bank.status="processing";audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"files":len(seen_source_ids)});db.commit()
+    for job in jobs_to_dispatch:extract_bank_import.delay(job.id)
     return {"bank":bank_view(bank,db),"imports":[import_view(job,db) for job in jobs]}
 
 @app.post("/admin/question-banks/{bank_id}/questions/{question_id}/resolve")
@@ -219,6 +239,17 @@ def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=
     job=db.get(ImportJob,q.import_job_id)
     if job and not db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first():job.status=ImportStatus.APPROVED;job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete","flagged_count":0}
     db.commit();return question_view(q,db)
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/retry",status_code=202)
+def retry_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id);job=db.get(ImportJob,job_id)
+    if not bank or not job or job.bank_id!=bank.id:raise HTTPException(404,"Import not found")
+    if job.status!=ImportStatus.FAILED:raise HTTPException(409,"Only a failed import can be retried")
+    job.status=ImportStatus.UPLOADED;job.error=None
+    job.extraction_meta={**(job.extraction_meta or {}),"phase":"Queued to retry the failed import"}
+    audit(db,user.id,"question_bank.import_retried","question_bank",bank.id,{"job_id":job.id,"filename":db.get(SourceDocument,job.question_document_id).filename})
+    db.commit();extract_bank_import.delay(job.id)
+    return import_view(job,db)
 
 @app.post("/admin/question-banks/{bank_id}/publish")
 def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
@@ -395,7 +426,14 @@ def question_view(q:Question, db:Session|None=None):
         taxonomy=[{"id":node.id,"parent_id":node.parent_id,"kind":node.kind,"name":node.name,"code":node.code} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==q.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
     options=normalized_options(q.options); kind=safe_question_kind(q.kind,options)
     answer=None if kind=="subjective" and len(options)<2 else q.answer
-    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":q.interaction or {},"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":taxonomy}
+    interaction=dict(q.interaction or {})
+    # Older imports predate source_filename in interaction.  Enrich their review
+    # payloads without changing the original source provenance.
+    if db and q.import_job_id and not interaction.get("source_filename"):
+        job=db.get(ImportJob,q.import_job_id)
+        source=db.get(SourceDocument,job.question_document_id) if job else None
+        if source:interaction["source_filename"]=source.filename
+    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":interaction,"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":taxonomy}
 @app.get("/questions")
 def questions(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     rows=db.query(Question).filter((Question.owner_id==user.id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())

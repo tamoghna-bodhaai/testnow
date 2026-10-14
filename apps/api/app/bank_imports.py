@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 
 import fitz, httpx
 from pypdf import PdfReader
+from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .db import SessionLocal
@@ -23,7 +24,11 @@ def _pdf_bytes(source: SourceDocument) -> bytes:
     if source.media_type == "application/pdf": return raw
     with TemporaryDirectory(prefix="bank-docx-") as directory:
         path=Path(directory) / source.filename; path.write_bytes(raw)
-        subprocess.run(["soffice","--headless","--convert-to","pdf","--outdir",directory,str(path)],check=True,capture_output=True,timeout=120)
+        try:
+            subprocess.run(["soffice","--headless","--convert-to","pdf","--outdir",directory,str(path)],check=True,capture_output=True,text=True,timeout=120)
+        except subprocess.CalledProcessError as exc:
+            detail=(exc.stderr or exc.stdout or "LibreOffice could not read the document").strip()
+            raise ValueError(f"Could not convert {source.filename} to PDF: {detail[:500]}") from exc
         converted=path.with_suffix(".pdf")
         if not converted.exists(): raise ValueError("DOCX conversion did not produce a PDF")
         return converted.read_bytes()
@@ -44,6 +49,31 @@ def _issues(item: dict, answer: object, diagrams: list[dict]) -> list[str]:
     if item.get("diagrams") and not diagrams:issues.append("diagram_unavailable")
     if not str(item.get("chapter") or "").strip():issues.append("taxonomy_uncertain")
     return issues
+
+
+def _answer_from_solution(item: dict) -> dict | None:
+    """Recover an unambiguous MCQ key that the model wrote only in its solution.
+
+    We deliberately accept just explicit statements such as "correct option is C";
+    anything less clear remains a review flag.
+    """
+    if item.get("kind") not in {"single_choice", "assertion_reason"} or item.get("answer"):
+        return item.get("answer")
+    solution=str(item.get("solution_markdown") or "")
+    match=re.search(r"(?:correct\s+(?:option|answer)|answer)\s*(?:is|:)?\s*\(?\s*([A-D])\s*\)?",solution,re.I)
+    if not match:
+        return None
+    index=ord(match.group(1).upper())-ord("A")
+    return {"option":index} if index < len(item.get("options") or []) else None
+
+
+def _failure_message(exc: Exception) -> str:
+    message=str(exc).strip() or exc.__class__.__name__
+    if "Document exceeds" in message:
+        return f"{message}. Split this source into smaller chapter files, then upload the parts."
+    if isinstance(exc, IntegrityError) or "uq_question_bank_source_key" in message:
+        return "This source was already imported into this bank. Its existing questions were kept; no duplicate was created."
+    return message
 
 
 def run_bank_import(job_id: str) -> None:
@@ -84,18 +114,30 @@ def run_bank_import(job_id: str) -> None:
                     key=f"bank-diagrams/{bank.id}/{job.id}/{number}-{index}.png";put(key,page.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png"),"image/png")
                     diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
                 except Exception:continue
-            answer=item.get("answer");issues=_issues(item,answer,diagrams);flagged+=bool(issues)
+            answer=_answer_from_solution(item);issues=_issues(item,answer,diagrams);flagged+=bool(issues)
             chapter=_node(db,bank.id,subject_node.id,"chapter",str(item.get("chapter") or "Unmapped chapter"));topic_name=str(item.get("topic") or "").strip();topic=_node(db,bank.id,chapter.id,"topic",topic_name) if topic_name else None
-            interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_page":(item.get("source_spans") or [{}])[0].get("page"),"ingestion_issues":issues,"model":settings().openrouter_model}
-            q=Question(id=uid(),owner_id=job.owner_id,bank_id=bank.id,scope=QuestionScope.GLOBAL,import_job_id=job.id,source_number=number,source_key=f"{source.sha256}:{number}",kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=answer,solution_markdown=item.get("solution_markdown"),confidence=item.get("confidence"),source_spans=item.get("source_spans") or [],diagrams=diagrams,interaction=interaction,approved_at=None if issues else datetime.now(timezone.utc))
-            db.add(q);db.flush()
+            interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":(item.get("source_spans") or [{}])[0].get("page"),"ingestion_issues":issues,"model":settings().openrouter_model,"answer_inferred_from_solution":bool(answer and not item.get("answer"))}
+            source_key=f"{source.sha256}:{number}"
+            # Jobs can be retried by Celery and the same file can be selected twice
+            # in a folder upload.  The source identity is the idempotency key.
+            if db.query(Question.id).filter_by(bank_id=bank.id,source_key=source_key).first():
+                continue
+            q=Question(id=uid(),owner_id=job.owner_id,bank_id=bank.id,scope=QuestionScope.GLOBAL,import_job_id=job.id,source_number=number,source_key=source_key,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=answer,solution_markdown=item.get("solution_markdown"),confidence=item.get("confidence"),source_spans=item.get("source_spans") or [],diagrams=diagrams,interaction=interaction,approved_at=None if issues else datetime.now(timezone.utc))
+            try:
+                with db.begin_nested():
+                    db.add(q);db.flush()
+            except IntegrityError:
+                # Another worker won the race.  Treat this exactly as a replay.
+                continue
             for taxonomy in (subject_node,chapter,topic):
                 if taxonomy:db.add(QuestionTaxonomy(question_id=q.id,taxonomy_node_id=taxonomy.id))
         job.status=ImportStatus.REVIEW if flagged else ImportStatus.APPROVED
         job.extraction_meta={**meta,"phase":"Needs anomaly review" if flagged else "Validated and ready for bank publication","question_count":len(numbers),"flagged_count":flagged,"model":settings().openrouter_model};db.commit()
     except Exception as exc:
-        if 'job' in locals() and job:
-            job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit()
+        db.rollback()
+        failed_job=db.get(ImportJob,job_id)
+        if failed_job:
+            failed_job.status=ImportStatus.FAILED;failed_job.error=_failure_message(exc)[:2000];failed_job.extraction_meta={**(failed_job.extraction_meta or {}),"phase":"Import failed"};db.commit()
         raise
     finally:
         if rendered:rendered.close()

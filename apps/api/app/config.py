@@ -16,7 +16,9 @@ class Settings(BaseSettings):
     openrouter_model: str = "google/gemini-2.5-flash"
     openrouter_fallback_model: str | None = None
     openrouter_timeout_seconds: int = 90
-    max_upload_bytes: int = 52_428_800
+    # Applies per source file.  The web relay is configured to the same 200 MB
+    # ceiling, so large chapter documents are rejected consistently.
+    max_upload_bytes: int = 209_715_200
     max_pdf_pages: int = 60
     max_rendered_pdf_bytes: int = 20_000_000
     cors_origins: str = "http://localhost:3000"
