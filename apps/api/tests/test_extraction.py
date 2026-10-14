@@ -4,7 +4,7 @@ import pytest
 from app.bank_imports import _node, _pdf_bytes
 from app.models import QuestionBank, QuestionKind, SourceDocument, TaxonomyNode
 from app.seed_jee_openrouter import normalize_choice_kind
-from app.tasks import answer_from_key, embedded_answer_key_text, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, validate
+from app.tasks import answer_from_key, embedded_answer_key_text, expected_questions, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, unit_requires_vision, validate
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db import Base
@@ -56,8 +56,15 @@ def test_native_answer_key_lookup_maps_only_explicit_numbered_choice():
     assert answer_from_key("42",options,"The answer to 42 may be B in some versions.") is None
 
 def test_sparse_pages_are_batched_but_dense_pages_are_bounded():
-    pages=["cover", "index", "1. a\n2. b\n3. c\n4. d\n5. e\n6. f\n7. g\n8. h\n9. i", "10. j"]
+    pages=["cover", "index", "1 Let x be real\n2. If y is positive\n3. Find z\n4. Given a\n5. Which value\n6. The result\n7. In a set\n8. Prove that\n9. Evaluate x", "10. Let j be real"]
     assert extraction_units(pages) == [(0,3),(3,4)]
+
+def test_coaching_book_question_numbers_without_a_dot_are_detected():
+    # This is the printing convention on Arihant PDF page 10, where the old
+    # `number.` detector returned zero and allowed an empty model response.
+    text="""1 Let z be a complex number. Determine its modulus from the stated conditions.\n(a) one (b) two\n2 All the points in S satisfying the given relation lie on a curve in the complex plane.\n3 Let x be real and evaluate the following expression using the supplied identity.\n4 If y is positive, determine the possible values after applying the relation above."""
+    assert expected_questions(text) == 4
+    assert unit_requires_vision([text],0,1) is False
 
 def test_combined_document_answer_key_pages_are_detected():
     pages=["1. Question text", "ANSWER KEY\n1. A\n2. B\n3. C\n4. D\n5. A\n6. B"]

@@ -20,7 +20,15 @@ SPAN_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bb
 SCHEMA={"name":"exam_questions","strict":True,"schema":{"type":"object","additionalProperties":False,"required":["questions"],"properties":{"questions":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["number","chapter","topic","kind","stem_markdown","options","answer","solution_markdown","confidence","source_spans","diagrams"],"properties":{"number":{"type":"string"},"chapter":{"type":"string"},"topic":{"type":"string"},"kind":{"type":"string","enum":["single_choice","multiple_choice","numerical","integer","matrix_match","assertion_reason","subjective"]},"stem_markdown":{"type":"string"},"options":{"type":"array","items":OPTION_SCHEMA},"answer":{"type":["object","null"]},"solution_markdown":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"source_spans":{"type":"array","items":SPAN_SCHEMA},"diagrams":{"type":"array","items":DIAGRAM_SCHEMA}}}}}}}
 
 _INLINE_OPTION=re.compile(r"(?:^|\n)\s*(?:\(?([A-Ha-h])\)|([A-Ha-h])[.)])\s*(.+?)(?=(?:\n\s*(?:\(?[A-Ha-h]\)|[A-Ha-h][.)])\s*)|$)",re.S)
-_QUESTION_START=re.compile(r"(?m)^\s*(?:q(?:uestion)?\s*)?\d{1,4}\s*[.)]")
+# Coaching books frequently print a question number as `1 Let ...` rather
+# than `1. Let ...`.  The old expression only saw the latter (and therefore
+# considered the first real Arihant question page empty).  Options do not
+# match because they are parenthesised letters, not a bare question number.
+_QUESTION_START=re.compile(
+    r"(?mi)^\s*(?:q(?:uestion)?\s*)?\d{1,4}(?:\s*[.)])?\s+"
+    r"(?=(?:let|if|for|find|given|which|what|the|in|from|prove|show|all|"
+    r"calculate|determine|evaluate|match|assertion|statement|read)\b)"
+)
 _ANSWER_HEADING=re.compile(r"\b(?:answer\s*key|answers?\b|solutions?\b|answer\s*&\s*solution)",re.I)
 _ANSWER_CELL=re.compile(r"(?<!\d)\d{1,4}(?!\d)\s*(?:[.)-]\s*)?\(?[A-H]\)?(?=\s|$)",re.I)
 
@@ -163,17 +171,40 @@ def best_page_text(raw:bytes, reader:PdfReader, rendered:fitz.Document)->list[st
         result.append(mupdf_text if len(mupdf_text)>len(pypdf_text) else pypdf_text)
     return result
 
-def extraction_units(page_texts:list[str], max_pages:int=8, max_questions:int=9)->list[tuple[int,int]]:
-    """Batch sparse pages, but isolate dense pages before JSON gets truncated."""
+def expected_questions(text:str)->int:
+    """A conservative signal used to prevent successful-looking empty calls."""
+    return len(_QUESTION_START.findall(text or ""))
+
+def extraction_units(page_texts:list[str], max_pages:int=8, max_characters:int=7_000,
+                     max_questions:int=9)->list[tuple[int,int]]:
+    """Make bounded native-text batches, following the proven reference design.
+
+    The previous page/image batching created hundreds of expensive serial model
+    calls and supplied far more source than the JSON response could reliably
+    contain.  Keep a dense page by itself; otherwise join sparse front matter
+    only while its text and expected question count fit a response-sized unit.
+    """
     units=[];start=0
     while start<len(page_texts):
-        end=start;questions=0
+        end=start;characters=0;questions=0
         while end<len(page_texts) and end-start<max_pages:
-            found=len(_QUESTION_START.findall(page_texts[end]))
-            if end>start and questions and questions+found>max_questions:break
-            questions+=found;end+=1
+            text=page_texts[end] or ""; found=expected_questions(text)
+            if end>start and (characters+len(text)>max_characters or (questions and questions+found>max_questions)):
+                break
+            characters+=len(text);questions+=found;end+=1
+            # A page that is already a full text chunk must be sent by itself.
+            if characters>=max_characters or questions>=max_questions:break
         units.append((start,end));start=end
     return units
+
+def unit_requires_vision(page_texts:list[str], start:int, end:int)->bool:
+    """Use image input only when the native PDF text is genuinely unusable.
+
+    Diagrams are collected from the PDF independently, so attaching every
+    rendered page to a text-rich request only slows extraction and degrades
+    question-boundary accuracy.
+    """
+    return any(len((page_texts[index] or "").strip())<240 for index in range(start,end))
 
 def embedded_answer_key_text(page_texts:list[str])->str:
     """Locate answer-table pages in a combined question-and-solution PDF."""
@@ -195,7 +226,7 @@ def page_unit_content(page_texts:list[str], start:int, key_text:str, end:int|Non
     if key_text:text+=f"\n\nANSWER KEY DOCUMENT (authoritative):\n{key_text[:40000]}"
     return text
 
-def request_extraction(payload:dict, title:str)->dict:
+def request_extraction(payload:dict, title:str, minimum_questions:int=0)->dict:
     """Make a bounded, retriable provider request for one durable page unit."""
     import httpx
     models=[payload["model"]]
@@ -208,7 +239,13 @@ def request_extraction(payload:dict, title:str)->dict:
             try:
                 response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":title},json=request,timeout=settings().openrouter_timeout_seconds)
                 response.raise_for_status()
-                return json.loads(response.json()["choices"][0]["message"]["content"])
+                parsed=json.loads(response.json()["choices"][0]["message"]["content"])
+                if len(parsed.get("questions") or [])<minimum_questions:
+                    raise ValueError(
+                        f"Provider returned {len(parsed.get('questions') or [])} questions "
+                        f"for a source unit with at least {minimum_questions} detectable questions"
+                    )
+                return parsed
             except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 last_error=exc
                 if attempt<2:time.sleep(2**attempt)
@@ -302,18 +339,21 @@ def extract_import(self, job_id:str):
       for start,end in units:
         if start<checkpoint:start=checkpoint
         vision_content=[{"type":"text","text":page_unit_content(page_texts,start,key_text,end)}]
-        rendered_bytes=0
-        # Include one continuation page visually too.  It provides options and
-        # diagrams that cross a page break, but only the primary page owns IDs.
-        for page_number in range(start,min(page_count,end+1)):
-          png=rendered[page_number].get_pixmap(matrix=fitz.Matrix(1.25,1.25),alpha=False).tobytes("png")
-          rendered_bytes+=len(png)
-          if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("A rendered extraction batch exceeds the configured size limit")
-          vision_content.extend([{"type":"text","text":f"Source page {page_number+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}])
+        # Native text is materially more accurate for this digitally-produced
+        # book.  Rendering every readable page made this a 625-request visual
+        # scan.  Keep vision as a precise fallback for scanned/sparse pages.
+        if unit_requires_vision(page_texts,start,end):
+          rendered_bytes=0
+          for page_number in range(start,min(page_count,end+1)):
+            png=rendered[page_number].get_pixmap(matrix=fitz.Matrix(1.25,1.25),alpha=False).tobytes("png")
+            rendered_bytes+=len(png)
+            if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("A rendered extraction batch exceeds the configured size limit")
+            vision_content.extend([{"type":"text","text":f"Source page {page_number+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}])
         job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"question_count":len(numbers)};db.commit()
         payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":vision_content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
         try:
-          parsed=request_extraction(payload,"TestNow")
+          minimum=1 if expected_questions("\n".join(page_texts[start:end])) else 0
+          parsed=request_extraction(payload,"TestNow",minimum)
         except Exception as page_error:
           # A single corrupt page or transient provider failure must not strand
           # hundreds of already checkpointed pages.  Surface the exact page in

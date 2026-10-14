@@ -16,7 +16,7 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
-from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, diagrams_for_item, embedded_answer_key_text, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
+from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, diagrams_for_item, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction, unit_requires_vision
 
 
 def _pdf_bytes(source: SourceDocument) -> bytes:
@@ -187,13 +187,18 @@ def run_bank_import(job_id: str) -> None:
                 job.error="Cancelled by administrator" if control=="cancelled" else None
                 job.extraction_meta={**(job.extraction_meta or {}),"phase":"Cancelled" if control=="cancelled" else "Paused by administrator","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1};db.commit();return
             content=[{"type":"text","text":f"Subject: {subject}. {page_unit_content(page_texts,start,answer_text,end)}"}]
-            for page_no in range(start,min(page_count,end+1)):
-                png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
-                content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
+            # Do not turn selectable PDF text into a visual OCR job.  The
+            # source PDF itself supplies vector/raster diagram regions later;
+            # vision is reserved for pages with no usable text layer.
+            if unit_requires_vision(page_texts,start,end):
+                for page_no in range(start,min(page_count,end+1)):
+                    png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
+                    content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
             job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};db.commit()
             payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
             try:
-                parsed=request_extraction(payload,"TestNow Bank Importer")
+                minimum=1 if expected_questions("\n".join(page_texts[start:end])) else 0
+                parsed=request_extraction(payload,"TestNow Bank Importer",minimum)
             except Exception as page_error:
                 failed_pages.append({"page":start+1,"error":str(page_error)[:300]})
                 job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
