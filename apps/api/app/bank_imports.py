@@ -24,19 +24,30 @@ def _pdf_bytes(source: SourceDocument) -> bytes:
     if source.media_type == "application/pdf": return raw
     with TemporaryDirectory(prefix="bank-docx-") as directory:
         path=Path(directory) / source.filename; path.write_bytes(raw)
-        try:
-            subprocess.run(["soffice","--headless","--convert-to","pdf","--outdir",directory,str(path)],check=True,capture_output=True,text=True,timeout=120)
-        except subprocess.CalledProcessError as exc:
-            detail=(exc.stderr or exc.stdout or "LibreOffice could not read the document").strip()
-            raise ValueError(f"Could not convert {source.filename} to PDF: {detail[:500]}") from exc
         converted=path.with_suffix(".pdf")
-        if not converted.exists(): raise ValueError("DOCX conversion did not produce a PDF")
+        # Keep LibreOffice isolated per job.  Besides avoiding profile locks in
+        # concurrent Celery workers, this lets us use the same stored-file
+        # pipeline as the teacher PDF importer after conversion.
+        profile=Path(directory) / "profile"
+        result=subprocess.run([
+            "soffice", "--headless", "--convert-to", "pdf:writer_pdf_Export",
+            "--outdir", directory, f"-env:UserInstallation={profile.as_uri()}", str(path),
+        ],check=False,capture_output=True,text=True,timeout=120)
+        # Some slim LibreOffice packages return non-zero after printing the
+        # harmless javaldx warning, even though they successfully write the
+        # PDF.  The artifact, not that warning, is the conversion result.
+        if not converted.exists() or not converted.read_bytes().startswith(b"%PDF"):
+            detail=(result.stderr or result.stdout or "LibreOffice could not read the document").strip()
+            raise ValueError(f"Could not convert {source.filename} to PDF: {detail[:500]}")
         return converted.read_bytes()
 
 
 def _node(db, bank_id: str, parent_id: str | None, kind: str, name: str) -> TaxonomyNode:
     name=re.sub(r"\s+"," ",name).strip()[:200] or f"Unmapped {kind}"
-    row=db.query(TaxonomyNode).filter_by(bank_id=bank_id,parent_id=parent_id,kind=kind,name=name).one_or_none()
+    # PostgreSQL's regular UNIQUE constraint treats NULL parent ids as distinct.
+    # Older concurrent imports therefore left duplicate root subjects behind;
+    # selecting one stable row keeps those historic records importable.
+    row=db.query(TaxonomyNode).filter_by(bank_id=bank_id,parent_id=parent_id,kind=kind,name=name).order_by(TaxonomyNode.created_at,TaxonomyNode.id).first()
     if row:return row
     row=TaxonomyNode(id=uid(),bank_id=bank_id,parent_id=parent_id,kind=kind,name=name);db.add(row);db.flush();return row
 
@@ -88,6 +99,9 @@ def _control_state(db, job_id: str) -> str | None:
 
 def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers):
     flagged=0; saved=0
+    # Serialize the small taxonomy/write phase per bank.  This prevents two
+    # source jobs from creating a second NULL-parent subject simultaneously.
+    db.query(QuestionBank).filter_by(id=bank.id).with_for_update().one()
     subject_node=_node(db,bank.id,None,"subject",subject)
     for item in items:
         item=normalize_item(item);validate(item);number=str(item["number"]).strip()
