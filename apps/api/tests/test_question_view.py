@@ -25,3 +25,15 @@ def test_question_view_tolerates_legacy_non_numeric_confidence():
     )
 
     assert question_view(question)["confidence"] is None
+
+
+def test_question_view_does_not_requery_preloaded_empty_taxonomy():
+    question=SimpleNamespace(
+        id="question-2", source_number="2", kind=QuestionKind.SINGLE,
+        stem_markdown="Question", options=["One", "Two"], answer={"option":0},
+        solution_markdown=None, scoring={}, diagrams=[], source_spans=[],
+        interaction={}, confidence=1, approved_at=None, bank_id="bank-1",
+        import_job_id=None, scope=QuestionScope.GLOBAL,
+    )
+
+    assert question_view(question, object(), taxonomy=[])["taxonomy"] == []

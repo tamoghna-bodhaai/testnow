@@ -629,7 +629,7 @@ def canonical_answer(answer,options):
     # Numerical / subjective answer keys keep their reviewed structured value.
     if raw is not None:return {"value":raw}
     raise HTTPException(422,"Choose a valid option or provide an answer value")
-def question_view(q:Question, db:Session|None=None):
+def question_view(q:Question, db:Session|None=None, taxonomy:list[dict]|None=None):
     confidence=q.confidence
     if confidence is not None:
         # Imported legacy records can contain a non-numeric confidence value.
@@ -640,9 +640,10 @@ def question_view(q:Question, db:Session|None=None):
             confidence=min(1.0,max(0.0,float(confidence)))
         except (TypeError,ValueError):
             confidence=None
-    taxonomy=[]
-    if db and q.bank_id:
-        taxonomy=[{"id":node.id,"parent_id":node.parent_id,"kind":node.kind,"name":node.name,"code":node.code} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==q.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
+    if taxonomy is None:
+        taxonomy=[]
+        if db and q.bank_id:
+            taxonomy=[{"id":node.id,"parent_id":node.parent_id,"kind":node.kind,"name":node.name,"code":node.code} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==q.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
     options=normalized_options(q.options); kind=safe_question_kind(q.kind,options)
     answer=None if kind=="subjective" and len(options)<2 else q.answer
     interaction=dict(q.interaction or {})
@@ -653,9 +654,33 @@ def question_view(q:Question, db:Session|None=None):
         source=db.get(SourceDocument,job.question_document_id) if job else None
         if source:interaction["source_filename"]=source.filename
     return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":interaction,"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":taxonomy}
+
+def question_views(rows:list[Question],db:Session)->list[dict]:
+    """Serialize a page of questions without one taxonomy query per question."""
+    question_ids=[question.id for question in rows]
+    taxonomy_by_question={question_id:[] for question_id in question_ids}
+    if question_ids:
+        links=(db.query(QuestionTaxonomy.question_id,TaxonomyNode)
+               .join(TaxonomyNode,TaxonomyNode.id==QuestionTaxonomy.taxonomy_node_id)
+               .filter(QuestionTaxonomy.question_id.in_(question_ids))
+               .order_by(TaxonomyNode.kind,TaxonomyNode.name))
+        for question_id,node in links:
+            taxonomy_by_question[question_id].append({"id":node.id,"parent_id":node.parent_id,"kind":node.kind,"name":node.name,"code":node.code})
+    return [question_view(question,db,taxonomy_by_question[question.id]) for question in rows]
+
 @app.get("/questions")
-def questions(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+def questions(
+    page:int|None=Query(default=None,ge=1),
+    page_size:int=Query(default=20,ge=1,le=100),
+    user:User=Depends(require(Role.TEACHER,Role.ADMIN)),
+    db:Session=Depends(get_db),
+):
     rows=db.query(Question).filter((Question.owner_id==user.id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
+    if page is not None:
+        total=rows.count()
+        approved_total=rows.filter(Question.approved_at.is_not(None)).count()
+        items=rows.offset((page-1)*page_size).limit(page_size).all()
+        return {"items":question_views(items,db),"page":page,"page_size":page_size,"total":total,"approved_total":approved_total,"has_more":page*page_size<total}
     # Do not make the whole teacher library unavailable because a legacy import
     # has malformed optional display metadata. It remains repairable in review.
     visible=[]
@@ -742,7 +767,7 @@ def bank_questions(
     if kinds:query=query.filter(Question.kind.in_([QuestionKind(value) for value in kinds]))
     total=query.count()
     rows=query.order_by(Question.created_at.desc(),Question.id).offset((page-1)*page_size).limit(page_size).all()
-    return {"items":[question_view(row,db) for row in rows],"page":page,"page_size":page_size,"total":total,"has_more":page*page_size<total}
+    return {"items":question_views(rows,db),"page":page,"page_size":page_size,"total":total,"has_more":page*page_size<total}
 @app.get("/media/questions/{question_id}/{index}")
 def question_media(question_id:str,index:int,user:User=Depends(current_user),db:Session=Depends(get_db),asset:str|None=None):
     q=db.get(Question,question_id)

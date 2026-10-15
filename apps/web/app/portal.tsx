@@ -46,6 +46,7 @@ type Question = {
   scope?: "private" | "global";
   taxonomy?: { id: string; parent_id?: string; kind: string; name: string }[];
 };
+type QuestionPage = { items: Question[]; page: number; page_size: number; total: number; approved_total?: number; has_more: boolean };
 type ImportJob = {
   id: string;
   status: "uploaded" | "processing" | "review" | "failed" | "approved";
@@ -275,6 +276,7 @@ export function Portal() {
     >("home"),
     [tests, setTests] = useState<Test[]>([]),
     [questions, setQuestions] = useState<Question[]>([]),
+    [questionCount, setQuestionCount] = useState(0),
     [classes, setClasses] = useState<Classroom[]>([]),
     [studentClasses, setStudentClasses] = useState<StudentClass[]>([]),
     [jobs, setJobs] = useState<ImportJob[]>([]),
@@ -310,12 +312,13 @@ export function Portal() {
     } else if (me.role === "teacher") {
       const [loadedTests, loadedQuestions, loadedClasses] = await Promise.all([
         api("/tests"),
-        api("/questions"),
+        api("/questions?page=1&page_size=20"),
         api("/classes"),
       ]);
       if (version !== sessionVersion.current) return;
       setTests(loadedTests);
-      setQuestions(loadedQuestions);
+      setQuestions(loadedQuestions.items);
+      setQuestionCount(loadedQuestions.approved_total ?? 0);
       setClasses(loadedClasses);
       await loadImports(version);
     } else {
@@ -479,7 +482,7 @@ export function Portal() {
         ) : (
           <TeacherHome
             tests={tests}
-            questions={questions}
+            questionCount={questionCount}
             classes={classes}
             jobs={jobs}
             onTestDeleted={(id) =>
@@ -553,7 +556,8 @@ export function Portal() {
       {view === "bank-import" && <QuestionBankManager notify={setMessage} />}
       {view === "builder" && (
         <Builder
-          questions={questions}
+          initialQuestions={questions}
+          initialQuestionCount={questionCount}
           onDone={async (id) => {
             openTest(id);
             setMessage("Draft created. Add classes and publish it when ready.");
@@ -648,7 +652,7 @@ function ImportSummary({ job, open }: { job: ImportJob; open: () => void }) {
 }
 function TeacherHome({
   tests,
-  questions,
+  questionCount,
   classes,
   jobs,
   onTestDeleted,
@@ -657,7 +661,7 @@ function TeacherHome({
   refresh,
 }: {
   tests: Test[];
-  questions: Question[];
+  questionCount: number;
   classes: Classroom[];
   jobs: ImportJob[];
   onTestDeleted: (id: string) => void;
@@ -698,7 +702,7 @@ function TeacherHome({
           <span>Published tests</span>
         </Card>
         <Card>
-          <b>{questions.filter((q) => q.approved).length}</b>
+          <b>{questionCount}</b>
           <span>Approved questions</span>
         </Card>
       </div>
@@ -1861,10 +1865,12 @@ function ReviewQuestion({
 }
 
 function Builder({
-  questions,
+  initialQuestions,
+  initialQuestionCount,
   onDone,
 }: {
-  questions: Question[];
+  initialQuestions: Question[];
+  initialQuestionCount: number;
   onDone: (id: string) => void;
 }) {
   const [selected, setSelected] = useState<string[]>([]),
@@ -1883,6 +1889,7 @@ function Builder({
       total: number;
       has_more: boolean;
     }>({ items: [], total: 0, has_more: false }),
+    [mine, setMine] = useState<QuestionPage>({ items: initialQuestions, page: 1, page_size: 20, total: initialQuestionCount, has_more: initialQuestionCount > initialQuestions.length }),
     [availability, setAvailability] = useState<{
       total: number;
       counts: Record<string, number>;
@@ -1942,6 +1949,14 @@ function Builder({
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [source, bankId, subjectId, chapterId, subtopicId, kinds, page]);
+  useEffect(() => {
+    if (source !== "mine") return;
+    setLoading(true);
+    api(`/questions?page=${page}&page_size=20`)
+      .then(setMine)
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [source, page]);
   const subjects = nodes.filter((node) => node.kind === "subject"),
     chapters = nodes.filter(
       (node) => node.kind === "chapter" && node.parent_id === subjectId,
@@ -1952,7 +1967,7 @@ function Builder({
     shown =
       source === "bank"
         ? remote.items
-        : questions.filter((q) => q.approved && q.scope !== "global"),
+        : mine.items,
     selectedQuestions = selected.map((id) => shown.find((question) => question.id === id)).filter(Boolean) as Question[],
     toggleKind = (kind: string) => {
       setPage(1);
@@ -2186,9 +2201,9 @@ function Builder({
               </p>
             )}
           </div>
-          {source === "bank" && (
+          {(source === "bank" || source === "mine") && (
             <div className="review-actions">
-              <small>{remote.total} matching questions</small>
+              <small>{source === "bank" ? remote.total : mine.total} matching questions</small>
               <button
                 type="button"
                 className="secondary-action"
@@ -2200,7 +2215,7 @@ function Builder({
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!remote.has_more}
+                disabled={source === "bank" ? !remote.has_more : !mine.has_more}
                 onClick={() => setPage((value) => value + 1)}
               >
                 Next
