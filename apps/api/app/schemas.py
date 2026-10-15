@@ -37,7 +37,7 @@ class AnswerKeyIn(BaseModel): answer:dict=Field(min_length=1); confidence:float|
 class FigureReviewIn(BaseModel):
     diagrams:list[dict]=Field(max_length=32)
     confirmed:bool
-class TestCreate(BaseModel): title:str=Field(min_length=2,max_length=255); subject:str=Field(min_length=2,max_length=120); duration_minutes:int=Field(ge=1); opens_at:datetime|None=None; closes_at:datetime|None=None; max_attempts:int=Field(default=1,ge=1,le=10); results_policy:dict=Field(default_factory=lambda:{"mode":"immediate"}); question_ids:list[str]=Field(min_length=1)
+class TestCreate(BaseModel): title:str=Field(min_length=2,max_length=255); subject:str=Field(min_length=2,max_length=120); duration_minutes:int=Field(ge=1); opens_at:datetime|None=None; closes_at:datetime|None=None; max_attempts:int=Field(default=1,ge=1,le=10); marks_per_question:int=Field(default=4,ge=1,le=100); results_policy:dict=Field(default_factory=lambda:{"mode":"immediate"}); question_ids:list[str]=Field(min_length=1)
 class ResponseIn(BaseModel): answer:dict|None=None; marked_for_review:bool=False; revision:int=Field(ge=0)
 class EnrolIn(BaseModel):
     email:str

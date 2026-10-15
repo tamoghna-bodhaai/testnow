@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, create_student, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
+from app.main import assigned_student_ids, create_student, delete_test, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
 from app.models import AccountStatus, Attempt, Classroom, ClassMembership, Question, QuestionKind, Role, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.schemas import LoginIn, RosterUpdate, StudentCreate
 from fastapi import HTTPException
@@ -49,6 +49,23 @@ def test_student_classes_returns_only_the_current_students_enrolments():
     db.commit()
 
     assert student_classes(first,db)==[{"id":"class-1","name":"Physics 12A","description":"Morning section"}]
+
+def test_teacher_can_delete_an_unattempted_test_and_its_assignments():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    test=Assessment(id="test",owner_id=teacher.id,title="Physics",subject="Physics",status=AssessmentStatus.DRAFT,duration_seconds=3600,max_attempts=1,results_policy={"mode":"immediate"})
+    classroom=Classroom(id="class",owner_id=teacher.id,name="12A")
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]})
+    db.add_all([teacher,test,classroom,version,ClassAssignment(test_id=test.id,class_id=classroom.id)])
+    db.commit()
+    test_id=test.id
+    version_id=version.id
+
+    delete_test(test_id,teacher,db)
+
+    assert db.get(Assessment,test_id) is None
+    assert db.get(AssessmentVersion,version_id) is None
+    assert not db.query(ClassAssignment).filter_by(test_id=test_id).count()
 
 def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch):
     db=make_db()

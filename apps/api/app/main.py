@@ -18,6 +18,8 @@ from .seed import ensure_demo_data
 from .figures import is_visual_issue, option_media_issues
 
 app=FastAPI(title="TestNow API",version="1.0.0")
+def as_utc(value:datetime)->datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 from .figure_review import router as figure_review_router
 app.include_router(figure_review_router)
 app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
@@ -834,13 +836,32 @@ def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMI
     if data.closes_at and data.opens_at and data.closes_at<=data.opens_at:raise HTTPException(422,"Closing time must be after opening time")
     duration_seconds=data.duration_minutes*60
     test=Test(id=uid(),owner_id=user.id,title=data.title,subject=data.subject,duration_seconds=duration_seconds,opens_at=data.opens_at,closes_at=data.closes_at,max_attempts=data.max_attempts,results_policy=data.results_policy);db.add(test);db.flush()
-    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":snapshot_questions(db,data.question_ids,user.id),"duration_seconds":duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id);db.commit();return test_view(test,db)
+    selected=snapshot_questions(db,data.question_ids,user.id)
+    for question in selected:
+        question["scoring"]={**(question.get("scoring") or {}),"correct":data.marks_per_question}
+    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":selected,"duration_seconds":duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id,{"marks_per_question":data.marks_per_question});db.commit();return test_view(test,db)
 @app.get("/tests")
 def list_tests(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):return [test_view(t,db) for t in db.query(Test).filter_by(owner_id=user.id).order_by(Test.created_at.desc())]
 @app.get("/tests/{test_id}")
 def test_detail(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     t=test_for_owner(test_id,user,db)
     return test_view(t,db,True)
+@app.delete("/tests/{test_id}",status_code=204)
+def delete_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    """Remove an assessment that has never been started by a student.
+
+    Started tests are preserved as part of the student's assessment record;
+    teachers can still unassign them, but cannot erase that history.
+    """
+    test=test_for_owner(test_id,user,db)
+    if db.query(Attempt).filter_by(test_id=test.id).first():
+        raise HTTPException(409,"A test with student attempts cannot be deleted")
+    db.query(TestClassAssignment).filter_by(test_id=test.id).delete(synchronize_session=False)
+    db.query(Enrollment).filter_by(test_id=test.id).delete(synchronize_session=False)
+    db.query(TestVersion).filter_by(test_id=test.id).delete(synchronize_session=False)
+    db.delete(test)
+    audit(db,user.id,"test.deleted","test",test_id,{"title":test.title})
+    db.commit()
 @app.post("/tests/{test_id}/publish")
 def publish_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     t=test_for_owner(test_id,user,db)
@@ -890,7 +911,7 @@ def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN
         rows.append({"student":user_public(student),"status":status,"score":latest.score if latest else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"attempt_count":len(attempts)})
     return {"test_id":test.id,"summary":{"assigned":len(student_ids),"started":started,"submitted":submitted,"pending":len(student_ids)-started},"students":rows}
 def test_view(t:Test,db:Session,include=False):
-    v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids)}
+    v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids),"assigned_class_names":[c.name for c in classes]}
     if include:
         out["classes"]=[classroom_view(c,db) for c in classes]
         if v:out["questions"]=v.content["questions"]
@@ -945,7 +966,7 @@ def get_attempt(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessi
 def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
     if not a or a.student_id!=user.id or a.submitted_at or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(409,"Attempt cannot be changed")
-    if datetime.now(timezone.utc)>=a.ends_at:raise HTTPException(409,"Attempt has expired")
+    if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired")
     content=db.get(TestVersion,a.version_id).content
     if question_id not in {q["id"] for q in content["questions"]}:raise HTTPException(422,"Question is not part of this attempt")
     if data.revision!=a.revision:raise HTTPException(409,"Attempt changed in another session")
@@ -958,7 +979,7 @@ def submit(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=De
     a=db.get(Attempt,attempt_id)
     if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
     if a.submitted_at:return attempt_view(a,db)
-    if datetime.now(timezone.utc)>=a.ends_at:raise HTTPException(409,"Attempt has expired and cannot be submitted")
+    if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired and cannot be submitted")
     version=db.get(TestVersion,a.version_id); responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};a.score,_=score(version.content,responses);a.submitted_at=datetime.now(timezone.utc);audit(db,user.id,"attempt.submitted","attempt",a.id);db.commit();return attempt_view(a,db)
 @app.get("/results/{attempt_id}")
 def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):

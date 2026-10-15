@@ -95,6 +95,7 @@ type Test = {
   max_attempts: number;
   class_count: number;
   assigned_student_count: number;
+  assigned_class_names?: string[];
   classes?: Classroom[];
   questions?: Question[];
   availability?: "available" | "upcoming" | "closed";
@@ -652,6 +653,15 @@ function TeacherHome({
   const actionable = jobs.filter((job) => job.status !== "approved"),
     students = classes.reduce((total, item) => total + item.student_count, 0),
     published = tests.filter((test) => test.status === "published").length;
+  const deleteTest = async (test: Test) => {
+    if (!window.confirm(`Delete “${test.title}”? This cannot be undone.`)) return;
+    try {
+      await api(`/tests/${test.id}`, { method: "DELETE" });
+      await refresh();
+    } catch (e: any) {
+      window.alert(e.message);
+    }
+  };
   return (
     <div className="page">
       <p className="eyebrow">TEACHER WORKSPACE</p>
@@ -700,7 +710,9 @@ function TeacherHome({
                 <small>
                   {t.subject} · {t.question_count} questions ·{" "}
                   {Math.ceil(t.duration_seconds / 60)} min ·{" "}
-                  {t.assigned_student_count} assigned
+                  {t.assigned_class_names?.length
+                    ? `Assigned to: ${t.assigned_class_names.join(", ")} · ${t.assigned_student_count} students`
+                    : "Not assigned to a batch"}
                 </small>
               </div>
               <div>
@@ -710,6 +722,13 @@ function TeacherHome({
                   onClick={() => openTest(t.id)}
                 >
                   View
+                </button>
+                <button
+                  type="button"
+                  className="text-danger"
+                  onClick={() => deleteTest(t)}
+                >
+                  Delete
                 </button>
                 {t.status === "draft" && (
                   <button
@@ -1125,7 +1144,9 @@ function TestDetail({
     [analytics, setAnalytics] = useState<Analytics | null>(null),
     [tab, setTab] = useState<"preview" | "assignment" | "analytics">("preview"),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
+    [publishing, setPublishing] = useState(false),
+    [savingAssignments, setSavingAssignments] = useState(false),
+    [deleting, setDeleting] = useState(false);
   const load = async () => {
     try {
       setTest(await api(`/tests/${testId}`));
@@ -1140,22 +1161,25 @@ function TestDetail({
   const assigned = new Set(test.classes?.map((c) => c.id) || []);
   const saveClasses = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    setBusy(true);
+    setSavingAssignments(true);
+    setError("");
     try {
       const form = new FormData(e.currentTarget);
       const class_ids = form.getAll("class_id").map(String);
-      setTest(
-        await api(`/tests/${test.id}/classes`, {
-          method: "PUT",
-          body: JSON.stringify({ class_ids }),
-        }),
-      );
-      await refresh();
+      const updated = await api(`/tests/${test.id}/classes`, {
+        method: "PUT",
+        body: JSON.stringify({ class_ids }),
+      });
+      setTest(updated);
       notify("Class assignments saved.");
+      // The assignment is already persisted. Keep the dashboard refresh
+      // independent so an unrelated library refresh cannot make this form
+      // look as though it is still saving or failed.
+      void refresh().catch(() => {});
     } catch (e: any) {
       setError(e.message);
     } finally {
-      setBusy(false);
+      setSavingAssignments(false);
     }
   };
   const loadAnalytics = async () => {
@@ -1164,6 +1188,21 @@ function TestDetail({
       setAnalytics(await api(`/tests/${test.id}/analytics`));
     } catch (e: any) {
       setError(e.message);
+    }
+  };
+  const deleteCurrentTest = async () => {
+    if (!window.confirm(`Delete “${test.title}”? This cannot be undone.`)) return;
+    setDeleting(true);
+    setError("");
+    try {
+      await api(`/tests/${test.id}`, { method: "DELETE" });
+      await refresh();
+      notify("Test deleted.");
+      back();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setDeleting(false);
     }
   };
   return (
@@ -1179,13 +1218,19 @@ function TestDetail({
             {test.subject} · {test.question_count} questions ·{" "}
             {Math.ceil(test.duration_seconds / 60)} minutes
           </p>
+          <p>
+            {test.assigned_class_names?.length
+              ? `Assigned to: ${test.assigned_class_names.join(", ")}`
+              : "Not assigned to a batch yet"}
+          </p>
         </div>
         <div className="detail-actions">
           <span className={`badge ${test.status}`}>{test.status}</span>
           {test.status === "draft" && (
             <button
               onClick={async () => {
-                setBusy(true);
+                setPublishing(true);
+                setError("");
                 try {
                   await api(`/tests/${test.id}/publish`, { method: "POST" });
                   await load();
@@ -1196,14 +1241,22 @@ function TestDetail({
                 } catch (e: any) {
                   setError(e.message);
                 } finally {
-                  setBusy(false);
+                  setPublishing(false);
                 }
               }}
-              disabled={busy}
+              disabled={publishing}
             >
               Publish test
             </button>
           )}
+          <button
+            type="button"
+            className="text-danger"
+            onClick={deleteCurrentTest}
+            disabled={deleting}
+          >
+            {deleting ? "Deleting…" : "Delete test"}
+          </button>
         </div>
       </div>
       {error && <Notice kind="error">{error}</Notice>}
@@ -1218,7 +1271,7 @@ function TestDetail({
           className={tab === "assignment" ? "active" : ""}
           onClick={() => setTab("assignment")}
         >
-          Classes ({test.class_count})
+          {test.class_count ? `Assigned batches (${test.class_count})` : "No batch assigned"}
         </button>
         <button
           className={tab === "analytics" ? "active" : ""}
@@ -1270,7 +1323,9 @@ function TestDetail({
                 Create a class first, then return here to assign it.
               </Notice>
             )}
-            <button disabled={busy}>Save assignments</button>
+            <button disabled={savingAssignments}>
+              {savingAssignments ? "Saving assignments…" : "Save assignments"}
+            </button>
           </form>
         </Card>
       )}
@@ -1869,6 +1924,7 @@ function Builder({
             closes_at: toIso(f.closes_at),
             duration_minutes: Number(f.duration_minutes),
             max_attempts: Number(f.max_attempts),
+            marks_per_question: Number(f.marks_per_question),
             question_ids: selected,
             results_policy: { mode: "immediate" },
           }),
@@ -1913,6 +1969,10 @@ function Builder({
                 defaultValue="1"
                 required
               />
+            </div>
+            <div>
+              <label>Marks per question</label>
+              <input name="marks_per_question" type="number" min="1" defaultValue="4" required />
             </div>
             <div>
               <label>
@@ -2021,17 +2081,12 @@ function Builder({
                     ))}
                   </select>
                 </label>
-                <div className="question-type-list">
-                  <label>
-                    Question type{" "}
-                    <span className="optional">
-                      (
-                      {countsLoading
-                        ? "updating…"
-                        : `${availability.total} available`}
-                      )
-                    </span>
-                  </label>
+                <details className="question-type-list">
+                  <summary>
+                    Question type <span className="optional">({countsLoading ? "updating…" : `${availability.total} available`})</span>
+                    <b>{kinds.length ? `${kinds.length} selected` : "All types"}</b>
+                  </summary>
+                  <div>
                   {JEE_QUESTION_TYPES.map(([value, label]) => (
                     <label key={value} className="assignment-choice">
                       <input
@@ -2045,7 +2100,8 @@ function Builder({
                       </b>
                     </label>
                   ))}
-                </div>
+                  </div>
+                </details>
               </>
             )}
           </div>
@@ -2127,7 +2183,9 @@ function Builder({
               </details>
             </> : <p>Add questions from the library to build your test.</p>}
           </div>
-          <button disabled={!selected.length}>Create draft ({selected.length})</button>
+          <button className="builder-selection-submit" disabled={!selected.length}>
+            Create draft{selected.length ? ` (${selected.length})` : ""}
+          </button>
         </Card>
       </form>
     </div>
