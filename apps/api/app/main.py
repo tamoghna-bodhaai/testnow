@@ -11,7 +11,7 @@ from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollme
 from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import audit, ensure_live, publish, score, safe_question_kind, snapshot_questions
-from .storage import client as storage_client, digest, get, put, signed_get
+from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
 from .tasks import extract_import, extract_bank_import
 from .seed import ensure_demo_data
 
@@ -255,6 +255,41 @@ def retry_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMI
     db.commit();extract_bank_import.delay(job.id)
     return import_view(job,db)
 
+def clear_bank_import_output(db:Session,job:ImportJob)->int:
+    """Remove one material's derived records before a clean re-extraction.
+
+    The uploaded source documents intentionally remain: a re-extraction must
+    use the exact same input bytes and answer-key pairing.  Taxonomy links are
+    removed explicitly so this works on every supported database, including
+    local SQLite installations where foreign-key cascades may be disabled.
+    """
+    question_ids=[row[0] for row in db.query(Question.id).filter_by(import_job_id=job.id).all()]
+    if question_ids:
+        db.query(QuestionTaxonomy).filter(QuestionTaxonomy.question_id.in_(question_ids)).delete(synchronize_session=False)
+        db.query(Question).filter(Question.id.in_(question_ids)).delete(synchronize_session=False)
+    # Diagram crops are derived data as well.  Their prefix is scoped to the
+    # import id, never to the complete question bank.
+    if job.bank_id:
+        delete_prefix(f"bank-diagrams/{job.bank_id}/{job.id}/")
+    return len(question_ids)
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/reextract",status_code=202)
+def reextract_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    """Start this stored source again from page one with no stale output."""
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    meta=dict(job.extraction_meta or {})
+    active=job.status==ImportStatus.PROCESSING or (job.status==ImportStatus.UPLOADED and not meta.get("pause_requested"))
+    if active:raise HTTPException(409,"Pause or cancel this material and wait for its current page batch to stop before re-extracting it")
+    if job.published_at:raise HTTPException(409,"This source material is live. Create a bank revision before replacing a published material")
+    removed=clear_bank_import_output(db,job)
+    subject=meta.get("subject") or "Unclassified"
+    job.status=ImportStatus.UPLOADED;job.error=None;job.published_at=None
+    job.extraction_meta={"subject":subject,"source_role":meta.get("source_role","combined"),"pairing":meta.get("pairing","missing_answer_source"),"phase":"Queued for clean re-extraction","reextraction_count":int(meta.get("reextraction_count") or 0)+1,"reextracted_at":datetime.now(timezone.utc).isoformat()}
+    audit(db,user.id,"question_bank.import_reextracted","import",job.id,{"bank_id":bank_id,"filename":db.get(SourceDocument,job.question_document_id).filename,"cleared_questions":removed})
+    db.commit();extract_bank_import.delay(job.id)
+    return import_view(job,db)
+
 @app.get("/admin/question-banks/{bank_id}/imports/{job_id}")
 def get_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     job=db.get(ImportJob,job_id)
@@ -290,7 +325,10 @@ def delete_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADM
     job=db.get(ImportJob,job_id)
     if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
     if job.status==ImportStatus.PROCESSING or (job.status==ImportStatus.UPLOADED and not (job.extraction_meta or {}).get("pause_requested")):raise HTTPException(409,"Pause this material and wait for the current batch to finish before deleting it")
-    db.query(Question).filter_by(import_job_id=job.id).delete(synchronize_session=False)
+    # Paused and cancelled materials are deliberately deletable.  A material
+    # may have a useful partial extraction, so publication is offered first in
+    # the UI; deletion is the administrator's explicit destructive choice.
+    clear_bank_import_output(db,job)
     db.delete(job);audit(db,user.id,"question_bank.import_deleted","import",job_id,{"bank_id":bank_id});db.commit()
 
 @app.post("/admin/question-banks/{bank_id}/publish")

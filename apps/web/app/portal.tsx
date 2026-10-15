@@ -422,21 +422,21 @@ export function Portal() {
           <nav>
             {user.role === "teacher" && (
               <>
-                <button onClick={() => setView("home")}>Dashboard</button>
-                <button onClick={() => setView("classes")}>
+                <button className={view === "home" ? "active" : ""} onClick={() => setView("home")}>Dashboard</button>
+                <button className={view === "classes" ? "active" : ""} onClick={() => setView("classes")}>
                   Class / batch
                 </button>
-                <button onClick={() => setView("import")}>Import paper</button>
-                <button onClick={() => setView("reviews")}>
+                <button className={view === "import" ? "active" : ""} onClick={() => setView("import")}>Import paper</button>
+                <button className={view === "reviews" ? "active" : ""} onClick={() => setView("reviews")}>
                   Review papers
                 </button>
-                <button onClick={() => setView("builder")}>Build test</button>
+                <button className={view === "builder" ? "active" : ""} onClick={() => setView("builder")}>Build test</button>
               </>
             )}
             {user.role === "admin" && (
               <>
-                <button onClick={() => setView("home")}>Admin dashboard</button>
-                <button onClick={() => setView("bank-import")}>
+                <button className={view === "home" ? "active" : ""} onClick={() => setView("home")}>Admin dashboard</button>
+                <button className={view === "bank-import" ? "active" : ""} onClick={() => setView("bank-import")}>
                   Question banks
                 </button>
               </>
@@ -509,8 +509,12 @@ export function Portal() {
             );
           }}
           job={null}
-          jobs={[]}
+          jobs={jobs}
           selectJob={setSelectedJobId}
+          openReview={(id) => {
+            setSelectedJobId(id);
+            setView("reviews");
+          }}
           refresh={async () => {}}
         />
       )}
@@ -1338,6 +1342,7 @@ function ImportScreen({
   job,
   jobs,
   selectJob,
+  openReview,
   refresh,
   reviewOnly = false,
 }: {
@@ -1345,6 +1350,7 @@ function ImportScreen({
   job: ImportJob | null;
   jobs: ImportJob[];
   selectJob: (id: string) => void;
+  openReview?: (id: string) => void;
   refresh: () => void;
   reviewOnly?: boolean;
 }) {
@@ -1390,41 +1396,57 @@ function ImportScreen({
         {reviewOnly ? "Review imported papers" : "Import a paper for review"}
       </h1>
       {!reviewOnly && (
-        <Card>
-          <form onSubmit={submit} className="stacked-form">
-            <div>
-              <label>Question paper PDF</label>
-              <input
-                required
-                name="question_paper"
-                type="file"
-                accept="application/pdf"
-              />
+        <div className="import-page-content">
+          <p className="import-intro">
+            Add the question paper and its answer key. You will review every
+            extracted question before using it in an assessment.
+          </p>
+          <Card className="paper-import-card">
+            <form onSubmit={submit} className="stacked-form">
+              <label className="paper-name-field">
+                Paper name <span className="optional">(optional)</span>
+                <input name="paper_title" placeholder="e.g. JEE Main Physics — Set A" />
+              </label>
+              <div className="paper-upload-fields">
+                <label className="paper-upload-field">
+                  <span>Question paper</span>
+                  <small>PDF · questions and diagrams</small>
+                  <input required name="question_paper" type="file" accept="application/pdf" />
+                </label>
+                <label className="paper-upload-field">
+                  <span>Answer key & solutions</span>
+                  <small>PDF · required for review</small>
+                  <input required name="answer_key" type="file" accept="application/pdf" />
+                </label>
+              </div>
+              <div className="import-submit-row">
+                <small>Extraction begins immediately. Review happens in the dedicated paper workspace.</small>
+                <button disabled={busy}>{busy ? "Uploading paper…" : "Upload and start extraction"}</button>
+              </div>
+            </form>
+            {error && <Notice kind="error">{error}</Notice>}
+          </Card>
+          <section className="recent-imports" aria-label="Recent imports">
+            <div className="recent-imports-heading">
+              <h2>Recent imports</h2>
+              {jobs.length > 3 && <span>{jobs.length} total</span>}
             </div>
-            <div>
-              <label>Answer key PDF</label>
-              <input
-                required
-                name="answer_key"
-                type="file"
-                accept="application/pdf"
-              />
-              <small>
-                The answer key and worked solutions are required for every
-                imported paper.
-              </small>
-            </div>
-            <button disabled={busy}>
-              {busy ? "Uploading paper…" : "Upload and start extraction"}
-            </button>
-          </form>
-          {error && <Notice kind="error">{error}</Notice>}
-        </Card>
+            {jobs.length ? jobs.slice(0, 3).map((item) => (
+            <button type="button" key={item.id} onClick={() => openReview ? openReview(item.id) : selectJob(item.id)}>
+                <span>
+                  <b>{item.meta?.paper_title || item.filename || "Question paper"}</b>
+                  <small>{item.meta?.question_count || 0} questions · {item.meta?.phase || "Queued"}</small>
+                </span>
+                <span className={`badge ${item.status}`}>{item.status}</span>
+              </button>
+            )) : <p>No papers imported yet.</p>}
+          </section>
+        </div>
       )}
       {reviewOnly && (
         <div className="review-layout">
           <aside className="paper-queue">
-            <h2>Paper queue</h2>
+            <div className="paper-queue-heading"><h2>Paper queue</h2><span>{jobs.length}</span></div>
             {jobs.length ? (
               jobs.map((item) => (
                 <button
@@ -1453,6 +1475,19 @@ function ImportScreen({
               <ImportReview job={job} active={!!active} refresh={refresh} />
             )}
           </div>
+          {job && (
+            <aside className="review-health">
+              <p className="eyebrow">IMPORT HEALTH</p>
+              <h2>Review progress</h2>
+              <strong>{job.questions?.filter((q) => q.approved).length || 0}<span> / {job.questions?.length || job.meta?.question_count || 0}</span></strong>
+              <small>questions approved</small>
+              <hr />
+              <div><b>Status</b><span className={`badge ${job.status}`}>{job.status}</span></div>
+              <div><b>Extraction</b><small>{job.meta?.phase || "Checking import status"}</small></div>
+              {job.meta?.failed_pages?.length ? <Notice kind="error">{job.meta.failed_pages.length} page(s) need attention.</Notice> : null}
+              <a href={`/api/teacher/imports/${job.id}/source`} target="_blank" rel="noreferrer">Open source PDF</a>
+            </aside>
+          )}
         </div>
       )}
     </div>
@@ -1467,7 +1502,11 @@ function ImportReview({
   active: boolean;
   refresh: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(false),
+    [questionIndex, setQuestionIndex] = useState(0);
+  useEffect(() => setQuestionIndex(0), [job.id]);
+  const reviewQuestions = job.questions || [],
+    currentQuestion = reviewQuestions[questionIndex];
   const reextract = async () => {
     setBusy(true);
     try {
@@ -1535,15 +1574,26 @@ function ImportReview({
             automatically while this view is open.
           </p>
         </Card>
-      ) : (
-        job.questions?.map((q) => (
+      ) : currentQuestion ? (
+        <>
+          <div className="review-question-context">
+            <span>Question {questionIndex + 1} of {reviewQuestions.length}</span>
+            <span>{currentQuestion.kind.replaceAll("_", " ")}</span>
+          </div>
           <ReviewQuestion
-            key={q.id}
+            key={currentQuestion.id}
             jobId={job.id}
-            question={q}
+            question={currentQuestion}
             onChanged={refresh}
           />
-        ))
+          <div className="review-pagination">
+            <button type="button" className="secondary-action" disabled={!questionIndex} onClick={() => setQuestionIndex((index) => index - 1)}>Previous</button>
+            <span>{questionIndex + 1} / {reviewQuestions.length}</span>
+            <button type="button" className="secondary-action" disabled={questionIndex === reviewQuestions.length - 1} onClick={() => setQuestionIndex((index) => index + 1)}>Next question</button>
+          </div>
+        </>
+      ) : (
+        <Card><p>No extracted questions are ready to review yet.</p></Card>
       )}
     </>
   );
@@ -1823,8 +1873,8 @@ function Builder({
       <p className="eyebrow">TEST BUILDER</p>
       <h1>Create a governed assessment</h1>
       {error && <Notice kind="error">{error}</Notice>}
-      <form onSubmit={submit} className="builder">
-        <Card>
+      <form onSubmit={submit} className="builder builder-workspace">
+        <Card className="builder-settings">
           <div className="stacked-form">
             <div>
               <label>Test title</label>
@@ -1866,12 +1916,9 @@ function Builder({
               </label>
               <input name="closes_at" type="datetime-local" />
             </div>
-            <button disabled={!selected.length}>
-              Create draft ({selected.length})
-            </button>
           </div>
         </Card>
-        <Card>
+        <Card className="builder-library">
           <h2>
             {source === "bank"
               ? `${activeBank?.name || "Global"} global question bank`
@@ -1992,33 +2039,35 @@ function Builder({
               </>
             )}
           </div>
-          {loading ? (
-            <p>Loading filtered questions…</p>
-          ) : shown.length ? (
-            shown.map((q) => (
-              <div className="selectq" key={q.id}>
-                <input
-                  aria-label={`Include ${questionNumber(q.source_number)}`}
-                  type="checkbox"
-                  checked={selected.includes(q.id)}
-                  onChange={() =>
-                    setSelected((x) =>
-                      x.includes(q.id)
-                        ? x.filter((id) => id !== q.id)
-                        : [...x, q.id],
-                    )
-                  }
-                />
-                <QuestionCard q={q} mode="teacher" />
-              </div>
-            ))
-          ) : (
-            <p>
-              {source === "bank"
-                ? "No published questions match these filters yet."
-                : "Approve questions from an imported paper before building a test."}
-            </p>
-          )}
+          <div className="builder-question-list">
+            {loading ? (
+              <p>Loading filtered questions…</p>
+            ) : shown.length ? (
+              shown.map((q) => (
+                <div className="selectq" key={q.id}>
+                  <input
+                    aria-label={`Include ${questionNumber(q.source_number)}`}
+                    type="checkbox"
+                    checked={selected.includes(q.id)}
+                    onChange={() =>
+                      setSelected((x) =>
+                        x.includes(q.id)
+                          ? x.filter((id) => id !== q.id)
+                          : [...x, q.id],
+                      )
+                    }
+                  />
+                  <QuestionCard q={q} mode="teacher" />
+                </div>
+              ))
+            ) : (
+              <p>
+                {source === "bank"
+                  ? "No published questions match these filters yet."
+                  : "Approve questions from an imported paper before building a test."}
+              </p>
+            )}
+          </div>
           {source === "bank" && (
             <div className="review-actions">
               <small>{remote.total} matching questions</small>
@@ -2040,6 +2089,25 @@ function Builder({
               </button>
             </div>
           )}
+        </Card>
+        <Card className="builder-selection">
+          <div className="builder-selection-heading">
+            <span>Selection tray</span>
+            <b>{selected.length.toString().padStart(2, "0")}</b>
+          </div>
+          <div className="builder-selection-summary">
+            <span><small>Questions</small><b>{selected.length}</b></span>
+            <span><small>Source</small><b>{source === "bank" ? "Bank" : "Mine"}</b></span>
+          </div>
+          <div className="builder-selection-list">
+            {selected.length ? selected.map((id) => (
+              <div key={id}>
+                <span>Selected question</span>
+                <button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button>
+              </div>
+            )) : <p>Add questions from the library to build your test.</p>}
+          </div>
+          <button disabled={!selected.length}>Create draft ({selected.length})</button>
         </Card>
       </form>
     </div>
@@ -2260,6 +2328,7 @@ function BankImportStatus({
   onResume,
   onCancel,
   onDelete,
+  onReextract,
   onInspect,
   onPublish = () => {},
 }: {
@@ -2269,6 +2338,7 @@ function BankImportStatus({
   onResume: (job: ImportJob) => void;
   onCancel: (job: ImportJob) => void;
   onDelete: (job: ImportJob) => void;
+  onReextract: (job: ImportJob) => void;
   onInspect: (job: ImportJob) => void;
   onPublish?: (job: ImportJob) => void;
 }) {
@@ -2325,6 +2395,11 @@ function BankImportStatus({
                   ? `${job.meta.processed_pages || 0}/${job.meta.total_pages} pages`
                   : "";
               const failedJob = job.status === "failed";
+              // A pause request is durable but the worker may still be
+              // finishing its in-flight page.  Only offer destructive/reset
+              // actions after it has written the paused checkpoint.
+              const canManageStoredOutput =
+                !running || (paused && job.status === "uploaded");
               return (
                 <article
                   className={`import-item ${failedJob ? "has-error" : ""}`}
@@ -2417,7 +2492,17 @@ function BankImportStatus({
                         ×
                       </button>
                     )}
-                    {(!running || paused) && (
+                    {canManageStoredOutput && !job.published && (
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        title="Clear this material's extracted questions and run the stored file through ingestion again"
+                        onClick={() => onReextract(job)}
+                      >
+                        Re-extract material
+                      </button>
+                    )}
+                    {canManageStoredOutput && (
                       <button
                         type="button"
                         className="text-danger"
@@ -2456,6 +2541,8 @@ function QuestionBankManager({
   notify: (message: string) => void;
 }) {
   const [banks, setBanks] = useState<Bank[]>([]),
+    [bankQuery, setBankQuery] = useState(""),
+    [bankStatus, setBankStatus] = useState("all"),
     [detail, setDetail] = useState<Bank | null>(null),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
@@ -2492,7 +2579,9 @@ function QuestionBankManager({
     );
     if (!detail?.id || !active) return;
     const timer = window.setInterval(() => {
-      open(detail.id).catch((e) => setError(e.message));
+      api(`/admin/question-banks/${detail.id}`)
+        .then(setDetail)
+        .catch((e) => setError(e.message));
       load().catch(() => {});
     }, 3000);
     return () => window.clearInterval(timer);
@@ -2615,6 +2704,29 @@ function QuestionBankManager({
       setBusy(false);
     }
   };
+  const reextractImport = async (job: ImportJob) => {
+    if (
+      !detail ||
+      !window.confirm(
+        `Re-extract ${job.filename}? Its current extracted questions will be replaced using the same stored source file.`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/admin/question-banks/${detail.id}/imports/${job.id}/reextract`, {
+        method: "POST",
+      });
+      setSelectedImport(null);
+      await open(detail.id);
+      notify(`${job.filename || "Source"} queued for clean re-extraction.`);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const publish = async () => {
     if (!detail) return;
     setBusy(true);
@@ -2702,45 +2814,88 @@ function QuestionBankManager({
   const visibleQuestions = selectedImport
     ? selectedQuestions
     : detail?.questions;
+  const visibleBanks = banks.filter((bank) => {
+    const matchesQuery = bank.name
+      .toLowerCase()
+      .includes(bankQuery.trim().toLowerCase());
+    return matchesQuery && (bankStatus === "all" || bank.status === bankStatus);
+  });
   return (
     <div className="page bank-manager">
       <p className="eyebrow">SUPER ADMIN · QUESTION BANKS</p>
       <h1>Question bank library</h1>
       {error && <Notice kind="error">{error}</Notice>}
-      <div className="class-layout">
-        <aside className="class-list">
-          <Card>
-            <h2>Create bank</h2>
-            <form className="stacked-form" onSubmit={create}>
+      <div className="bank-workspace">
+        <Card className="new-bank-card">
+          <div className="bank-workspace-heading">
+            <span className="bank-workspace-icon">+</span>
+            <h2>New bank</h2>
+          </div>
+          <form className="stacked-form" onSubmit={create}>
+            <div className="new-bank-fields">
               <label>
                 Name
-                <input name="name" required />
+                <input name="name" placeholder="e.g. Science Library 2024" required />
               </label>
               <label>
                 Exam code <span className="optional">(optional)</span>
-                <input name="exam_code" placeholder="JEE" />
+                <input name="exam_code" placeholder="JEE, NEET, etc." />
               </label>
-              <button disabled={busy}>Create draft</button>
-            </form>
-          </Card>
-          <Card>
-            <h2>Banks</h2>
-            {banks.map((bank) => (
+            </div>
+            <button disabled={busy}>Create draft</button>
+          </form>
+        </Card>
+        <Card className="bank-navigator">
+          <div className="bank-navigator-header">
+            <div className="bank-navigator-title">
+              <h2>Banks</h2>
+              <span>{banks.length} total</span>
+            </div>
+            <div className="bank-filters">
+              <input
+                aria-label="Search banks"
+                type="search"
+                value={bankQuery}
+                onChange={(event) => setBankQuery(event.target.value)}
+                placeholder="Search banks"
+              />
+              <select
+                aria-label="Filter banks by status"
+                value={bankStatus}
+                onChange={(event) => setBankStatus(event.target.value)}
+              >
+                <option value="all">All status</option>
+                <option value="published">Published</option>
+                <option value="processing">Processing</option>
+                <option value="draft">Draft</option>
+              </select>
+            </div>
+          </div>
+          <div className="bank-list-scroll" aria-label="Question banks">
+            {visibleBanks.map((bank) => (
               <button
-                className={`class-choice ${detail?.id === bank.id ? "selected" : ""}`}
+                type="button"
+                className={`bank-choice-row ${detail?.id === bank.id ? "selected" : ""}`}
                 key={bank.id}
                 onClick={() => open(bank.id)}
               >
-                <b>{bank.name}</b>
-                <small>
-                  {bank.status} · revision {bank.revision} ·{" "}
-                  {bank.question_count} questions
-                </small>
+                <span>
+                  <b>{bank.name}</b>
+                  <small>revision {bank.revision}</small>
+                </span>
+                <span className="bank-choice-meta">
+                  <small>{bank.question_count.toLocaleString()} questions</small>
+                  <span className={`badge ${bank.status}`}>{bank.status}</span>
+                </span>
               </button>
             ))}
-          </Card>
-        </aside>
-        <section>
+            {!visibleBanks.length && (
+              <p className="bank-list-empty">No banks match this filter.</p>
+            )}
+          </div>
+        </Card>
+      </div>
+      <section className="bank-detail-workspace">
           {detail ? (
             <>
               <Card>
@@ -2832,6 +2987,7 @@ function QuestionBankManager({
                 onResume={(job) => importAction(job, "resume")}
                 onCancel={(job) => importAction(job, "cancel")}
                 onDelete={deleteImport}
+                onReextract={reextractImport}
                 onInspect={inspectImport}
                 onPublish={publishImport}
               />
@@ -2852,32 +3008,48 @@ function QuestionBankManager({
                     Show all documents
                   </button>
                 )}
-                {selectedImport && (
-                  <MaterialTaxonomy questions={selectedQuestions || []} />
-                )}
                 <p>
                   Showing {visibleQuestions?.length || 0} questions
                   {selectedImport ? " from this document" : " from this bank"},
-                  organized by source document.
+                  organized by topic. Open a topic to browse its questions.
                 </p>
                 {visibleQuestions?.length ? (
-                  <DocumentQuestionGroups
-                    questions={visibleQuestions}
-                    activeQuestion={editingQuestion}
-                    edit={setEditingQuestion}
-                    renderEditor={(question) => (
-                      <BankQuestionEditor
-                        key={question.id}
-                        bankId={detail.id}
-                        question={question}
-                        done={async () => {
-                          setEditingQuestion(null);
-                          await open(detail.id);
-                        }}
-                        cancel={() => setEditingQuestion(null)}
-                      />
-                    )}
-                  />
+                  <>
+                    <TopicQuestionBrowser
+                      questions={visibleQuestions}
+                      activeQuestion={editingQuestion}
+                      edit={setEditingQuestion}
+                      renderEditor={(question) => (
+                        <BankQuestionEditor
+                          key={question.id}
+                          bankId={detail.id}
+                          question={question}
+                          done={async () => {
+                            setEditingQuestion(null);
+                            await open(detail.id);
+                          }}
+                          cancel={() => setEditingQuestion(null)}
+                        />
+                      )}
+                    />
+                    <AttentionQuestionQueue
+                      questions={visibleQuestions}
+                      activeQuestion={editingQuestion}
+                      edit={setEditingQuestion}
+                      renderEditor={(question) => (
+                        <BankQuestionEditor
+                          key={question.id}
+                          bankId={detail.id}
+                          question={question}
+                          done={async () => {
+                            setEditingQuestion(null);
+                            await open(detail.id);
+                          }}
+                          cancel={() => setEditingQuestion(null)}
+                        />
+                      )}
+                    />
+                  </>
                 ) : (
                   <p>
                     {selectedImport?.status === "failed"
@@ -2891,21 +3063,38 @@ function QuestionBankManager({
           ) : (
             <Card>Create or select a bank to begin.</Card>
           )}
-        </section>
-      </div>
+      </section>
     </div>
   );
 }
 
-function MaterialTaxonomy({questions}:{questions:Question[]}){
- const tree=questions.reduce<Record<string,Record<string,Record<string,number>>>>((all,question)=>{
-  const nodes=question.taxonomy||[],subject=nodes.find(node=>node.kind==="subject")?.name||"Unclassified subject",chapter=nodes.find(node=>node.kind==="chapter")?.name||"Unclassified chapter",topic=nodes.find(node=>node.kind==="topic")?.name||"Unclassified subtopic";
-  (((all[subject]||={})[chapter]||={})[topic]||=0);all[subject][chapter][topic]++;return all;
- },{});
- return <section className="material-taxonomy"><div><p className="eyebrow">MATERIAL CLASSIFICATION</p><h3>Subject → chapter → subtopic</h3><p>This is the taxonomy assigned to the currently inspected source document.</p></div>{Object.keys(tree).length?<div className="taxonomy-tree">{Object.entries(tree).map(([subject,chapters])=><details key={subject} open><summary><b>{subject}</b><small>{Object.values(chapters).reduce((total,topics)=>total+Object.values(topics).reduce((sum,count)=>sum+count,0),0)} questions</small></summary>{Object.entries(chapters).map(([chapter,topics])=><details key={chapter} open><summary><b>{chapter}</b><small>{Object.values(topics).reduce((sum,count)=>sum+count,0)} questions</small></summary><ul>{Object.entries(topics).map(([topic,count])=><li key={topic}><span>{topic}</span><b>{count}</b></li>)}</ul></details>)}</details>)}</div>:<p>No classified questions are available for this material yet.</p>}</section>
+function QuestionReviewRow({
+  question,
+  activeQuestion,
+  edit,
+  renderEditor,
+}: {
+  question: Question;
+  activeQuestion: Question | null;
+  edit: (question: Question) => void;
+  renderEditor: (question: Question) => React.ReactNode;
+}) {
+  const issues = question.interaction?.ingestion_issues || [];
+  return <div className="document-question" key={question.id}>
+    <article className="row">
+      <div>
+        <b>{questionNumber(question.source_number)} · {question.kind}</b>
+        <small>Page {question.interaction?.source_page || "—"} · {issues.length ? `Flagged: ${issues.join(", ")}` : question.approved ? "Reviewed" : "Needs review"}</small>
+      </div>
+      <button type="button" className="secondary-action" onClick={() => edit(question)}>
+        {activeQuestion?.id === question.id ? "Editing" : "View / edit"}
+      </button>
+    </article>
+    {activeQuestion?.id === question.id && renderEditor(question)}
+  </div>;
 }
 
-function DocumentQuestionGroups({
+function TopicQuestionBrowser({
   questions,
   activeQuestion,
   edit,
@@ -2916,85 +3105,25 @@ function DocumentQuestionGroups({
   edit: (question: Question) => void;
   renderEditor: (question: Question) => React.ReactNode;
 }) {
-  const groups = questions.reduce<
-    Map<string, { filename: string; questions: Question[] }>
-  >((all, question) => {
-    const filename =
-      question.interaction?.source_filename || "Unknown source document";
-    const key = String(question.interaction?.source_document_id || filename);
-    const group: { filename: string; questions: Question[] } = all.get(key) || {
-      filename,
-      questions: [],
-    };
-    group.questions.push(question);
-    all.set(key, group);
+  const tree = questions.reduce<Record<string, Record<string, Record<string, Question[]>>>>((all, question) => {
+    const nodes = question.taxonomy || [];
+    const subject = nodes.find((node) => node.kind === "subject")?.name || "Unclassified subject";
+    const chapter = nodes.find((node) => node.kind === "chapter")?.name || "Unclassified chapter";
+    const topic = nodes.find((node) => node.kind === "topic")?.name || "Unclassified topic";
+    (((all[subject] ||= {})[chapter] ||= {})[topic] ||= []).push(question);
     return all;
-  }, new Map());
+  }, {});
   return (
-    <div className="document-review-groups">
-      {Array.from(groups.entries()).map(([key, group], index) => {
-        const flagged = group.questions.filter(
-          (question) => (question.interaction?.ingestion_issues || []).length,
-        ).length;
-        const remaining = group.questions.filter(
-          (question) => !question.approved,
-        ).length;
-        const containsActive = group.questions.some(
-          (question) => question.id === activeQuestion?.id,
-        );
-        return (
-          <details
-            className="document-review-group"
-            key={key}
-            open={index === 0 || containsActive}
-          >
-            <summary>
-              <span>
-                <b>{group.filename}</b>
-                <small>
-                  {group.questions.length} questions ·{" "}
-                  {remaining ? `${remaining} to review` : "All reviewed"}
-                  {flagged ? ` · ${flagged} flagged` : ""}
-                </small>
-              </span>
-              <span className="document-group-toggle">Review questions</span>
-            </summary>
-            <div className="document-question-list">
-              {group.questions.map((question) => (
-                <div className="document-question" key={question.id}>
-                  <article className="row">
-                    <div>
-                      <b>
-                        {questionNumber(question.source_number)} ·{" "}
-                        {question.kind}
-                      </b>
-                      <small>
-                        Page {question.interaction?.source_page || "—"} ·{" "}
-                        {(question.interaction?.ingestion_issues || []).length
-                          ? `Flagged: ${(question.interaction.ingestion_issues || []).join(", ")}`
-                          : question.approved
-                            ? "Reviewed"
-                            : "Needs review"}
-                      </small>
-                    </div>
-                    <button
-                      className="secondary-action"
-                      onClick={() => edit(question)}
-                    >
-                      {activeQuestion?.id === question.id
-                        ? "Editing"
-                        : "View / edit"}
-                    </button>
-                  </article>
-                  {activeQuestion?.id === question.id && renderEditor(question)}
-                </div>
-              ))}
-            </div>
-          </details>
-        );
-      })}
-    </div>
+    <section className="topic-question-browser">
+      <div className="question-browser-heading"><div><p className="eyebrow">QUESTION LIBRARY</p><h3>Browse by chapter and topic</h3><p>Topics stay compact until you need to inspect their questions.</p></div><span>{questions.length} questions</span></div>
+      {Object.entries(tree).map(([subject, chapters]) => <details className="taxonomy-subject" key={subject} open><summary><b>{subject}</b><small>{Object.values(chapters).reduce((sum, topics) => sum + Object.values(topics).reduce((count, items) => count + items.length, 0), 0)} questions</small></summary>{Object.entries(chapters).map(([chapter, topics]) => <details className="taxonomy-chapter" key={chapter} open><summary><b>{chapter}</b><small>{Object.values(topics).reduce((sum, items) => sum + items.length, 0)} questions</small></summary>{Object.entries(topics).map(([topic, topicQuestions]) => <details className="taxonomy-topic" key={topic} open={topicQuestions.some((question) => question.id === activeQuestion?.id)}><summary><span><b>{topic}</b><small>{topicQuestions.filter((question) => (question.interaction?.ingestion_issues || []).length || !question.approved).length ? "Needs attention" : "Complete"}</small></span><strong>{topicQuestions.length}</strong></summary><div className="topic-question-list">{topicQuestions.map((question) => <QuestionReviewRow key={question.id} question={question} activeQuestion={activeQuestion} edit={edit} renderEditor={renderEditor} />)}</div></details>)}</details>)}</details>)}
+    </section>
   );
+}
+
+function AttentionQuestionQueue({questions,activeQuestion,edit,renderEditor}:{questions:Question[];activeQuestion:Question|null;edit:(question:Question)=>void;renderEditor:(question:Question)=>React.ReactNode}){
+ const attention=questions.filter(question=>(question.interaction?.ingestion_issues||[]).length||!question.approved);
+ return <section className="attention-question-queue"><div className="question-browser-heading"><div><p className="eyebrow">REQUIRES REVIEW</p><h3>Questions needing attention</h3><p>Only flagged or unresolved questions appear here.</p></div><span className={attention.length?"needs-attention":""}>{attention.length} items</span></div>{attention.length?<div className="document-question-list">{attention.map(question=><QuestionReviewRow key={question.id} question={question} activeQuestion={activeQuestion} edit={edit} renderEditor={renderEditor}/>)}</div>:<p className="queue-empty">No issues found. All questions are classified and reviewed.</p>}</section>
 }
 
 function inferredChoiceFromSolution(question: Question) {

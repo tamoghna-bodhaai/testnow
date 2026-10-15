@@ -2,7 +2,8 @@ import subprocess
 
 import pytest
 from app.bank_imports import _node, _pdf_bytes
-from app.models import QuestionBank, QuestionKind, SourceDocument, TaxonomyNode
+from app.main import clear_bank_import_output
+from app.models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from app.seed_jee_openrouter import normalize_choice_kind
 from app.tasks import answer_from_key, embedded_answer_key_text, expected_questions, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, unit_requires_vision, validate
 from sqlalchemy import create_engine
@@ -94,3 +95,20 @@ def test_taxonomy_normalization_reuses_cosmetic_chapter_variants():
     subject=_node(db,"bank",None,"subject","Physics")
     original=_node(db,"bank",subject.id,"chapter","Wave Optics")
     assert _node(db,"bank",subject.id,"chapter","wave-optics").id == original.id
+
+def test_clean_reextraction_removes_only_the_materials_derived_questions(monkeypatch):
+    engine=create_engine("sqlite+pysqlite:///:memory:"); Base.metadata.create_all(engine); db=sessionmaker(bind=engine)()
+    db.add(QuestionBank(id="bank",slug="bank",name="Bank",exam_code="test"))
+    job=ImportJob(id="job",owner_id="owner",bank_id="bank",question_document_id="source",status=ImportStatus.FAILED)
+    db.add(job)
+    node=TaxonomyNode(id="node",bank_id="bank",parent_id=None,kind="subject",name="Physics")
+    extracted=Question(id="extracted",owner_id="owner",bank_id="bank",scope=QuestionScope.GLOBAL,import_job_id="job",source_key="source:1",kind=QuestionKind.SUBJECTIVE,stem_markdown="Extracted",options=[],answer=None)
+    untouched=Question(id="untouched",owner_id="owner",bank_id="bank",scope=QuestionScope.GLOBAL,source_key="manual:1",kind=QuestionKind.SUBJECTIVE,stem_markdown="Manual",options=[],answer=None)
+    db.add_all([node,extracted,untouched]); db.flush(); db.add(QuestionTaxonomy(question_id="extracted",taxonomy_node_id="node")); db.commit()
+    prefixes=[];monkeypatch.setattr("app.main.delete_prefix",lambda prefix:prefixes.append(prefix))
+    assert clear_bank_import_output(db,job) == 1
+    db.commit()
+    assert db.get(Question,"extracted") is None
+    assert db.get(Question,"untouched") is not None
+    assert db.query(QuestionTaxonomy).filter_by(question_id="extracted").count() == 0
+    assert prefixes == ["bank-diagrams/bank/job/"]
