@@ -4,8 +4,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, create_student, delete_test, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
-from app.models import AccountStatus, Attempt, Classroom, ClassMembership, Question, QuestionKind, Role, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.main import assigned_student_ids, create_student, delete_import, delete_test, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
+from app.models import AccountStatus, Attempt, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.schemas import LoginIn, RosterUpdate, StudentCreate
 from fastapi import HTTPException
 
@@ -66,6 +66,20 @@ def test_teacher_can_delete_an_unattempted_test_and_its_assignments():
     assert db.get(Assessment,test_id) is None
     assert db.get(AssessmentVersion,version_id) is None
     assert not db.query(ClassAssignment).filter_by(test_id=test_id).count()
+
+def test_teacher_can_delete_a_finished_import(monkeypatch):
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    source=SourceDocument(id="source",owner_id=teacher.id,filename="paper.pdf",object_key="documents/teacher/paper.pdf",sha256="a" * 64,media_type="application/pdf",size_bytes=10)
+    job=ImportJob(id="job",owner_id=teacher.id,question_document_id=source.id,status=ImportStatus.FAILED)
+    question=Question(id="question",owner_id=teacher.id,import_job_id=job.id,kind=QuestionKind.SINGLE,stem_markdown="Question",options=[{"markdown":"A"},{"markdown":"B"}])
+    db.add_all([teacher,source,job,question]);db.commit()
+    monkeypatch.setattr(main,"delete_prefix",lambda prefix:None)
+
+    delete_import(job.id,teacher,db)
+
+    assert db.get(ImportJob,"job") is None
+    assert db.get(Question,"question") is None
 
 def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch):
     db=make_db()

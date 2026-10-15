@@ -519,6 +519,33 @@ def get_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db
     job=db.get(ImportJob,job_id)
     if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
     return {**import_view(job,db),"questions":[question_view(q) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.source_number)]}
+@app.delete("/teacher/imports/{job_id}",status_code=204)
+def delete_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    """Remove a completed import and its reviewable question records.
+
+    Active workers and tests that already use the extracted questions are kept
+    intact so deletion cannot race an extraction or break an existing test's
+    saved figures.
+    """
+    job=db.get(ImportJob,job_id)
+    if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
+    if job.status in {ImportStatus.UPLOADED,ImportStatus.PROCESSING}:
+        raise HTTPException(409,"Wait for the active extraction to finish before deleting this import")
+    question_ids={row[0] for row in db.query(Question.id).filter_by(import_job_id=job.id).all()}
+    if question_ids:
+        for version in db.query(TestVersion).yield_per(50):
+            saved_ids={item.get("id") for item in (version.content or {}).get("questions",[]) if isinstance(item,dict)}
+            if question_ids & saved_ids:
+                raise HTTPException(409,"This import cannot be deleted because its questions are used in a test")
+        db.query(QuestionTaxonomy).filter(QuestionTaxonomy.question_id.in_(question_ids)).delete(synchronize_session=False)
+        db.query(Question).filter(Question.id.in_(question_ids)).delete(synchronize_session=False)
+    db.delete(job)
+    audit(db,user.id,"import.deleted","import",job_id,{"question_count":len(question_ids)})
+    db.commit()
+    # Source documents are intentionally retained for auditability and may be
+    # shared by duplicate uploads. Derived crops are unique to this import.
+    try: delete_prefix(f"diagrams/{job_id}/")
+    except Exception: pass
 @app.get("/teacher/imports/{job_id}/source")
 def import_source(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     job=db.get(ImportJob,job_id)

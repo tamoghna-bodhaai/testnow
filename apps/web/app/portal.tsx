@@ -482,6 +482,9 @@ export function Portal() {
             questions={questions}
             classes={classes}
             jobs={jobs}
+            onTestDeleted={(id) =>
+              setTests((current) => current.filter((test) => test.id !== id))
+            }
             openImport={(id) => {
               setSelectedJobId(id);
               setView("reviews");
@@ -517,6 +520,10 @@ export function Portal() {
             setSelectedJobId(id);
             setView("reviews");
           }}
+          onDeleted={(id) => {
+            setJobs((current) => current.filter((item) => item.id !== id));
+            setMessage("Import deleted.");
+          }}
           refresh={async () => {}}
         />
       )}
@@ -527,6 +534,12 @@ export function Portal() {
           job={jobs.find((job) => job.id === selectedJobId) || null}
           jobs={jobs}
           selectJob={setSelectedJobId}
+          onDeleted={(id) => {
+            const remaining = jobs.filter((item) => item.id !== id);
+            setJobs(remaining);
+            setSelectedJobId(remaining[0]?.id || null);
+            setMessage("Import deleted.");
+          }}
           refresh={async () => {
             if (!selectedJobId) return;
             const updated = await api(`/teacher/imports/${selectedJobId}`);
@@ -638,6 +651,7 @@ function TeacherHome({
   questions,
   classes,
   jobs,
+  onTestDeleted,
   openImport,
   openTest,
   refresh,
@@ -646,9 +660,10 @@ function TeacherHome({
   questions: Question[];
   classes: Classroom[];
   jobs: ImportJob[];
+  onTestDeleted: (id: string) => void;
   openImport: (id: string) => void;
   openTest: (id: string) => void;
-  refresh: () => void;
+  refresh: () => Promise<void> | void;
 }) {
   const actionable = jobs.filter((job) => job.status !== "approved"),
     students = classes.reduce((total, item) => total + item.student_count, 0),
@@ -657,7 +672,10 @@ function TeacherHome({
     if (!window.confirm(`Delete “${test.title}”? This cannot be undone.`)) return;
     try {
       await api(`/tests/${test.id}`, { method: "DELETE" });
-      await refresh();
+      onTestDeleted(test.id);
+      // The delete is already confirmed. Refresh in the background so an
+      // unrelated question-library failure cannot report it as unsuccessful.
+      void Promise.resolve(refresh()).catch(() => {});
     } catch (e: any) {
       window.alert(e.message);
     }
@@ -1403,18 +1421,21 @@ function ImportScreen({
   jobs,
   selectJob,
   openReview,
+  onDeleted,
   refresh,
   reviewOnly = false,
 }: {
   onDone: (x: ImportJob) => void;
   job: ImportJob | null;
   jobs: ImportJob[];
-  selectJob: (id: string) => void;
+  selectJob: (id: string | null) => void;
   openReview?: (id: string) => void;
+  onDeleted: (id: string) => void;
   refresh: () => void;
   reviewOnly?: boolean;
 }) {
   const [busy, setBusy] = useState(false),
+    [deletingId, setDeletingId] = useState<string | null>(null),
     [error, setError] = useState("");
   useEffect(() => {
     if (!job && jobs[0]) selectJob(jobs[0].id);
@@ -1447,6 +1468,19 @@ function ImportScreen({
     }
   };
   const active = job?.status === "uploaded" || job?.status === "processing";
+  const deleteImport = async (item: ImportJob) => {
+    if (!window.confirm(`Delete “${item.meta?.paper_title || item.filename || "this import"}”?`)) return;
+    setDeletingId(item.id);
+    setError("");
+    try {
+      await api(`/teacher/imports/${item.id}`, { method: "DELETE" });
+      onDeleted(item.id);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setDeletingId(null);
+    }
+  };
   return (
     <div className={`page ${reviewOnly ? "review-workspace" : "narrow"}`}>
       <p className="eyebrow">
@@ -1492,13 +1526,23 @@ function ImportScreen({
               {jobs.length > 3 && <span>{jobs.length} total</span>}
             </div>
             {jobs.length ? jobs.slice(0, 3).map((item) => (
-            <button type="button" key={item.id} onClick={() => openReview ? openReview(item.id) : selectJob(item.id)}>
+            <div className="recent-import-row" key={item.id}>
+              <button type="button" onClick={() => openReview ? openReview(item.id) : selectJob(item.id)}>
                 <span>
                   <b>{item.meta?.paper_title || item.filename || "Question paper"}</b>
                   <small>{item.meta?.question_count || 0} questions · {item.meta?.phase || "Queued"}</small>
                 </span>
                 <span className={`badge ${item.status}`}>{item.status}</span>
               </button>
+              <button
+                type="button"
+                className="text-danger"
+                disabled={deletingId === item.id || item.status === "uploaded" || item.status === "processing"}
+                onClick={() => deleteImport(item)}
+              >
+                {deletingId === item.id ? "Deleting…" : "Delete"}
+              </button>
+            </div>
             )) : <p>No papers imported yet.</p>}
           </section>
         </div>
@@ -1546,6 +1590,14 @@ function ImportScreen({
               <div><b>Extraction</b><small>{job.meta?.phase || "Checking import status"}</small></div>
               {job.meta?.failed_pages?.length ? <Notice kind="error">{job.meta.failed_pages.length} page(s) need attention.</Notice> : null}
               <a href={`/api/teacher/imports/${job.id}/source`} target="_blank" rel="noreferrer">Open source PDF</a>
+              <button
+                type="button"
+                className="text-danger"
+                disabled={active || deletingId === job.id}
+                onClick={() => deleteImport(job)}
+              >
+                {deletingId === job.id ? "Deleting…" : "Delete import"}
+              </button>
             </aside>
           )}
         </div>
