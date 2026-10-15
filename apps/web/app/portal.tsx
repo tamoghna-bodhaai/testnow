@@ -52,7 +52,7 @@ type ImportJob = {
   filename?: string;
   source_id?: string;
   error?: string;
-  errors?: { page?: number; message: string }[];
+  errors?: { page?: number; end_page?: number; message: string }[];
   question_count?: number;
   approved_count?: number;
   published?: boolean;
@@ -63,7 +63,7 @@ type ImportJob = {
     paper_title?: string;
     flagged_count?: number;
     skipped_count?: number;
-    failed_pages?: { page: number; error: string }[];
+    failed_pages?: { page: number; end_page?: number; error: string }[];
     subject?: string;
     processed_pages?: number;
     total_pages?: number;
@@ -2397,7 +2397,7 @@ function BankImportStatus({
                 running =
                   job.status === "uploaded" || job.status === "processing",
                 pageProgress = job.meta?.total_pages
-                  ? `${job.meta.processed_pages || 0}/${job.meta.total_pages} pages`
+                  ? `${job.meta.processed_pages || 0}/${job.meta.total_pages} pages checked`
                   : "";
               const failedJob = job.status === "failed";
               // A pause request is durable but the worker may still be
@@ -2442,7 +2442,17 @@ function BankImportStatus({
                           {job.error}
                         </p>
                       )}
-                      {job.errors?.length ? <details className="import-error-log"><summary>Recent extraction errors ({job.errors.length})</summary><ul>{job.errors.map((error,index)=><li key={`${error.page||"job"}-${index}`}>{error.page?`Page ${error.page}: `:""}{error.message}</li>)}</ul></details> : null}
+                      {job.meta?.failed_pages?.length ? <p className="import-error">
+                        <strong>{job.meta.failed_pages.length} source page range{job.meta.failed_pages.length === 1 ? "" : "s"} skipped</strong>
+                        Questions from these ranges may be missing even while extraction continues. Inspect the failures before publishing.
+                      </p> : null}
+                      {job.errors?.length ? <details className="import-error-log">
+                        <summary>Recent extraction failures ({job.errors.length})</summary>
+                        <p>These requests failed after retries. Continuing with later pages does not recover the skipped questions.</p>
+                        <ul>{job.errors.map((error,index)=><li key={`${error.page||"job"}-${index}`}>
+                          {error.page ? error.end_page && error.end_page > error.page ? `Pages ${error.page}–${error.end_page}: ` : `Page ${error.page}: ` : ""}{error.message}
+                        </li>)}</ul>
+                      </details> : null}
                     </div>
                   </div>
                   <div className="import-controls">
@@ -3172,14 +3182,16 @@ function BankQuestionEditor({
   const save = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
-    const approve = (e.nativeEvent as SubmitEvent).submitter?.getAttribute("data-action") !== "draft";
+    const action = (e.nativeEvent as SubmitEvent).submitter?.getAttribute("data-action");
+    const approve = action !== "draft";
+    const ignoreWarnings = action === "ignore-warnings";
     setBusy(true);
     setError("");
     try {
       const options = JSON.parse(String(form.get("options") || "[]"));
       const answer = JSON.parse(String(form.get("answer") || "null"));
       await api(
-        approve ? `/admin/question-banks/${bankId}/questions/${question.id}/resolve` : `/questions/${question.id}/draft`,
+        approve ? `/admin/question-banks/${bankId}/questions/${question.id}/resolve${ignoreWarnings ? "?ignore_warnings=true" : ""}` : `/questions/${question.id}/draft`,
         {
           method: approve ? "POST" : "PUT",
           body: JSON.stringify({
@@ -3325,6 +3337,11 @@ function BankQuestionEditor({
             <button type="submit" data-action="approve" disabled={busy}>
               {busy ? "Saving…" : "Save and approve"}
             </button>
+            {!!(question.interaction?.ingestion_issues || []).length && (
+              <button type="submit" data-action="ignore-warnings" className="secondary-action" disabled={busy}>
+                Ignore warnings & approve
+              </button>
+            )}
             <button type="button" className="secondary-action" onClick={cancel}>
               Cancel
             </button>

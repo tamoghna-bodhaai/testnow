@@ -322,8 +322,8 @@ def extract_import(self, job_id:str):
           # A single corrupt page or transient provider failure must not strand
           # hundreds of already checkpointed pages.  Surface the exact page in
           # review metadata and continue with the next durable unit.
-          failed_pages.append({"page":start+1,"error":str(page_error)[:300]})
-          job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
+          failed_pages.append({"page":start+1,"end_page":end,"error":str(page_error)[:300]})
+          job.extraction_meta={**meta,"phase":f"Skipped failed extraction pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
         skipped=0
         for raw_item in mark_scope_conflicts(ground_question_spans(parsed.get("questions",[]),rendered)):
           item,preflight_issues=prepare_item_for_ingestion(raw_item)
@@ -340,7 +340,7 @@ def extract_import(self, job_id:str):
           diagrams,visual_issues=save_figures(item,rendered,native_regions,f"diagrams/{job.id}/{owned_page}-{number}",put)
           db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item.get("solution_markdown"),confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams,interaction={"ingestion_issues":preflight_issues+visual_issues,"source_document_id":doc.id}))
         job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"skipped_count":int(meta.get("skipped_count") or 0)+skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
-      phase="Ready for review" if not failed_pages else f"Ready for review — {len(failed_pages)} page(s) need re-extraction"
+      phase="Ready for review" if not failed_pages else f"Extraction incomplete — {len(failed_pages)} source page range(s) need re-extraction"
       job.status=ImportStatus.REVIEW; job.extraction_meta={**meta,"model":settings().openrouter_model,"paper_title":paper_title,"processed_pages":page_count,"total_pages":page_count,"question_count":len(numbers),"failed_pages":failed_pages,"phase":phase};db.commit()
     except Exception as exc:
       job.status=ImportStatus.FAILED;job.error=str(exc)[:2000];job.extraction_meta={**(job.extraction_meta or {}),"phase":"Import failed"};db.commit();raise

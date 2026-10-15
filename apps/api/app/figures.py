@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 import fitz
 
-VERSION = "figures_v3"
+VERSION = "figures_v4"
 
 
 def docx_visual_inventory(raw):
@@ -61,7 +61,11 @@ OPTION_SCHEMA = {
                    "requires_diagram": {"type": "boolean"}},
 }
 VISUAL_INSTRUCTIONS = """
-VISUAL CONTRACT: Every source image is an unrotated page. All bbox values and
+VISUAL CONTRACT: Diagrams are optional. Return diagrams=[] when no source
+illustration belongs to the question. Do not create a diagram entry merely
+because the question mentions a graph, circuit, figure, or asks the student to
+draw one. Text, equations, whitespace, and the question's source_spans are not
+diagram entries. Every source image is an unrotated page. All bbox values and
 source_spans must use top-left PDF POINTS from the supplied page dimensions and
 layout, never rendered pixels. Include complete figures and their labels, but
 exclude surrounding question prose. Use role=question for stem figures,
@@ -411,6 +415,55 @@ def _option_at(page, box, spans, options):
     return nearby[0][0] if len({i for i, _ in nearby}) == 1 else None
 
 
+def references_source_figure(stem):
+    """A reference to a supplied illustration, not a subject-area keyword.
+
+    'Draw a circuit' and 'find the graph of f(x)' do not promise an image.
+    Keep explicit references reviewable even if native detection missed it.
+    """
+    figure = r"(?:diagram|figure|graph|circuit|fig\.)"
+    return bool(re.search(
+        rf"\b(?:study|see|consider|refer\s+to)\s+(?:the\s+)?{figure}\b"
+        rf"|\b(?:the\s+)?(?:following|accompanying|adjacent|attached|given)\s+{figure}\b"
+        rf"|\b{figure}\s+(?:below|above|shows|illustrates|depicts)\b"
+        rf"|\bshown\s+(?:below|above|here)\b"
+        rf"|\bshown\s+in\s+(?:the\s+)?{figure}"
+        rf"|\b(?:fig\.?|figure)\s*\d+\b",
+        str(stem or ""), re.I))
+
+
+def _unsupported_text_crop(raw, item, document):
+    """Ignore invented crops only with positive evidence of text-only scope.
+
+    Never apply to scans, visual choices, explicit image references, invalid
+    geometry or a crop containing graphics (even outside the question scope).
+    Those still need the normal validation/review path.
+    """
+    if not isinstance(raw, dict) or raw.get("role", "question") != "question":
+        return False
+    if references_source_figure(item.get("stem_markdown")) or any(
+        o.get("requires_diagram") or not str(o.get("markdown") or "").strip()
+        for o in item.get("options") or []
+    ):
+        return False
+    number = page_number(raw.get("page"), document)
+    box = rect(raw.get("bbox"))
+    if number is None or box is None:
+        return False
+    with unrotated(document[number - 1]) as page:
+        spans = _spans(item, number, page)
+        if not spans or coverage(box, page.rect) < .95:
+            return False
+        words = page.get_text("words")
+        if sum(any(coverage(fitz.Rect(w[:4]), s) > .8 for s in spans) for w in words) < 8:
+            return False
+        graphics = _paths(page) + [b for info in page.get_image_info()
+                                  if (b := rect(info.get("bbox"))) is not None]
+        # Check the proposal as well as scope: a misplaced real figure must
+        # remain flagged rather than disappearing as a text-only question.
+        return not any((g & area).get_area() > 1 for g in graphics for area in [box, *spans])
+
+
 def extract_figures(item, document, regions, reviewed=False):
     """Return validated figures (including bytes) and explicit review reasons.
 
@@ -420,7 +473,8 @@ def extract_figures(item, document, regions, reviewed=False):
     """
     accepted, issues = [], list(item.get("_visual_scope_issues") or [])
     options = item.get("options") or []
-    proposed = [(d, False) for d in (item.get("diagrams") or [])]
+    proposed = [(d, False) for d in (item.get("diagrams") or [])
+                if reviewed or not _unsupported_text_crop(d, item, document)]
     if not reviewed:
         for span in item.get("source_spans") or []:
             if isinstance(span,dict) and (n:=page_number(span.get("page"),document)) is not None:
@@ -547,7 +601,7 @@ def extract_figures(item, document, regions, reviewed=False):
         visual = option.get("requires_diagram") or not str(option.get("markdown") or "").strip()
         if visual and not any(d["role"] == "option" and d["option_index"] == index for d in accepted):
             issues.append(f"option_diagram_missing:{index}")
-    if not reviewed and not accepted and re.search(r"\b(?:diagram|figure|graph|circuit|shown)\b", str(item.get("stem_markdown") or ""), re.I):
+    if not reviewed and not accepted and references_source_figure(item.get("stem_markdown")):
         issues.append("diagram_expected_missing")
     return accepted, list(dict.fromkeys(issues))
 

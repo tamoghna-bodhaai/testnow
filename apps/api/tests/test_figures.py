@@ -286,3 +286,56 @@ def test_question_grounding_respects_columns_and_numeric_option_labels():
     grounded=ground_question_spans([first,second],doc)
     assert grounded[0]["source_spans"][0]["bbox"][2]==212
     assert grounded[0]["source_spans"][0]["bbox"][3]==488
+
+
+@pytest.mark.parametrize("stem", [
+    "Draw a ray diagram for a convex mirror.",
+    "Sketch the graph of y = x squared.",
+    "Find the resistance of a circuit with two resistors in series.",
+    "Which graph represents uniform motion?",
+    "Prove that the result shown by the calculation is correct.",
+    "Calculate the area of a plane figure with sides 3 and 4.",
+    "Determine the number of significant figures in 0.00340.",
+])
+def test_subject_keywords_do_not_require_a_source_diagram(stem):
+    doc=document();data=item();data["stem_markdown"]=stem
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert figures==[] and issues==[]
+
+
+@pytest.mark.parametrize("stem", [
+    "Study the figure and find the angle.",
+    "Calculate the resistance in the circuit shown below.",
+    "In the following diagram, determine the angle.",
+    "Find the current shown in the circuit.",
+    "Figure 2 shows the apparatus. Find its reading.",
+])
+def test_explicit_source_references_still_flag_missing_figures(stem):
+    doc=document();data=item();data["stem_markdown"]=stem
+    figures,issues=extract_figures(data,doc,[])
+    assert figures==[] and "diagram_expected_missing" in issues
+
+
+@pytest.mark.parametrize("box", [(20,20,310,50),(250,350,350,450),(10,5,390,18)])
+def test_model_invented_text_and_blank_stem_crops_are_optional(box):
+    doc=document();data=item([diagram(box)])
+    data["stem_markdown"]="Draw a circuit with two resistors in series."
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert figures==[] and issues==[]
+
+
+def test_model_crop_of_another_questions_graphic_is_still_rejected():
+    doc=document();square(doc[0],y=300)
+    data=item([diagram((96,296,184,384))],spans=[{"page":1,"bbox":[20,20,380,100]}])
+    data["stem_markdown"]="Calculate the resistance of two resistors."
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert not figures and "diagram_outside_question" in issues
+
+
+def test_false_crop_filter_never_suppresses_missing_visual_options():
+    doc=document();data=item([diagram((250,350,350,450))],options=[
+        {"value":"a","markdown":"","requires_diagram":True},
+        {"value":"b","markdown":"a textual choice","requires_diagram":False}])
+    data["stem_markdown"]="Select the correct answer."
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert not figures and "option_diagram_missing:0" in issues

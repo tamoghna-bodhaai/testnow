@@ -263,10 +263,12 @@ async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:l
     return {"bank":bank_view(bank,db),"imports":[import_view(job,db) for job in jobs]}
 
 @app.post("/admin/question-banks/{bank_id}/questions/{question_id}/resolve")
-def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db),ignore_warnings:bool=False):
     q=db.get(Question,question_id);bank=db.get(QuestionBank,bank_id)
     if not bank or not q or q.bank_id!=bank.id:raise HTTPException(404,"Question not found")
-    if any(is_visual_issue(issue) for issue in (q.interaction or {}).get("ingestion_issues", [])) or option_media_issues(data.options,q.diagrams):
+    warnings=list((q.interaction or {}).get("ingestion_issues", []))
+    visual_warnings=any(is_visual_issue(issue) for issue in warnings) or option_media_issues(data.options,q.diagrams)
+    if visual_warnings and not ignore_warnings:
         raise HTTPException(422,"Review and save the question and option figures before approving this question")
     if any(d.get("role")=="option" for d in q.diagrams or []) and [o.get("value") for o in data.options] != [o.get("value") for o in q.options or []]:
         raise HTTPException(422,"Option order is linked to figures; preserve option values and order")
@@ -276,9 +278,21 @@ def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=
     for name,value in data.model_dump().items():
         if name not in {"source_spans","diagrams","interaction"}:setattr(q,name,value)
     if q.kind!=QuestionKind.SUBJECTIVE and not q.answer:raise HTTPException(422,"A reviewed answer is required")
-    q.interaction={**(q.interaction or {}),"ingestion_issues":[],"reviewed_by":user.id};q.approved_at=datetime.now(timezone.utc)
+    interaction={**(q.interaction or {})}
+    if ignore_warnings and warnings:
+        # Keep the original automated findings for accountability, but remove
+        # them from the active review queue after an administrator accepts them.
+        interaction["ignored_ingestion_issues"]=warnings
+        interaction["warnings_ignored_by"]=user.id
+        interaction["warnings_ignored_at"]=datetime.now(timezone.utc).isoformat()
+        audit(db,user.id,"question.warnings_ignored","question",q.id,{"warnings":warnings})
+    interaction.update({"ingestion_issues":[],"reviewed_by":user.id})
+    q.interaction=interaction;q.approved_at=datetime.now(timezone.utc)
     job=db.get(ImportJob,q.import_job_id)
-    if job and not db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first():job.status=ImportStatus.APPROVED;job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete","flagged_count":0}
+    if job and not db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first():
+        incomplete=bool((job.extraction_meta or {}).get("failed_pages"))
+        job.status=ImportStatus.REVIEW if incomplete else ImportStatus.APPROVED
+        job.extraction_meta={**(job.extraction_meta or {}),"phase":"Extraction incomplete: source pages skipped" if incomplete else "Review complete","flagged_count":0}
     db.commit();return question_view(q,db)
 
 @app.post("/admin/question-banks/{bank_id}/imports/{job_id}/retry",status_code=202)
@@ -517,7 +531,10 @@ def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.T
     q.approved_at=datetime.now(timezone.utc)
     db.flush()
     pending=db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first()
-    if not pending: job.status=ImportStatus.APPROVED; job.extraction_meta={**(job.extraction_meta or {}),"phase":"Review complete"}
+    if not pending:
+        incomplete=bool((job.extraction_meta or {}).get("failed_pages"))
+        job.status=ImportStatus.REVIEW if incomplete else ImportStatus.APPROVED
+        job.extraction_meta={**(job.extraction_meta or {}),"phase":"Extraction incomplete: source pages skipped" if incomplete else "Review complete"}
     db.commit();return question_view(q)
 def import_view(job:ImportJob,db:Session|None=None):
     source=db.get(SourceDocument,job.question_document_id) if db else None
@@ -525,7 +542,8 @@ def import_view(job:ImportJob,db:Session|None=None):
     total=questions.count() if questions is not None else 0
     approved=questions.filter(Question.approved_at.is_not(None)).count() if questions is not None else 0
     meta=job.extraction_meta or {}
-    errors=list(meta.get("error_log") or meta.get("failed_pages") or [])[-10:]
+    errors=[{**entry,"message":entry.get("message") or entry.get("error") or "Extraction failed"}
+            for entry in list(meta.get("error_log") or meta.get("failed_pages") or [])[-10:]]
     return {"id":job.id,"status":job.status.value,"error":job.error,"meta":meta,"errors":errors,"created_at":job.created_at,"filename":source.filename if source else None,"source_id":source.id if source else None,"question_count":total,"approved_count":approved,"published":bool(job.published_at),"published_at":job.published_at}
 def normalized_options(options):
     output=[]

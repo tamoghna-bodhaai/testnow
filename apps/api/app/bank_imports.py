@@ -66,7 +66,9 @@ def _issues(item: dict, answer: object, diagrams: list[dict]) -> list[str]:
     if not answer and item.get("kind") != "subjective":issues.append("missing_answer")
     if float(item.get("confidence") or 0)<.75:issues.append("low_confidence")
     if "$$$" in str(item.get("stem_markdown") or ""):issues.append("invalid_latex")
-    if item.get("diagrams") and not diagrams:issues.append("diagram_unavailable")
+    # save_figures supplies concrete validation/storage failures. Raw model
+    # proposals can be disproved by a text-only source; they are not a promise
+    # that this question requires an image.
     if not str(item.get("chapter") or "").strip():issues.append("taxonomy_uncertain")
     return issues
 
@@ -89,6 +91,8 @@ def _answer_from_solution(item: dict) -> dict | None:
 
 def _failure_message(exc: Exception) -> str:
     message=str(exc).strip() or exc.__class__.__name__
+    if "cryptography" in message.lower() and "aes" in message.lower():
+        return "The extraction worker is missing PDF encryption support. Rebuild the API and workers with pypdf[crypto] installed, then retry this import."
     if "Document exceeds" in message:
         return f"{message}. Split this source into smaller chapter files, then upload the parts."
     if isinstance(exc, IntegrityError) or "uq_question_bank_source_key" in message:
@@ -234,15 +238,15 @@ def run_bank_import(job_id: str) -> None:
                 parsed=request_extraction(payload,"TestNow Bank Importer",minimum)
             except Exception as page_error:
                 message=str(page_error)[:300]
-                failed_pages.append({"page":start+1,"error":message})
-                errors=list(meta.get("error_log") or [])[-49:]+[{"page":start+1,"message":message}]
+                failed_pages.append({"page":start+1,"end_page":end,"error":message})
+                errors=list(meta.get("error_log") or [])[-49:]+[{"page":start+1,"end_page":end,"message":message}]
                 # Authentication, quota and model-access errors cannot improve
                 # on the next page. Stop immediately, preserve the extracted
                 # questions, and present a useful material-level error.
                 if "403" in message or "key limit" in message.lower() or "api key" in message.lower():
                     job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access."
                     job,meta=_checkpoint(db,job_id,{"phase":"Stopped: provider access error","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors});job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access.";db.commit();return
-                job,meta=_checkpoint(db,job_id,{"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors});db.commit();continue
+                job,meta=_checkpoint(db,job_id,{"phase":f"Skipped failed extraction pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages,"error_log":errors});db.commit();continue
             added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,set(range(start+1,end+1)),answer_lookup_text,source_issues);saved+=added;flagged+=new_flags;skipped+=new_skipped
             job,meta=_checkpoint(db,job_id,{"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages});db.commit()
         control=_control_state(db,job_id)
@@ -250,7 +254,7 @@ def run_bank_import(job_id: str) -> None:
             _finish_controlled_import(db,job_id,control,{"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages});return
         job,meta=_checkpoint(db,job_id,{})
         job.status=ImportStatus.REVIEW if flagged or failed_pages else ImportStatus.APPROVED
-        phase="Needs anomaly review" if flagged or failed_pages else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication")
+        phase="Extraction incomplete: source pages skipped" if failed_pages else ("Needs anomaly review" if flagged else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication"))
         job.extraction_meta={**meta,"phase":phase,"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages,"model":settings().openrouter_model};db.commit()
     except Exception as exc:
         db.rollback()

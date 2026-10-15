@@ -2,6 +2,51 @@
 
 15 October 2026. Implemented locally; no production bank migration or deployment was performed. See [the initial audit](diagram-extraction-audit.md) for the original failures.
 
+## Follow-up: false missing-diagram flags in admin bank imports
+
+The missing-figure rule previously treated any occurrence of `graph`, `circuit`,
+`figure`, `diagram`, or `shown` as evidence of an existing source illustration.
+That incorrectly flagged text-only questions and instructions to draw graphs or
+circuits. The rule now requires an explicit reference to a supplied figure.
+Gemini's shared prompt explicitly requests `diagrams=[]` for questions without
+illustrations.
+
+Model-proposed question crops containing only text/whitespace are discarded only
+when a readable native-text question scope has no graphics, no visual choices,
+and no explicit source-figure reference. Invalid geometry, scans, actual graphics
+outside the question, and missing visual options retain their review checks.
+Bank imports use the validator's concrete failures rather than appending a
+generic `diagram_unavailable` solely because the model proposed a crop.
+
+Verification: 98 extraction tests pass, including 23 new regression cases.
+The full backend suite has 111 passing tests and the same pre-existing expired
+attempt datetime failure described below. No frontend changes are needed.
+Deploy/restart API and extraction workers together. Existing stored review flags
+are not rewritten automatically; re-extract or verify the figure set in the
+review editor (an empty confirmed set is valid for text-only questions).
+
+## Follow-up: extraction failures that appear to disappear
+
+Provider requests retry before the worker skips a failed source batch and moves
+to later pages. The next progress checkpoint used to replace the skipped-page
+phase with ordinary progress. This did not establish that the skipped batch
+recovered. Failures now retain both the start and end page, the import list shows
+a persistent skipped-range warning, and completed jobs with gaps say extraction
+is incomplete. Reviewing the questions that were saved does not clear the gaps.
+Legacy error records are also returned with readable messages. The worker's
+existing retry, continuation and checkpoint behavior remains intact.
+
+The separate `cryptography>=3.1 is required for AES algorithm` failure is a
+missing runtime dependency. Requirements now install `pypdf[crypto]==5.1.0` for
+API and workers. A real AES-256 PDF with an empty user password is exercised
+through the bank worker and saves its extracted question successfully. Rebuild
+the services before retrying affected imports; a running old worker does not
+gain the dependency from a source-only update.
+
+Follow-up verification: 102 extraction tests pass and the production web build
+passes. The full backend suite still has the unrelated datetime failure noted
+below. These changes do not retry or rewrite production imports automatically.
+
 ## What changed
 
 The fix covers PDF and DOCX inputs, stem figures, image-only answer choices, mixed text/image options, and solution figures. It keeps the existing Celery, database, storage, batching, checkpoints, and scoring architecture. Figure ownership and validation now have one implementation in `apps/api/app/figures.py`.

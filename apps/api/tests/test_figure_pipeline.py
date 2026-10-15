@@ -21,6 +21,8 @@ from app.models import Attempt, ImportJob, ImportStatus, Question, QuestionBank,
 from app.schemas import FigureReviewIn, QuestionIn
 from app.services import snapshot_questions
 from app.tasks import extract_import
+from app.bank_imports import run_bank_import
+from app.main import import_view
 
 
 def setup_db():
@@ -83,6 +85,28 @@ def test_plain_text_question_still_imports_without_diagrams(monkeypatch):
     assert db.query(Question).one().diagrams==[]
 
 
+@pytest.mark.parametrize("stem", [
+    "Draw a circuit with two resistors connected in series.",
+    "Sketch the graph of the function y = x squared.",
+    "What is two plus two?",
+])
+@pytest.mark.parametrize("invented_crop", [False, True])
+def test_admin_bank_text_only_questions_do_not_require_diagrams(monkeypatch,stem,invented_crop):
+    db,admin,bank,source,job=setup_db()
+    doc=fitz.open();page=doc.new_page(width=400,height=500)
+    page.insert_text((30,50),"1. "+stem,fontsize=9)
+    page.insert_text((30,75),"Explain the result clearly and state the relevant units.",fontsize=9)
+    data=model_item()
+    data.update(kind="subjective",stem_markdown=stem,options=[],answer=None,
+                diagrams=[{"page":1,"bbox":[20,20,380,100],"role":"question","option_index":None}]
+                if invented_crop else [])
+    uploads=[];monkeypatch.setattr("app.bank_imports.put",lambda *args:uploads.append(args))
+    assert _save_questions(db,bank,job,source,"Physics",doc,image_regions(doc)+vector_regions(doc),[data],set(),{1})==(1,0,0)
+    question=db.query(Question).one()
+    assert question.diagrams==[] and question.interaction["ingestion_issues"]==[]
+    assert question.approved_at is not None and uploads==[]
+
+
 def test_teacher_worker_uses_the_same_contract_and_checkpoints(monkeypatch):
     db,admin,bank,source,job=setup_db();job.bank_id=None;db.commit()
     doc=fixture_pdf();raw=doc.tobytes();requests=[]
@@ -98,6 +122,74 @@ def test_teacher_worker_uses_the_same_contract_and_checkpoints(monkeypatch):
     assert len(q.diagrams)==2 and q.interaction["ingestion_issues"]==[]
     assert saved_job.status==ImportStatus.REVIEW and saved_job.extraction_meta["processed_pages"]==1
     assert any(p["type"]=="image_url" for p in requests[0]["messages"][1]["content"])
+
+
+def test_admin_import_keeps_skipped_batch_visible_after_later_success(monkeypatch):
+    db,admin,bank,source,job=setup_db();doc=fitz.open()
+    for n in range(3):
+        page=doc.new_page(width=400,height=500)
+        page.insert_text((30,50),f"{n+1}. Calculate the result and state the relevant units.",fontsize=9)
+    monkeypatch.setattr("app.bank_imports.SessionLocal",lambda:db)
+    monkeypatch.setattr("app.bank_imports.get",lambda key:doc.tobytes())
+    monkeypatch.setattr("app.bank_imports.settings",lambda:settings().model_copy(update={"openrouter_api_key":"test-key"}))
+    monkeypatch.setattr("app.bank_imports.extraction_units",lambda texts:[(0,2),(2,3)])
+    calls=[]
+    def extract(payload,*args):
+        calls.append(payload)
+        if len(calls)==1:raise RuntimeError("Extraction provider failed after retries: malformed JSON")
+        checkpoint=db.get(ImportJob,"job").extraction_meta
+        assert checkpoint["failed_pages"][0]["end_page"]==2
+        return {"questions":[{"number":"3","kind":"subjective","stem_markdown":"Calculate the result and state the relevant units.",
+                               "options":[],"diagrams":[],"source_spans":[{"page":3,"bbox":[20,20,380,100]}],
+                               "answer":None,"chapter":"Physics","topic":"Units","confidence":.99}]}
+    monkeypatch.setattr("app.bank_imports.request_extraction",extract)
+    run_bank_import(job.id)
+    result=db.get(ImportJob,"job")
+    assert len(calls)==2 and db.query(Question).count()==1
+    assert result.status==ImportStatus.REVIEW and result.extraction_meta["processed_pages"]==3
+    assert result.extraction_meta["phase"]=="Extraction incomplete: source pages skipped"
+    assert result.extraction_meta["failed_pages"]==[{"page":1,"end_page":2,"error":"Extraction provider failed after retries: malformed JSON"}]
+    view=import_view(result,db)
+    assert view["errors"][0]["end_page"]==2 and "malformed JSON" in view["errors"][0]["message"]
+
+
+def test_aes_encrypted_pdf_with_empty_user_password_imports(monkeypatch):
+    from pypdf import PdfReader, PdfWriter
+    db,admin,bank,source,job=setup_db();doc=fitz.open();page=doc.new_page()
+    page.insert_text((30,50),"1. Calculate the result and state the relevant units.")
+    writer=PdfWriter(clone_from=BytesIO(doc.tobytes()))
+    writer.encrypt(user_password="",owner_password="owner-only",algorithm="AES-256")
+    encrypted=BytesIO();writer.write(encrypted);raw=encrypted.getvalue()
+    assert PdfReader(BytesIO(raw)).is_encrypted
+    monkeypatch.setattr("app.bank_imports.SessionLocal",lambda:db)
+    monkeypatch.setattr("app.bank_imports.get",lambda key:raw)
+    monkeypatch.setattr("app.bank_imports.settings",lambda:settings().model_copy(update={"openrouter_api_key":"test-key"}))
+    monkeypatch.setattr("app.bank_imports.request_extraction",lambda *args:{"questions":[{
+        "number":"1","kind":"subjective","stem_markdown":"Calculate the result and state the relevant units.",
+        "options":[],"diagrams":[],"source_spans":[{"page":1,"bbox":[20,20,550,100]}],
+        "answer":None,"chapter":"Physics","topic":"Units","confidence":.99}]})
+    run_bank_import(job.id)
+    result=db.get(ImportJob,"job")
+    assert result.status==ImportStatus.APPROVED and result.error is None
+    assert result.extraction_meta["processed_pages"]==1
+    assert db.query(Question).count()==1
+
+
+def test_approving_present_questions_does_not_clear_skipped_source_pages():
+    db,admin,bank,source,job=setup_db();q=question_record(db)
+    q.kind=QuestionKind.SUBJECTIVE;q.options=[];q.diagrams=[];q.interaction={};q.approved_at=None
+    job.status=ImportStatus.REVIEW;job.extraction_meta={"failed_pages":[{"page":1,"end_page":2,"error":"provider timeout"}]}
+    db.commit()
+    data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=[],answer=None)
+    resolve_bank_question(bank.id,q.id,data,user=admin,db=db)
+    assert q.approved_at is not None and job.status==ImportStatus.REVIEW
+    assert job.extraction_meta["phase"]=="Extraction incomplete: source pages skipped"
+
+
+def test_legacy_failed_page_error_is_returned_as_readable_message():
+    db,admin,bank,source,job=setup_db()
+    job.extraction_meta={"failed_pages":[{"page":2,"error":"Provider timed out"}]}
+    assert import_view(job,db)["errors"][0]["message"]=="Provider timed out"
 
 
 def question_record(db):
@@ -143,7 +235,7 @@ def test_review_upload_failure_keeps_existing_database_references(monkeypatch):
 def test_visual_flags_cannot_be_cleared_by_generic_approve(monkeypatch):
     db,admin,bank,source,job=setup_db();q=question_record(db)
     data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=q.options,answer=q.answer)
-    with pytest.raises(HTTPException) as caught:resolve_bank_question(bank.id,q.id,data,admin,db)
+    with pytest.raises(HTTPException) as caught:resolve_bank_question(bank.id,q.id,data,user=admin,db=db)
     assert caught.value.status_code==422
 
 
@@ -219,6 +311,19 @@ def test_draft_option_reordering_requires_image_ownership_review():
     data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=list(reversed(q.options)))
     save_question_draft(q.id,data,admin,db)
     assert "diagram_option_ownership_uncertain" in q.interaction["ingestion_issues"] and q.approved_at is None
+
+
+def test_admin_can_ignore_a_false_positive_warning_and_approve_with_audit_trail():
+    db,admin,bank,source,job=setup_db();q=question_record(db)
+    q.approved_at=None
+    q.interaction={"ingestion_issues":["diagram_unassigned_native_candidate"]}
+    db.commit()
+    data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=q.options,answer=q.answer)
+    resolve_bank_question(bank.id,q.id,data,user=admin,db=db,ignore_warnings=True)
+    assert q.approved_at is not None
+    assert q.interaction["ingestion_issues"]==[]
+    assert q.interaction["ignored_ingestion_issues"]==["diagram_unassigned_native_candidate"]
+    assert q.interaction["warnings_ignored_by"]==admin.id
 
 
 @pytest.mark.skipif(not shutil.which("soffice"),reason="LibreOffice is not installed")
