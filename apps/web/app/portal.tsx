@@ -541,9 +541,13 @@ export function Portal() {
         <Builder
           questions={questions}
           onDone={async (id) => {
-            await load(user);
             openTest(id);
             setMessage("Draft created. Add classes and publish it when ready.");
+            // Creating the draft already succeeded before this callback runs.
+            // Refresh the dashboard in the background so a stale or malformed
+            // question in the library cannot turn that successful operation
+            // into a misleading "Request failed" message.
+            void load(user).catch(() => {});
           }}
         />
       )}
@@ -1842,6 +1846,7 @@ function Builder({
       source === "bank"
         ? remote.items
         : questions.filter((q) => q.approved && q.scope !== "global"),
+    selectedQuestions = selected.map((id) => shown.find((question) => question.id === id)).filter(Boolean) as Question[],
     toggleKind = (kind: string) => {
       setPage(1);
       setKinds((current) =>
@@ -2105,12 +2110,22 @@ function Builder({
             <span><small>Source</small><b>{source === "bank" ? "Bank" : "Mine"}</b></span>
           </div>
           <div className="builder-selection-list">
-            {selected.length ? selected.map((id) => (
-              <div key={id}>
-                <span>Selected question</span>
-                <button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button>
+            {selected.length ? <>
+              <div className="selection-preview">
+                {selected.slice(0, 4).map((id, index) => {
+                  const question = selectedQuestions.find((item) => item.id === id);
+                  return <span key={id}>Q{questionNumber(question?.source_number || String(index + 1))}</span>;
+                })}
+                {selected.length > 4 && <span>+{selected.length - 4} more</span>}
               </div>
-            )) : <p>Add questions from the library to build your test.</p>}
+              <details className="selection-details">
+                <summary>Manage selected questions</summary>
+                <div>{selected.map((id, index) => {
+                  const question = selectedQuestions.find((item) => item.id === id);
+                  return <span key={id}><b>Q{questionNumber(question?.source_number || String(index + 1))}</b><button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button></span>;
+                })}</div>
+              </details>
+            </> : <p>Add questions from the library to build your test.</p>}
           </div>
           <button disabled={!selected.length}>Create draft ({selected.length})</button>
         </Card>

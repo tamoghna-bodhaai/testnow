@@ -602,7 +602,15 @@ def canonical_answer(answer,options):
     raise HTTPException(422,"Choose a valid option or provide an answer value")
 def question_view(q:Question, db:Session|None=None):
     confidence=q.confidence
-    if confidence is not None: confidence=min(1.0,max(0.0,float(confidence)))
+    if confidence is not None:
+        # Imported legacy records can contain a non-numeric confidence value.
+        # It is optional display metadata, so do not let one such record make
+        # the whole teacher question library (or a successful test refresh)
+        # return a 500 response.
+        try:
+            confidence=min(1.0,max(0.0,float(confidence)))
+        except (TypeError,ValueError):
+            confidence=None
     taxonomy=[]
     if db and q.bank_id:
         taxonomy=[{"id":node.id,"parent_id":node.parent_id,"kind":node.kind,"name":node.name,"code":node.code} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==q.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
