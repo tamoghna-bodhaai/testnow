@@ -1,0 +1,97 @@
+{
+  "questions": [
+    {
+      "number": "1",
+      "chapter": "Geometry",
+      "topic": "Shapes",
+      "kind": "single_choice",
+      "stem_markdown": "Which diagram is a circle? Select exactly one answer.",
+      "options": [
+        {
+          "value": "A",
+          "markdown": "",
+          "requires_diagram": true
+        },
+        {
+          "value": "B",
+          "markdown": "",
+          "requires_diagram": true
+        },
+        {
+          "value": "C",
+          "markdown": "",
+          "requires_diagram": true
+        },
+        {
+          "value": "D",
+          "markdown": "",
+          "requires_diagram": true
+        }
+      ],
+      "answer": {},
+      "solution_markdown": "A circle is defined as a set of points equidistant from a center point. Option A is the only diagram showing a circle.",
+      "confidence": 1,
+      "source_spans": [
+        {
+          "page": 1,
+          "bbox": [
+            25.76,
+            34.45,
+            264.32,
+            315.9
+          ]
+        }
+      ],
+      "diagrams": [
+        {
+          "page": 1,
+          "alt": "Circle diagram",
+          "role": "option",
+          "option_index": 0,
+          "bbox": [
+            85.68,
+            91.0,
+            188.72,
+            208.65
+          ]
+        },
+        {
+          "page": 1,
+          "alt": "Square diagram",
+          "role": "option",
+          "option_index": 1,
+          "bbox": [
+            348.32,
+            91.0,
+            446.88,
+            208.65
+          ]
+        },
+        {
+          "page": 1,
+          "alt": "Triangle diagram",
+          "role": "option",
+          "option_index": 2,
+          "bbox": [
+            85.68,
+            312.0,
+            188.72,
+            429.65
+          ]
+        },
+        {
+          "page": 1,
+          "alt": "Rectangle diagram",
+          "role": "option",
+          "option_index": 3,
+          "bbox": [
+            348.32,
+            345.8,
+            469.28,
+            429.65
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -16,12 +16,14 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
-from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, diagrams_for_item, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction, unit_requires_vision
+from .figures import save_figures, visual_context, mark_scope_conflicts, ground_question_spans, docx_visual_inventory, docx_conversion_issues
+from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
 
 
-def _pdf_bytes(source: SourceDocument) -> bytes:
+def _pdf_bytes(source: SourceDocument, conversion_info:dict|None=None) -> bytes:
     raw=get(source.object_key)
     if source.media_type == "application/pdf": return raw
+    if conversion_info is not None:conversion_info.update(docx_visual_inventory(raw))
     with TemporaryDirectory(prefix="bank-docx-") as directory:
         path=Path(directory) / source.filename; path.write_bytes(raw)
         converted=path.with_suffix(".pdf")
@@ -104,17 +106,40 @@ def _control_state(db, job_id: str) -> str | None:
     return None
 
 
-def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers, owned_pages:set[int]|None=None, answer_text:str=""):
+def _checkpoint(db, job_id: str, updates: dict) -> tuple[ImportJob, dict]:
+    """Write worker progress without clobbering an admin control request.
+
+    A pause/cancel endpoint runs in a different request and can commit while an
+    OpenRouter call is in flight.  Always re-read the JSON metadata before a
+    worker checkpoint so its stale snapshot cannot erase that control flag.
+    """
+    db.expire_all()
+    job=db.get(ImportJob,job_id)
+    if not job: raise ValueError("Bank import job not found")
+    meta={**dict(job.extraction_meta or {}),**updates}
+    job.extraction_meta=meta
+    return job,meta
+
+
+def _finish_controlled_import(db, job_id: str, control: str, updates: dict) -> None:
+    job,meta=_checkpoint(db,job_id,updates)
+    job.status=ImportStatus.FAILED if control=="cancelled" else ImportStatus.UPLOADED
+    job.error="Cancelled by administrator" if control=="cancelled" else None
+    job.extraction_meta={**meta,"phase":"Cancelled" if control=="cancelled" else "Paused by administrator"}
+    db.commit()
+
+
+def _save_questions(db, bank, job, source, subject, rendered, regions, items, seen_numbers, owned_pages:set[int]|None=None, answer_text:str="",source_issues:list[str]|None=None):
     flagged=0; saved=0; skipped=0
     # Serialize the small taxonomy/write phase per bank.  This prevents two
     # source jobs from creating a second NULL-parent subject simultaneously.
     db.query(QuestionBank).filter_by(id=bank.id).with_for_update().one()
     subject_node=_node(db,bank.id,None,"subject",subject)
-    for raw_item in items:
+    for raw_item in mark_scope_conflicts(ground_question_spans(items,rendered)):
         item,preflight_issues=prepare_item_for_ingestion(raw_item)
         if item is None:
             skipped+=1;continue
-        item["_ingestion_issues"]=preflight_issues;number=str(item["number"]).strip()
+        item["_ingestion_issues"]=preflight_issues+list(source_issues or []);number=str(item["number"]).strip()
         # A source can contain a repeated number at a section boundary.  The
         # page span makes its identity stable, while repeated batch output is
         # discarded by the source-key check below.
@@ -127,14 +152,9 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
         source_key=f"{source.sha256}:{number}:{page or 'unknown'}"
         if source_key in seen_numbers or db.query(Question.id).filter_by(bank_id=bank.id,source_key=source_key).first():
             continue
-        seen_numbers.add(source_key);kind=QuestionKind(item["kind"]);diagrams=[]
-        for index,diagram in enumerate(diagrams_for_item(item,regions)):
-            try:
-                page_no=int(diagram["page"])-1;x0,y0,x1,y1=diagram["bbox"];page_obj=rendered[page_no];clip=fitz.Rect(float(x0),float(y0),float(x1),float(y1)) & page_obj.rect
-                if clip.is_empty:continue
-                key=f"bank-diagrams/{bank.id}/{job.id}/{number}-{page_no + 1}-{index}.png";put(key,page_obj.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png"),"image/png")
-                diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
-            except Exception:continue
+        seen_numbers.add(source_key);kind=QuestionKind(item["kind"])
+        diagrams,visual_issues=save_figures(item,rendered,regions,f"bank-diagrams/{bank.id}/{job.id}/{number}-{page}",put)
+        item["_ingestion_issues"] += visual_issues
         if not item.get("answer"):
             item["answer"]=answer_from_key(number,item.get("options") or [],answer_text)
         answer=_answer_from_solution(item);issues=_issues(item,answer,diagrams);flagged+=bool(issues)
@@ -165,9 +185,22 @@ def run_bank_import(job_id: str) -> None:
         if meta.get("cancel_requested"):
             job.status=ImportStatus.FAILED;job.error="Cancelled by administrator";job.extraction_meta={**meta,"phase":"Cancelled"};db.commit();return
         job.status=ImportStatus.PROCESSING;job.extraction_meta={**meta,"phase":"Reading source"};db.commit()
-        raw=_pdf_bytes(source);reader=PdfReader(BytesIO(raw));page_count=len(reader.pages)
+        canonical_key=meta.get("canonical_pdf_key")
+        conversion_info=dict(meta.get("docx_visual_inventory") or {})
+        raw=get(canonical_key) if canonical_key else _pdf_bytes(source,conversion_info)
+        if source.media_type != "application/pdf" and not canonical_key:
+            canonical_key=f"bank-sources/{bank.id}/{source.id}/canonical.pdf"
+            put(canonical_key,raw,"application/pdf")
+            job,meta=_checkpoint(db,job_id,{"canonical_pdf_key":canonical_key})
+            db.commit()
+        reader=PdfReader(BytesIO(raw));page_count=len(reader.pages)
         if not page_count:raise ValueError("The document contains no pages")
         rendered=fitz.open(stream=raw,filetype="pdf");regions=native_image_regions(rendered)+native_vector_regions(rendered)
+        source_issues=[]
+        if source.media_type!="application/pdf":
+            if not conversion_info:conversion_info=docx_visual_inventory(get(source.object_key))
+            source_issues=docx_conversion_issues(conversion_info,regions)
+            job,meta=_checkpoint(db,job_id,{"docx_visual_inventory":conversion_info,"docx_visual_issues":source_issues});db.commit()
         page_texts=best_page_text(raw,reader,rendered)
         if job.answer_document_id:
             answer_source=db.get(SourceDocument,job.answer_document_id);answer_raw=_pdf_bytes(answer_source)
@@ -188,19 +221,13 @@ def run_bank_import(job_id: str) -> None:
             if start<checkpoint:start=checkpoint
             control=_control_state(db,job_id)
             if control:
-                job=db.get(ImportJob,job_id)
-                job.status=ImportStatus.FAILED if control=="cancelled" else ImportStatus.UPLOADED
-                job.error="Cancelled by administrator" if control=="cancelled" else None
-                job.extraction_meta={**(job.extraction_meta or {}),"phase":"Cancelled" if control=="cancelled" else "Paused by administrator","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1};db.commit();return
+                _finish_controlled_import(db,job_id,control,{"processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1});return
             content=[{"type":"text","text":f"Subject: {subject}. {page_unit_content(page_texts,start,answer_text,end)}"}]
-            # Do not turn selectable PDF text into a visual OCR job.  The
-            # source PDF itself supplies vector/raster diagram regions later;
-            # vision is reserved for pages with no usable text layer.
-            if unit_requires_vision(page_texts,start,end):
-                for page_no in range(start,min(page_count,end+1)):
-                    png=rendered[page_no].get_pixmap(matrix=fitz.Matrix(1,1),alpha=False).tobytes("png")
-                    content += [{"type":"text","text":f"Source page {page_no+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}]
-            job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped};db.commit()
+            content += visual_context(rendered,start,end,page_texts,regions,settings().max_rendered_pdf_bytes)
+            job,meta=_checkpoint(db,job_id,{"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped});db.commit()
+            control=_control_state(db,job_id)
+            if control:
+                _finish_controlled_import(db,job_id,control,{"processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1});return
             payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
             try:
                 minimum=1 if expected_questions("\n".join(page_texts[start:end])) else 0
@@ -214,10 +241,14 @@ def run_bank_import(job_id: str) -> None:
                 # questions, and present a useful material-level error.
                 if "403" in message or "key limit" in message.lower() or "api key" in message.lower():
                     job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access."
-                    job.extraction_meta={**meta,"phase":"Stopped: provider access error","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors};db.commit();return
-                job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors};meta=dict(job.extraction_meta);db.commit();continue
-            added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,set(range(start+1,end+1)),answer_lookup_text);saved+=added;flagged+=new_flags;skipped+=new_skipped
-            job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
+                    job,meta=_checkpoint(db,job_id,{"phase":"Stopped: provider access error","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors});job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access.";db.commit();return
+                job,meta=_checkpoint(db,job_id,{"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors});db.commit();continue
+            added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,set(range(start+1,end+1)),answer_lookup_text,source_issues);saved+=added;flagged+=new_flags;skipped+=new_skipped
+            job,meta=_checkpoint(db,job_id,{"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages});db.commit()
+        control=_control_state(db,job_id)
+        if control:
+            _finish_controlled_import(db,job_id,control,{"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages});return
+        job,meta=_checkpoint(db,job_id,{})
         job.status=ImportStatus.REVIEW if flagged or failed_pages else ImportStatus.APPROVED
         phase="Needs anomaly review" if flagged or failed_pages else ("Completed with invalid records skipped" if skipped else "Validated and ready for bank publication")
         job.extraction_meta={**meta,"phase":phase,"processed_pages":page_count,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":len(ranges),"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages,"model":settings().openrouter_model};db.commit()

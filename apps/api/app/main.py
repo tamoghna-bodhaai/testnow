@@ -14,8 +14,11 @@ from .services import audit, ensure_live, publish, score, safe_question_kind, sn
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
 from .tasks import extract_import, extract_bank_import
 from .seed import ensure_demo_data
+from .figures import is_visual_issue, option_media_issues
 
 app=FastAPI(title="TestNow API",version="1.0.0")
+from .figure_review import router as figure_review_router
+app.include_router(figure_review_router)
 app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 @app.on_event("startup")
 def startup():
@@ -113,6 +116,36 @@ def bank_view(bank:QuestionBank,db:Session):
     live=questions.outerjoin(ImportJob,ImportJob.id==Question.import_job_id).filter(Question.approved_at.is_not(None),or_(Question.import_job_id.is_(None),ImportJob.published_at.is_not(None))).count()
     return {"id":bank.id,"slug":bank.slug,"name":bank.name,"exam_code":bank.exam_code,"status":bank.status,"revision":bank.revision,"is_global":bank.is_global,"question_count":questions.count(),"published_count":live,"import_count":jobs.count(),"flagged_count":sum(1 for q in questions if (q.interaction or {}).get("ingestion_issues"))}
 
+def bank_taxonomy_summary(bank_id:str,db:Session)->dict:
+    """Compact full-bank classification counts for the admin review screen.
+
+    The editable question payload is intentionally capped at 100 rows; this
+    summary is not.  It prevents that preview cap from being presented as the
+    total ingestion result.
+    """
+    question_ids=[row[0] for row in db.query(Question.id).filter_by(bank_id=bank_id).all()]
+    nodes={row.id:row for row in db.query(TaxonomyNode).filter_by(bank_id=bank_id).all()}
+    links={question_id:[] for question_id in question_ids}
+    if question_ids:
+        for question_id,node_id in db.query(QuestionTaxonomy.question_id,QuestionTaxonomy.taxonomy_node_id).filter(QuestionTaxonomy.question_id.in_(question_ids)):
+            if node_id in nodes:links.setdefault(question_id,[]).append(nodes[node_id])
+    tree={}
+    for question_id in question_ids:
+        attached=links.get(question_id,[])
+        subject=next((node.name for node in attached if node.kind=="subject"),"Unclassified subject")
+        chapter=next((node.name for node in attached if node.kind=="chapter"),"Unclassified chapter")
+        topic=next((node.name for node in attached if node.kind=="topic"),"Unclassified topic")
+        branch=tree.setdefault(subject,{"count":0,"chapters":{}});branch["count"]+=1
+        chapter_branch=branch["chapters"].setdefault(chapter,{"count":0,"topics":{}});chapter_branch["count"]+=1
+        chapter_branch["topics"][topic]=chapter_branch["topics"].get(topic,0)+1
+    subjects=[]
+    for name,subject in sorted(tree.items()):
+        chapters=[]
+        for chapter_name,chapter in sorted(subject["chapters"].items()):
+            chapters.append({"name":chapter_name,"count":chapter["count"],"topics":[{"name":topic,"count":count} for topic,count in sorted(chapter["topics"].items())]})
+        subjects.append({"name":name,"count":subject["count"],"chapters":chapters})
+    return {"total":len(question_ids),"subjects":subjects}
+
 def bank_slug(value:str,db:Session)->str:
     base=re.sub(r"[^a-z0-9]+","-",value.lower()).strip("-")[:60] or "question-bank"; candidate=base;index=2
     while db.query(QuestionBank).filter_by(slug=candidate).first():candidate=f"{base[:54]}-{index}";index+=1
@@ -135,7 +168,7 @@ def admin_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Se
     # Keep the management view responsive for large published banks.  The
     # summary retains the total count; this is the newest reviewable slice.
     questions=db.query(Question).filter_by(bank_id=bank.id).order_by(Question.created_at.desc()).limit(100).all()
-    return {**bank_view(bank,db),"imports":[import_view(job,db) for job in jobs],"questions":[question_view(q,db) for q in questions]}
+    return {**bank_view(bank,db),"imports":[import_view(job,db) for job in jobs],"questions":[question_view(q,db) for q in questions],"taxonomy_summary":bank_taxonomy_summary(bank.id,db)}
 
 @app.put("/admin/question-banks/{bank_id}")
 def update_question_bank(bank_id:str,data:QuestionBankUpdate,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
@@ -233,6 +266,10 @@ async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:l
 def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     q=db.get(Question,question_id);bank=db.get(QuestionBank,bank_id)
     if not bank or not q or q.bank_id!=bank.id:raise HTTPException(404,"Question not found")
+    if any(is_visual_issue(issue) for issue in (q.interaction or {}).get("ingestion_issues", [])) or option_media_issues(data.options,q.diagrams):
+        raise HTTPException(422,"Review and save the question and option figures before approving this question")
+    if any(d.get("role")=="option" for d in q.diagrams or []) and [o.get("value") for o in data.options] != [o.get("value") for o in q.options or []]:
+        raise HTTPException(422,"Option order is linked to figures; preserve option values and order")
     if q.kind in {QuestionKind.SINGLE,QuestionKind.MULTIPLE,QuestionKind.ASSERTION} and len(data.options)<2:raise HTTPException(422,"Choice questions need at least two options")
     # Review edits may correct rendered content and scoring, but must never
     # erase the immutable source spans/diagram provenance captured at ingest.
@@ -471,6 +508,8 @@ def save_answer_key(job_id:str,question_id:str,data:AnswerKeyIn,user:User=Depend
 def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     q=db.get(Question,question_id);job=db.get(ImportJob,job_id)
     if not job or not q or q.import_job_id!=job.id or job.owner_id!=user.id:raise HTTPException(404,"Question not found")
+    if any(is_visual_issue(issue) for issue in (q.interaction or {}).get("ingestion_issues", [])) or option_media_issues(q.options,q.diagrams):
+        raise HTTPException(422,"Review and save the question and option figures before approving this question")
     if not q.answer:raise HTTPException(422,"Select and save an answer key before approving this question")
     # Confidence is audit metadata, never a reason to block teacher approval. Legacy
     # imports may have omitted it or stored it on a 0-100 scale.
@@ -615,19 +654,38 @@ def bank_questions(
     rows=query.order_by(Question.created_at.desc(),Question.id).offset((page-1)*page_size).limit(page_size).all()
     return {"items":[question_view(row,db) for row in rows],"page":page,"page_size":page_size,"total":total,"has_more":page*page_size<total}
 @app.get("/media/questions/{question_id}/{index}")
-def question_media(question_id:str,index:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
+def question_media(question_id:str,index:int,user:User=Depends(current_user),db:Session=Depends(get_db),asset:str|None=None):
     q=db.get(Question,question_id)
-    if not q or index<0 or index>=len(q.diagrams):raise HTTPException(404,"Media not found")
+    if not q or index<0:raise HTTPException(404,"Media not found")
     allowed=q.owner_id==user.id or q.scope==QuestionScope.GLOBAL or user.role==Role.ADMIN
     if not allowed and user.role==Role.STUDENT:
         for a in db.query(Attempt).filter_by(student_id=user.id).all():
             version=db.get(TestVersion,a.version_id)
             if version and question_id in {item["id"] for item in version.content.get("questions",[])}:allowed=True;break
     if not allowed:raise HTTPException(403,"Media not available")
+    if asset is None:
+        if index>=len(q.diagrams):raise HTTPException(404,"Media not found")
+        key=q.diagrams[index]["object_key"]
+    else:
+        # Never pass an arbitrary requested object key to storage. A repaired
+        # question can change its diagram ordering, while saved test versions
+        # must continue to render their original immutable images.
+        key=next((d["object_key"] for d in q.diagrams if d.get("object_key")==asset),None)
+        if key is None:
+            versions=db.query(TestVersion)
+            if user.role==Role.STUDENT:
+                versions=versions.filter(TestVersion.id.in_(db.query(Attempt.version_id).filter_by(student_id=user.id)))
+            elif user.role!=Role.ADMIN:
+                versions=versions.join(Test,Test.id==TestVersion.test_id).filter(Test.owner_id==user.id)
+            for version in versions.yield_per(50):
+                recorded=next((item for item in version.content.get("questions",[]) if item.get("id")==question_id),None)
+                if recorded and any(d.get("object_key")==asset for d in recorded.get("diagrams",[])):
+                    key=asset;break
+        if key is None:raise HTTPException(404,"Media not found")
     # Do not redirect the browser to an internal object-store hostname. In local and
     # private deployments that hostname is unreachable from the browser, producing a
     # broken image despite successful diagram extraction.
-    return StreamingResponse(iter([get(q.diagrams[index]["object_key"])]),media_type="image/png",headers={"Cache-Control":"private, max-age=300"})
+    return StreamingResponse(iter([get(key)]),media_type="image/png",headers={"Cache-Control":"private, max-age=300"})
 @app.post("/questions",status_code=201)
 def create_question(data:QuestionIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     q=Question(id=uid(),owner_id=user.id,approved_at=datetime.now(timezone.utc),**data.model_dump());db.add(q);audit(db,user.id,"question.created","question",q.id);db.commit();return question_view(q)

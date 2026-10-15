@@ -9,13 +9,13 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionKind, SourceDocument
 from .security import uid
 from .storage import get, put
+from .figures import DIAGRAM_SCHEMA, OPTION_SCHEMA, VISUAL_INSTRUCTIONS, image_regions, vector_regions, save_figures, visual_context, model_visual_request, canonical_visual_response, mark_scope_conflicts, ground_question_spans, rect
 
 celery_app=Celery("testnow",broker=settings().redis_url,backend=settings().redis_url)
 SYSTEM="""You extract educational examination papers into teacher-reviewable records. Return only JSON matching the supplied schema.
 
 Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Its source_spans must cover the complete source area for that question, including its options and any associated figure. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. If choices are visibly labelled (A)-(D), (1)-(4), or similar, this is an objective question: return every option and classify it as single_choice or multiple_choice; do not call it subjective merely because an answer key is absent. The separately supplied answer-key document is authoritative: map its answer to the question option, and return its corresponding worked explanation in solution_markdown whenever available. Reuse the exact same chapter/topic spelling for repeated headings; do not make a question wording into a topic or subtopic. Format each solution as readable Markdown: use blank paragraphs, numbered steps for sequential working, and display math for substantial equations. Never flatten a multi-step solution into one paragraph. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
-OPTION_SCHEMA={"type":"object","additionalProperties":False,"required":["value","markdown"],"properties":{"value":{"type":"string"},"markdown":{"type":"string"}}}
-DIAGRAM_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox","alt"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"alt":{"type":"string"}}}
+SYSTEM += VISUAL_INSTRUCTIONS
 SPAN_SCHEMA={"type":"object","additionalProperties":False,"required":["page","bbox"],"properties":{"page":{"type":"integer","minimum":1},"bbox":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}}}
 SCHEMA={"name":"exam_questions","strict":True,"schema":{"type":"object","additionalProperties":False,"required":["questions"],"properties":{"questions":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["number","chapter","topic","kind","stem_markdown","options","answer","solution_markdown","confidence","source_spans","diagrams"],"properties":{"number":{"type":"string"},"chapter":{"type":"string"},"topic":{"type":"string"},"kind":{"type":"string","enum":["single_choice","multiple_choice","numerical","integer","matrix_match","assertion_reason","subjective"]},"stem_markdown":{"type":"string"},"options":{"type":"array","items":OPTION_SCHEMA},"answer":{"type":["object","null"]},"solution_markdown":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"source_spans":{"type":"array","items":SPAN_SCHEMA},"diagrams":{"type":"array","items":DIAGRAM_SCHEMA}}}}}}}
 
@@ -54,15 +54,35 @@ def options_embedded_in_stem(stem:object)->tuple[str,list[dict]]:
 def normalize_item(item:dict)->dict:
     """Accept legacy provider variations, but never store presentation JSON as an option."""
     options=[]
+    spans=[]
+    for span in item.get("source_spans") or []:
+        if not isinstance(span,dict) or isinstance(span.get("page"),bool) or not isinstance(span.get("page"),int) or span["page"]<1 or rect(span.get("bbox")) is None:
+            item.setdefault("_visual_scope_issues",[]).append("diagram_invalid_source_geometry")
+            continue
+        spans.append(span)
+    if "source_spans" in item:
+        item["source_spans"]=spans
+        if not spans:item.setdefault("_visual_scope_issues",[]).append("diagram_source_missing")
     for index, option in enumerate(item.get("options") or []):
         if isinstance(option, str):
             options.append({"value":chr(97+index),"markdown":option})
         elif isinstance(option, dict):
-            options.append({"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")})
+            clean={"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")}
+            if "requires_diagram" in option:clean["requires_diagram"]=bool(option["requires_diagram"])
+            options.append(clean)
     if len(options)<2:
         stem,recovered=options_embedded_in_stem(item.get("stem_markdown"))
         if recovered:
             item["stem_markdown"]=stem;options=recovered
+            if item.get("kind")=="subjective":item["kind"]="single_choice"
+    visual_indices={d.get("option_index") for d in (item.get("diagrams") or []) if isinstance(d,dict)
+                    and d.get("role")=="option" and isinstance(d.get("option_index"),int)
+                    and not isinstance(d.get("option_index"),bool) and 0<=d["option_index"]<8}
+    if visual_indices and max(visual_indices)>=len(options):
+        count=max(visual_indices)+1
+        if visual_indices | set(range(len(options))) == set(range(count)) and count>=2:
+            options += [{"value":chr(97+i),"markdown":"","requires_diagram":True} for i in range(len(options),count)]
+            item["_visual_options_recovered"]=True
             if item.get("kind")=="subjective":item["kind"]="single_choice"
     item["options"]=options
     item["answer"]=normalize_answer(item.get("answer"),options)
@@ -139,6 +159,7 @@ def prepare_item_for_ingestion(raw_item:dict)->tuple[dict|None,list[str]]:
     except (AttributeError, TypeError, ValueError) as exc:
         return None,[f"invalid_record:{str(exc) or exc.__class__.__name__}"]
     issues=[]
+    if item.get("_visual_options_recovered"):issues.append("diagram_options_recovered")
     if item.get("kind") in ("single_choice","multiple_choice","assertion_reason") and len(item.get("options") or [])<2:
         item["kind"]="subjective";item["answer"]=None;issues.append("choice_options_missing")
     try:
@@ -234,7 +255,7 @@ def request_extraction(payload:dict, title:str, minimum_questions:int=0)->dict:
         models.append(settings().openrouter_fallback_model)
     last_error=None
     for model in models:
-        request={**payload,"model":model}
+        request=model_visual_request(payload,model)
         for attempt in range(3):
             try:
                 response=httpx.post("https://openrouter.ai/api/v1/chat/completions",headers={"Authorization":f"Bearer {settings().openrouter_api_key}","HTTP-Referer":"https://testnow.app","X-Title":title},json=request,timeout=settings().openrouter_timeout_seconds)
@@ -245,68 +266,20 @@ def request_extraction(payload:dict, title:str, minimum_questions:int=0)->dict:
                         f"Provider returned {len(parsed.get('questions') or [])} questions "
                         f"for a source unit with at least {minimum_questions} detectable questions"
                     )
-                return parsed
+                return canonical_visual_response(parsed,payload,model)
             except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 last_error=exc
                 if attempt<2:time.sleep(2**attempt)
     raise RuntimeError(f"Extraction provider failed after retries: {last_error}")
 
 def native_image_regions(document):
-    """Find illustrations embedded in the PDF independently of model detection."""
-    regions=[]
-    for page_number,page in enumerate(document,1):
-        seen=set()
-        for image in page.get_images(full=True):
-            xref=image[0]
-            for rect in page.get_image_rects(xref):
-                key=(page_number,round(rect.x0,1),round(rect.y0,1),round(rect.x1,1),round(rect.y1,1))
-                # Ignore tiny raster marks; real diagrams have a meaningful visual area.
-                if key in seen or rect.width*rect.height<900:continue
-                seen.add(key)
-                regions.append({"page":page_number,"bbox":[rect.x0,rect.y0,rect.x1,rect.y1],"alt":"Diagram extracted from the source paper"})
-    return regions
+    return image_regions(document)
+
 
 def native_vector_regions(document):
-    """Find meaningful vector drawing groups (the common form of exam diagrams)."""
-    regions=[]
-    for page_number,page in enumerate(document,1):
-        rects=[]
-        try:
-            for drawing in page.get_drawings():
-                rect=drawing.get("rect")
-                if rect and rect.width*rect.height>=900:rects.append(fitz.Rect(rect))
-        except Exception:
-            continue
-        # Coalesce touching/nearby strokes into a single crop instead of one
-        # image per line in a circuit or geometry illustration.
-        groups=[]
-        for rect in sorted(rects,key=lambda value:(value.y0,value.x0)):
-            for group in groups:
-                expanded=group + (-8,-8,8,8)
-                if expanded.intersects(rect):
-                    group.include_rect(rect);break
-            else:groups.append(rect)
-        for rect in groups:
-            if rect.width*rect.height>=900:
-                regions.append({"page":page_number,"bbox":[rect.x0,rect.y0,rect.x1,rect.y1],"alt":"Vector diagram extracted from the source paper"})
-    return regions
+    return vector_regions(document)
 
-def intersects(a,b):
-    return max(a[0],b[0])<min(a[2],b[2]) and max(a[1],b[1])<min(a[3],b[3])
 
-def diagrams_for_item(item:dict,native_regions:list[dict]):
-    """Merge model-labelled figures with actual PDF image regions inside source spans."""
-    diagrams=list(item.get("diagrams") or [])
-    spans=item.get("source_spans") or []
-    present={(d.get("page"),tuple(d.get("bbox") or [])) for d in diagrams if isinstance(d,dict)}
-    for region in native_regions:
-        if (region["page"],tuple(region["bbox"])) in present:continue
-        for span in spans:
-            if not isinstance(span,dict) or span.get("page")!=region["page"]:continue
-            bbox=span.get("bbox") or []
-            if len(bbox)==4 and intersects(region["bbox"],bbox):
-                diagrams.append(region);present.add((region["page"],tuple(region["bbox"])));break
-    return diagrams
 @celery_app.task(bind=True,autoretry_for=(Exception,),retry_backoff=True,max_retries=2)
 def extract_import(self, job_id:str):
     db:Session=SessionLocal(); rendered=None; job=db.get(ImportJob,job_id)
@@ -339,16 +312,7 @@ def extract_import(self, job_id:str):
       for start,end in units:
         if start<checkpoint:start=checkpoint
         vision_content=[{"type":"text","text":page_unit_content(page_texts,start,key_text,end)}]
-        # Native text is materially more accurate for this digitally-produced
-        # book.  Rendering every readable page made this a 625-request visual
-        # scan.  Keep vision as a precise fallback for scanned/sparse pages.
-        if unit_requires_vision(page_texts,start,end):
-          rendered_bytes=0
-          for page_number in range(start,min(page_count,end+1)):
-            png=rendered[page_number].get_pixmap(matrix=fitz.Matrix(1.25,1.25),alpha=False).tobytes("png")
-            rendered_bytes+=len(png)
-            if rendered_bytes>settings().max_rendered_pdf_bytes: raise ValueError("A rendered extraction batch exceeds the configured size limit")
-            vision_content.extend([{"type":"text","text":f"Source page {page_number+1}"},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+base64.b64encode(png).decode()}}])
+        vision_content += visual_context(rendered,start,end,page_texts,native_regions,settings().max_rendered_pdf_bytes)
         job.extraction_meta={**meta,"phase":f"Extracting pages {start+1}-{end} of {page_count}","processed_pages":start,"total_pages":page_count,"question_count":len(numbers)};db.commit()
         payload={"model":settings().openrouter_model,"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":vision_content}],"response_format":{"type":"json_schema","json_schema":SCHEMA},"provider":{"require_parameters":True},"max_tokens":settings().openrouter_max_output_tokens,"stream":False}
         try:
@@ -361,8 +325,8 @@ def extract_import(self, job_id:str):
           failed_pages.append({"page":start+1,"error":str(page_error)[:300]})
           job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
         skipped=0
-        for raw_item in parsed.get("questions",[]):
-          item,_=prepare_item_for_ingestion(raw_item)
+        for raw_item in mark_scope_conflicts(ground_question_spans(parsed.get("questions",[]),rendered)):
+          item,preflight_issues=prepare_item_for_ingestion(raw_item)
           if item is None:
             skipped+=1;continue
           if not item.get("answer"):
@@ -372,14 +336,9 @@ def extract_import(self, job_id:str):
           # Reject a model returning continuation-owned records, rather than
           # depending on a global number dedupe that loses valid questions.
           if owned_page not in range(start+1,end+1) or (number,owned_page) in numbers: continue
-          numbers.add((number,owned_page));kind=QuestionKind(item["kind"]);diagrams=[]
-          for n,diagram in enumerate(diagrams_for_item(item,native_regions)):
-            try:
-              page_no=int(diagram["page"])-1; x0,y0,x1,y1=diagram["bbox"]; page=rendered[page_no];clip=fitz.Rect(float(x0),float(y0),float(x1),float(y1)) & page.rect
-              if clip.is_empty: continue
-              key=f"diagrams/{job.id}/{number}-{n}.png";put(key,page.get_pixmap(matrix=fitz.Matrix(2,2),clip=clip,alpha=False).tobytes("png"),"image/png");diagrams.append({"object_key":key,"page":page_no+1,"bbox":[x0,y0,x1,y1],"alt":diagram.get("alt","Question diagram")})
-            except Exception: continue
-          db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item["solution_markdown"],confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams))
+          numbers.add((number,owned_page));kind=QuestionKind(item["kind"])
+          diagrams,visual_issues=save_figures(item,rendered,native_regions,f"diagrams/{job.id}/{owned_page}-{number}",put)
+          db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item.get("solution_markdown"),confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams,interaction={"ingestion_issues":preflight_issues+visual_issues,"source_document_id":doc.id}))
         job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"skipped_count":int(meta.get("skipped_count") or 0)+skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
       phase="Ready for review" if not failed_pages else f"Ready for review — {len(failed_pages)} page(s) need re-extraction"
       job.status=ImportStatus.REVIEW; job.extraction_meta={**meta,"model":settings().openrouter_model,"paper_title":paper_title,"processed_pages":page_count,"total_pages":page_count,"question_count":len(numbers),"failed_pages":failed_pages,"phase":phase};db.commit()

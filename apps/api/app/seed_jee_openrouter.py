@@ -38,13 +38,15 @@ from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKin
 from .security import uid
 from .seed_jee import BANK_SLUG, find_or_create_node, subject_from_filename
 from .storage import delete_prefix, put
-from .tasks import normalize_answer
+from .tasks import normalize_answer, normalize_item
+from .figures import DIAGRAM_SCHEMA, OPTION_SCHEMA, VISUAL_INSTRUCTIONS, image_regions, vector_regions, save_figures, visual_context, model_visual_request, canonical_visual_response, mark_scope_conflicts, ground_question_spans
 
 PUBLISH_THRESHOLD = 0.90
 MAX_WINDOW_PAGES = 3
 SYSTEM = """You are extracting a permanent JEE Advanced question bank. Return only JSON matching the schema. Read the page images and native text together. Extract only complete questions whose printed number begins on one of the requested core pages; do not extract answer keys, worked-solution pages, headers, instructions, or continuations that began earlier. Preserve question prose and mathematics in Markdown with valid LaTex delimiters. Keep every option semantic and complete. `chapter` must be the printed/current chapter. Identify the actual question kind.
 
-Classify a question as `single_choice`, `multiple_choice`, or `assertion_reason` only when the source visibly supplies at least two selectable answer choices. Put those choices, and only those choices, in `options`. A long written question with lettered parts such as `(a)`, `(b)`, `(c)` is `subjective`: those parts belong in `stem_markdown`, not in `options`, even if its answer-key entry is labelled A, B, C, or D. Never infer a choice type from the answer key or from a preceding section heading. A numerical/integer question may have no options. A diagram is only a self-contained graph, figure, circuit, table, or geometry drawing: give its exact PDF-point bounding box. Never use a whole-question screenshot, text block, options, or solution as a diagram. If uncertain, omit the diagram and lower confidence."""
+Classify a question as `single_choice`, `multiple_choice`, or `assertion_reason` only when the source visibly supplies at least two selectable answer choices. Put those choices, and only those choices, in `options`. A long written question with lettered parts such as `(a)`, `(b)`, `(c)` is `subjective`: those parts belong in `stem_markdown`, not in `options`, even if its answer-key entry is labelled A, B, C, or D. Never infer a choice type from the answer key or from a preceding section heading. A numerical/integer question may have no options. A diagram is only a self-contained graph, figure, circuit, table, or geometry drawing: give its exact PDF-point bounding box. Never use a whole-question screenshot or prose-only block as a diagram. Extract each visual answer option separately with its option owner. If uncertain, omit the diagram and lower confidence."""
+SYSTEM += VISUAL_INSTRUCTIONS
 ITEM_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["number", "chapter", "kind", "stem_markdown", "options", "answer", "confidence", "source_spans", "diagrams"],
@@ -53,11 +55,11 @@ ITEM_SCHEMA = {
         "chapter": {"type": "string", "minLength": 1},
         "kind": {"type": "string", "enum": [kind.value for kind in QuestionKind]},
         "stem_markdown": {"type": "string", "minLength": 1},
-        "options": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["value", "markdown"], "properties": {"value": {"type": "string"}, "markdown": {"type": "string"}}}},
+        "options": {"type": "array", "items": OPTION_SCHEMA},
         "answer": {"type": ["object", "null"], "additionalProperties": True},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "source_spans": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["page", "bbox"], "properties": {"page": {"type": "integer", "minimum": 1}, "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}}},
-        "diagrams": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["page", "bbox", "alt"], "properties": {"page": {"type": "integer", "minimum": 1}, "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}, "alt": {"type": "string"}}}},
+        "diagrams": {"type": "array", "items": DIAGRAM_SCHEMA},
     },
 }
 SCHEMA = {"name": "jee_seed_page_window", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": ["questions"], "properties": {"questions": {"type": "array", "items": ITEM_SCHEMA}}}}
@@ -115,7 +117,7 @@ def normalized_options(options: object) -> list[dict]:
         if isinstance(option, str):
             result.append({"value": chr(97 + index), "markdown": option})
         elif isinstance(option, dict):
-            result.append({"value": str(option.get("value", chr(97 + index))), "markdown": str(option.get("markdown") or option.get("text") or "")})
+            result.append({"value": str(option.get("value", chr(97 + index))), "markdown": str(option.get("markdown") or option.get("text") or ""), **({"requires_diagram": bool(option["requires_diagram"])} if "requires_diagram" in option else {})})
     return result
 
 
@@ -223,7 +225,7 @@ def page_windows(limit: int, pages_per_request: int) -> Iterable[tuple[list[int]
         yield core, visible
 
 
-def extract_window(document: fitz.Document, subject: str, core: list[int], visible: list[int]) -> tuple[list[dict], dict]:
+def extract_window(document: fitz.Document, subject: str, core: list[int], visible: list[int], regions=None, texts=None) -> tuple[list[dict], dict]:
     if not settings().openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
     context = []
@@ -231,10 +233,13 @@ def extract_window(document: fitz.Document, subject: str, core: list[int], visib
         text = document[page_no - 1].get_text("text", sort=True)
         context.append(f"--- PAGE {page_no} ---\n{text[:18000]}")
     content = [{"type": "text", "text": f"Subject: {subject}. Extract questions that START on core pages {core}. Visible pages are {visible}. Native text context:\n" + "\n".join(context)}]
-    for page_no in visible:
-        image = document[page_no - 1].get_pixmap(matrix=fitz.Matrix(1.45, 1.45), alpha=False).tobytes("png")
-        content.extend([{"type": "text", "text": f"PDF page {page_no}"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode()}}])
+    if regions is None:
+        regions = image_regions(document,set(visible)) + vector_regions(document,set(visible))
+    if texts is None:
+        texts = [page.get_text("text") if i+1 in visible else "" for i,page in enumerate(document)]
+    content += visual_context(document,min(visible)-1,max(visible)-1,texts,regions,settings().max_rendered_pdf_bytes)
     payload = {"model": settings().openrouter_model, "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}], "response_format": {"type": "json_schema", "json_schema": SCHEMA}, "provider": {"require_parameters": True}, "stream": False}
+    payload=model_visual_request(payload,settings().openrouter_model)
     last_error=None
     for attempt in range(4):
         try:
@@ -242,7 +247,7 @@ def extract_window(document: fitz.Document, subject: str, core: list[int], visib
             response.raise_for_status(); body = response.json()
             parsed = json.loads(body["choices"][0]["message"]["content"])
             if not isinstance(parsed.get("questions"), list): raise ValueError("Provider returned no questions array")
-            return parsed["questions"], body.get("usage") or {}
+            return mark_scope_conflicts(ground_question_spans(canonical_visual_response(parsed,payload)["questions"],document)), body.get("usage") or {}
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             last_error=exc
             if attempt == 3: break
@@ -252,7 +257,8 @@ def extract_window(document: fitz.Document, subject: str, core: list[int], visib
     raise RuntimeError(f"OpenRouter extraction failed for core pages {core}") from last_error
 
 
-def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocument, subject: str, document: fitz.Document, item: dict, core: list[int], threshold: float) -> bool:
+def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocument, subject: str, document: fitz.Document, item: dict, core: list[int], threshold: float, regions: list[dict] | None = None) -> bool:
+    item = normalize_item(item)
     spans = clean_spans(item, document)
     if not spans or spans[0]["page"] not in core:
         return False
@@ -275,18 +281,16 @@ def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocum
         return False
     chapter = re.sub(r"\s+", " ", str(item.get("chapter") or "")).strip() or "Unmapped chapter"
     subject_node, chapter = taxonomy_nodes(db, bank, subject, chapter)
-    diagrams=[]
-    for index, raw in enumerate(item.get("diagrams") or []):
-        if not isinstance(raw, dict) or not (diagram := valid_diagram(raw, spans, document)):
-            continue
-        page = document[diagram["page"] - 1]; x0, y0, x1, y1 = diagram["bbox"]
-        png = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=fitz.Rect(x0, y0, x1, y1), alpha=False).tobytes("png")
-        key = f"seed-diagrams/{bank.id}/{subject.lower()}/{source.id}-{page_no}-{number}-{index}.png"
-        put(key, png, "image/png"); diagrams.append({**diagram, "object_key": key})
+    if regions is None:
+        regions = image_regions(document) + vector_regions(document)
+    visual_item = {**item, "options": options, "source_spans": spans}
+    diagrams, visual_issues = save_figures(visual_item,document,regions,f"seed-diagrams/{bank.id}/{subject.lower()}/{source.id}-{page_no}-{number}",put)
+    if item.get("_visual_options_recovered"):
+        visual_issues.append("diagram_options_recovered")
     # An A--D answer-key label is not a meaningful answer for a written
     # question, so do not expose it as one after normalizing its type.
     answer = None if kind == QuestionKind.SUBJECTIVE and len(options) < 2 else normalize_answer(item.get("answer"), options)
-    interaction = {"seed_mode": "openrouter_text_first", "seed_status": "awaiting_native_answer_solution_verification", "source_document_id": source.id, "source_page": page_no, "model": settings().openrouter_model, "diagram_validation": "bounded_figure_only"}
+    interaction = {"seed_mode": "openrouter_text_first", "seed_status": "awaiting_native_answer_solution_verification", "source_document_id": source.id, "source_page": page_no, "model": settings().openrouter_model, "diagram_validation": "figures_v3", "ingestion_issues": visual_issues}
     q = Question(id=uid(), owner_id=owner.id, bank_id=bank.id, scope=QuestionScope.GLOBAL, source_number=number, source_key=source_key, kind=kind, stem_markdown=stem, options=options, answer=answer, solution_markdown=None, diagrams=diagrams, source_spans=spans, interaction=interaction, confidence=confidence, approved_at=None)
     db.add(q); db.flush(); db.add(QuestionTaxonomy(question_id=q.id, taxonomy_node_id=subject_node.id)); db.add(QuestionTaxonomy(question_id=q.id, taxonomy_node_id=chapter.id)); return True
 
@@ -294,7 +298,7 @@ def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocum
 def publish_verified(db: Session, bank: QuestionBank, threshold: float, allow_missing_solution: bool = False) -> dict[str, int]:
     now=datetime.now(timezone.utc); result={"published":0,"review":0}
     for q in db.query(Question).filter_by(bank_id=bank.id, scope=QuestionScope.GLOBAL):
-        ready=bool(q.answer and (q.solution_markdown or allow_missing_solution) and q.confidence is not None and q.confidence >= threshold and q.source_spans)
+        ready=bool(q.answer and (q.solution_markdown or allow_missing_solution) and q.confidence is not None and q.confidence >= threshold and q.source_spans and not (q.interaction or {}).get("ingestion_issues"))
         q.approved_at=now if ready else None
         interaction=dict(q.interaction or {}); interaction["seed_status"]=("published_confidence_gated" if q.solution_markdown else "published_answer_key_gated") if ready else "review_required"
         q.interaction=interaction; result["published" if ready else "review"]+=1
@@ -349,14 +353,16 @@ def main() -> None:
                     subject=args.subject or subject_from_filename(path.name); source=source_document(db,owner,bank,path)
                     job = seed_checkpoint(db, owner, bank, source); progress = checkpoint_meta(job)
                     completed_through = int(progress.get("extracted_through_page") or 0)
+                    regions = image_regions(document) + vector_regions(document)
+                    page_texts = [page.get_text("text") for page in document]
                     for core,visible in page_windows(limit,args.pages_per_request):
                         if core[-1] <= completed_through:
                             continue
                         print(f"Extracting {path.name}: core pages {core[0]}-{core[-1]}", flush=True)
-                        items,window_usage=extract_window(document,subject,core,visible)
+                        items,window_usage=extract_window(document,subject,core,visible,regions,page_texts)
                         for key in usage: usage[key]+=int(window_usage.get(key,0) or 0)
                         for item in items:
-                            if isinstance(item,dict) and store_item(db,bank,owner,source,subject,document,item,core,args.publish_threshold): total+=1
+                            if isinstance(item,dict) and store_item(db,bank,owner,source,subject,document,item,core,args.publish_threshold,regions): total+=1
                         db.commit()
                         save_checkpoint(db, job, extracted_through_page=core[-1])
                     # The verified answer key/worked solution remains authoritative;

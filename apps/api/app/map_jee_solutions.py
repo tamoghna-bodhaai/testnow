@@ -552,7 +552,7 @@ def map_pdf(
                 else:
                     matrix_choices = sorted(target_labels)
                 interaction.update({"response_format": "row_to_many_columns", "matrix_items": matrix_items, "matrix_choices": matrix_choices})
-            if publish:
+            if publish and not (question.interaction or {}).get("ingestion_issues"):
                 question.approved_at = now
                 stats["published"] += 1
         else:

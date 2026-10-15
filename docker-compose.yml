@@ -37,8 +37,8 @@ services:
       COOKIE_SECURE: "false"
       CORS_ORIGINS: http://localhost:3000
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-qwen/qwen3.5-122b-a10b}
-      OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-google/gemini-3.1-flash-lite}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3.1-flash-lite}
+      OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-90}
       SEED_DEMO_DATA: "false"
     depends_on: [postgres, redis, objectstore]
@@ -57,8 +57,8 @@ services:
       SESSION_SECRET: development-only-change-me
       SUPER_ADMIN_ACCESS_CODE: ${SUPER_ADMIN_ACCESS_CODE:-12345}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-qwen/qwen3.5-122b-a10b}
-      OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-google/gemini-3.1-flash-lite}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3.1-flash-lite}
+      OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-}
       OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-90}
       SEED_DEMO_DATA: "false"
     depends_on: [postgres, redis, objectstore]

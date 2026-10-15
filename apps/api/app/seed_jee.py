@@ -20,6 +20,7 @@ from .db import SessionLocal
 from .models import Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode, User
 from .security import uid
 from .storage import put
+from .figures import image_regions, vector_regions, save_figures
 
 BANK_SLUG="jee-advanced"
 QUESTION=re.compile(r"(?m)^\s*(\d{1,3})\.\s+")
@@ -111,6 +112,7 @@ def seed_pdf(db:Session, owner:User, path:Path, publish:bool=False)->int:
     existing={(str((q.interaction or {}).get("source_document_id")),int((q.interaction or {}).get("source_page",-1)),q.source_number) for q in db.query(Question).filter_by(bank_id=bank.id).all()}
     subject_node=find_or_create_node(db,bank.id,None,"subject",subject)
     document=fitz.open(path)
+    regions=image_regions(document)+vector_regions(document)
     chapter="Unmapped chapter";kind=QuestionKind.SINGLE;created=0
     for page_number,page in enumerate(document,1):
         text=page.get_text("text",sort=True)
@@ -130,9 +132,14 @@ def seed_pdf(db:Session, owner:User, path:Path, publish:bool=False)->int:
             image=source_crop(page,top,next_y)
             key=f"seed-diagrams/{bank.id}/{subject.lower()}/{page_number}-{match.group(1)}-{uid()}.png";put(key,image,"image/png")
             interaction={"source_document_id":source.id,"source_page":page_number,"seed_status":"needs_answer_review","taxonomy_status":"chapter_mapped"}
+            # A source preview is audit material, never a question diagram.
+            interaction["source_preview"]={"object_key":key,"page":page_number,"bbox":[0,top,page.rect.width,next_y]}
+            visual_item={"stem_markdown":stem,"options":options,"source_spans":[{"page":page_number,"bbox":[0,top,page.rect.width,next_y]}],"diagrams":[]}
+            diagrams,visual_issues=save_figures(visual_item,document,regions,f"seed-diagrams/{bank.id}/{subject.lower()}/{uid()}",put)
+            interaction["ingestion_issues"]=visual_issues+["diagram_native_seed_review"]
             if kind==QuestionKind.MATRIX:interaction["response_format"]="row_to_many_columns"
             if kind==QuestionKind.NUMERICAL:interaction["tolerance"]=1e-6
-            question=Question(id=uid(),owner_id=owner.id,bank_id=bank.id,scope=QuestionScope.GLOBAL,source_number=match.group(1),kind=kind,stem_markdown=stem,options=options,answer=None,solution_markdown=None,diagrams=[{"object_key":key,"page":page_number,"bbox":[0,top,page.rect.width,next_y],"alt":"Source rendering (includes any figure or graph)"}],source_spans=[{"page":page_number,"bbox":[0,top,page.rect.width,next_y]}],interaction=interaction,confidence=1.0,approved_at=datetime.now(timezone.utc) if publish else None)
+            question=Question(id=uid(),owner_id=owner.id,bank_id=bank.id,scope=QuestionScope.GLOBAL,source_number=match.group(1),kind=kind,stem_markdown=stem,options=options,answer=None,solution_markdown=None,diagrams=diagrams,source_spans=[{"page":page_number,"bbox":[0,top,page.rect.width,next_y]}],interaction=interaction,confidence=1.0,approved_at=None)
             if publish and not question.answer:raise ValueError("Native seed import cannot publish without reviewed answer keys")
             db.add(question);db.flush();db.add(QuestionTaxonomy(question_id=question.id,taxonomy_node_id=subject_node.id));db.add(QuestionTaxonomy(question_id=question.id,taxonomy_node_id=chapter_node.id));created+=1
             existing.add((source.id,page_number,match.group(1)))

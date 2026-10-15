@@ -13,11 +13,10 @@ class Settings(BaseSettings):
     s3_bucket: str = "testnow"
     s3_region: str = "auto"
     openrouter_api_key: str | None = None
-    # Native vision plus strict JSON output is the critical path for document
-    # extraction.  This is materially cheaper than the former Flash default
-    # while retaining image input and structured-output support.
-    openrouter_model: str = "qwen/qwen3.5-122b-a10b"
-    openrouter_fallback_model: str | None = "google/gemini-3.1-flash-lite"
+    # Gemini image understanding plus structured figure/option ownership.
+    # Explicit deployment environment settings continue to take precedence.
+    openrouter_model: str = "google/gemini-3.1-flash-lite"
+    openrouter_fallback_model: str | None = None
     openrouter_timeout_seconds: int = 90
     # Applies per source file.  The web relay is configured to the same 200 MB
     # ceiling, so large chapter documents are rejected consistently.

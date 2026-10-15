@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import { FigureEditor } from "./figure-editor";
 
 type User = {
   id: string;
@@ -40,7 +41,7 @@ type Question = {
   confidence?: number;
   approved?: boolean;
   scoring?: any;
-  diagrams?: { alt?: string; role?: string }[];
+  diagrams?: { alt?: string; role?: string; option_index?: number | null; object_key?: string; page?: number; bbox?: number[] }[];
   interaction?: any;
   scope?: "private" | "global";
   taxonomy?: { id: string; parent_id?: string; kind: string; name: string }[];
@@ -1679,6 +1680,10 @@ function ReviewQuestion({
   return (
     <Card className="review-question">
       <QuestionCard q={question} mode="teacher" />
+      <FigureEditor questionId={question.id} options={question.options} api={api} done={onChanged} />
+      {(question.interaction?.ingestion_issues || []).length > 0 && <Notice kind="error">
+        Needs review: {question.interaction.ingestion_issues.join(", ")}
+      </Notice>}
       {!question.approved && (
         <div className="answer-key-editor">
           <div>
@@ -2820,6 +2825,10 @@ function QuestionBankManager({
       .includes(bankQuery.trim().toLowerCase());
     return matchesQuery && (bankStatus === "all" || bank.status === bankStatus);
   });
+  const totalQuestionCount = banks.reduce(
+    (total, bank) => total + bank.question_count,
+    0,
+  );
   return (
     <div className="page bank-manager">
       <p className="eyebrow">SUPER ADMIN · QUESTION BANKS</p>
@@ -2850,6 +2859,7 @@ function QuestionBankManager({
             <div className="bank-navigator-title">
               <h2>Banks</h2>
               <span>{banks.length} total</span>
+              <span>{totalQuestionCount.toLocaleString()} questions</span>
             </div>
             <div className="bank-filters">
               <input
@@ -3009,7 +3019,9 @@ function QuestionBankManager({
                   </button>
                 )}
                 <p>
-                  Showing {visibleQuestions?.length || 0} questions
+                  {selectedImport
+                    ? `Showing ${visibleQuestions?.length || 0} questions`
+                    : `Showing the latest ${visibleQuestions?.length || 0} of ${detail.question_count} questions`}
                   {selectedImport ? " from this document" : " from this bank"},
                   organized by topic. Open a topic to browse its questions.
                 </p>
@@ -3160,15 +3172,16 @@ function BankQuestionEditor({
   const save = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
+    const approve = (e.nativeEvent as SubmitEvent).submitter?.getAttribute("data-action") !== "draft";
     setBusy(true);
     setError("");
     try {
       const options = JSON.parse(String(form.get("options") || "[]"));
       const answer = JSON.parse(String(form.get("answer") || "null"));
       await api(
-        `/admin/question-banks/${bankId}/questions/${question.id}/resolve`,
+        approve ? `/admin/question-banks/${bankId}/questions/${question.id}/resolve` : `/questions/${question.id}/draft`,
         {
-          method: "POST",
+          method: approve ? "POST" : "PUT",
           body: JSON.stringify({
             source_number: question.source_number,
             kind: form.get("kind"),
@@ -3234,6 +3247,7 @@ function BankQuestionEditor({
       {tab === "rendered" && (
         <div className="bank-rendered-question">
           <QuestionCard q={question} mode="teacher" />
+          <FigureEditor questionId={question.id} options={question.options} api={api} done={done} />
         </div>
       )}
       {tab === "json" && (
@@ -3307,7 +3321,8 @@ function BankQuestionEditor({
             />
           </label>
           <div className="review-buttons">
-            <button type="submit" disabled={busy}>
+            <button type="submit" data-action="draft" className="secondary-action" disabled={busy}>Save draft</button>
+            <button type="submit" data-action="approve" disabled={busy}>
               {busy ? "Saving…" : "Save and approve"}
             </button>
             <button type="button" className="secondary-action" onClick={cancel}>
@@ -3324,8 +3339,27 @@ function BankQuestionEditor({
 function optionMarkdown(option: any) {
   if (typeof option === "string") return option;
   if (option && typeof option === "object")
-    return option.markdown || option.text || option.value || "";
+    return "markdown" in option ? (option.markdown ?? "") : (option.text || option.value || "");
   return String(option || "");
+}
+function QuestionDiagram({ q, diagram, index }: {
+  q: Question; diagram: NonNullable<Question["diagrams"]>[number]; index: number;
+}) {
+  const [broken, setBroken] = useState(false);
+  const src = `/api/media/questions/${q.id}/${index}${diagram.object_key ? `?asset=${encodeURIComponent(diagram.object_key)}` : ""}`;
+  useEffect(() => setBroken(false), [src]);
+  return broken ? (
+    <div className="diagram-error">Diagram unavailable: {diagram.alt || "Source figure"}</div>
+  ) : (
+    <img className="diagram" src={src} alt={diagram.alt || "Source figure"} onError={() => setBroken(true)} />
+  );
+}
+function OptionContent({ q, index }: { q: Question; index: number }) {
+  return <div className="option-content">
+    <Markdown value={optionMarkdown(q.options[index])} />
+    {(q.diagrams || []).map((diagram, i) => diagram.role === "option" && diagram.option_index === index
+      ? <QuestionDiagram key={i} q={q} diagram={diagram} index={i} /> : null)}
+  </div>;
 }
 function QuestionCard({
   q,
@@ -3337,7 +3371,6 @@ function QuestionCard({
   studentAnswer?: any;
 }) {
   const [showSolution, setShowSolution] = useState(false),
-    [broken, setBroken] = useState<Set<number>>(new Set()),
     correct = answerOptionIndex(q),
     correctOptions = new Set<number>(
       Array.isArray(q.answer?.options)
@@ -3367,24 +3400,12 @@ function QuestionCard({
             : "",
     questionDiagrams = (q.diagrams || [])
       .map((d, i) => ({ d, i }))
-      .filter(({ d }) => d.role !== "solution"),
+      .filter(({ d }) => d.role !== "solution" && d.role !== "option"),
     solutionDiagrams = (q.diagrams || [])
       .map((d, i) => ({ d, i }))
       .filter(({ d }) => d.role === "solution"),
     renderDiagram = ({ d, i }: { d: any; i: number }) =>
-      broken.has(i) ? (
-        <div className="diagram-error" key={i}>
-          Diagram unavailable: {d.alt || "Question diagram"}
-        </div>
-      ) : (
-        <img
-          className="diagram"
-          key={i}
-          src={`/api/media/questions/${q.id}/${i}`}
-          alt={d.alt || "Question diagram"}
-          onError={() => setBroken((previous) => new Set(previous).add(i))}
-        />
-      );
+      <QuestionDiagram key={i} q={q} diagram={d} index={i} />;
   return (
     <article className="question">
       <b>
@@ -3407,7 +3428,7 @@ function QuestionCard({
               <span className="option-letter">
                 {String.fromCharCode(65 + i)}
               </span>
-              <Markdown value={optionMarkdown(o)} />
+              <OptionContent q={q} index={i} />
               {isCorrect && (
                 <span className="answer-badge">Correct answer</span>
               )}
@@ -3422,7 +3443,7 @@ function QuestionCard({
       {showAnswer && (
         <small className="answer-summary">Answer key: {answerSummary}</small>
       )}
-      {q.solution_markdown && mode !== "exam" && (
+      {(q.solution_markdown || solutionDiagrams.length > 0) && mode !== "exam" && (
         <>
           <button
             type="button"
@@ -3434,7 +3455,7 @@ function QuestionCard({
           {showSolution && (
             <div className="solution">
               <strong>Worked solution</strong>
-              <Markdown value={q.solution_markdown} />
+              {q.solution_markdown && <Markdown value={q.solution_markdown} />}
               {solutionDiagrams.map(renderDiagram)}
             </div>
           )}
@@ -3575,7 +3596,7 @@ function Exam({
                     <span className="option-letter">
                       {String.fromCharCode(65 + i)}
                     </span>
-                    <Markdown value={optionMarkdown(option)} />
+                    <OptionContent q={q} index={i} />
                   </button>
                 );
               })

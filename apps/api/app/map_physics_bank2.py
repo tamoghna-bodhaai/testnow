@@ -27,6 +27,7 @@ from .db import SessionLocal
 from .map_jee_solutions import answer_for, kind_from_source_answer
 from .models import Question, QuestionBank, QuestionKind, QuestionScope, SourceDocument, User
 from .storage import get, put
+from .figures import coverage, image_regions, vector_regions, save_figures
 
 
 BANK_SLUG = "physics-bank-2"
@@ -126,32 +127,11 @@ def solution_region(document: fitz.Document, header: dict, all_headers: dict[str
 
 
 def solution_diagram(page: fitz.Page, clip: fitz.Rect | None) -> fitz.Rect | None:
-    """Find a meaningful vector figure inside a mapped solution block.
-
-    This intentionally ignores glyph-sized drawings and never returns the full
-    solution block.  Question diagrams are already stored by the extractor;
-    this covers distinct worked-solution sketches only.
-    """
+    """Compatibility helper backed by the shared complete-figure detector."""
     if clip is None:
         return None
-    rectangles = []
-    for drawing in page.get_drawings():
-        rect = drawing["rect"] & clip
-        if rect.is_empty or rect.width < 18 or rect.height < 18 or rect.get_area() < 450:
-            continue
-        if rect.get_area() > clip.get_area() * 0.72:
-            continue
-        rectangles.append(rect)
-    if not rectangles:
-        return None
-    union = fitz.Rect(rectangles[0])
-    for rect in rectangles[1:]:
-        gap_x = max(0, rect.x0 - union.x1, union.x0 - rect.x1)
-        gap_y = max(0, rect.y0 - union.y1, union.y0 - rect.y1)
-        if union.intersects(rect) or max(gap_x, gap_y) < 28:
-            union |= rect
-    padded = (union + (-5, -5, 5, 5)) & page.rect
-    return padded if padded.width >= 24 and padded.height >= 24 else None
+    candidates=vector_regions(page.parent,{page.number+1})
+    return next((fitz.Rect(r["bbox"]) for r in candidates if coverage(fitz.Rect(r["bbox"]),clip)>=.95),None)
 
 
 def corrected_kind(question: Question, raw: str) -> QuestionKind:
@@ -168,6 +148,7 @@ def map_source(db: Session, bank: QuestionBank, source: SourceDocument, dry_run:
     document = fitz.open(stream=raw_pdf, filetype="pdf")
     try:
         headers, key_pages = solution_headers(document)
+        regions = image_regions(document) + vector_regions(document)
         questions = [
             question for question in db.query(Question).filter_by(bank_id=bank.id, scope=QuestionScope.GLOBAL)
             if (question.interaction or {}).get("source_document_id") == source.id
@@ -202,21 +183,20 @@ def map_source(db: Session, bank: QuestionBank, source: SourceDocument, dry_run:
                 "answer_key_pages": key_pages,
                 "solution_header": {"page": selected["page"], "printed_answer": selected["raw_answer"]},
             }
-            if answer or kind == QuestionKind.SUBJECTIVE:
-                question.approved_at = now if publish else question.approved_at
-                if publish:
-                    stats["published"] += 1
             if clip:
-                diagram_rect = solution_diagram(document[selected["page"] - 1], clip)
-                if diagram_rect:
-                    key = f"seed-diagrams/{bank.id}/physics/solutions/{source.id}-{question.id}-{selected['page']}.png"
-                    image = document[selected["page"] - 1].get_pixmap(clip=diagram_rect, matrix=fitz.Matrix(1.8, 1.8), alpha=False).tobytes("png")
-                    put(key, image, "image/png")
-                    diagrams = [item for item in (question.diagrams or []) if item.get("object_key") != key]
-                    diagrams.append({"object_key": key, "page": selected["page"], "bbox": [round(value, 2) for value in diagram_rect], "alt": "Worked-solution diagram", "role": "solution"})
-                    question.diagrams = diagrams
-                    stats["solution_diagrams"] += 1
-            interaction["seed_status"] = "published_native_answer_and_solution" if publish and (answer or kind == QuestionKind.SUBJECTIVE) else "native_answer_and_solution_mapped"
+                selected_regions=[r for r in regions if r["page"]==selected["page"] and coverage(fitz.Rect(r["bbox"]),clip)>=.95]
+                visual_item={"stem_markdown":solution,"options":[],"source_spans":[{"page":selected["page"],"bbox":list(clip)}],
+                             "diagrams":[{**r,"role":"solution","option_index":None} for r in selected_regions]}
+                diagrams,visual_issues=save_figures(visual_item,document,regions,f"seed-diagrams/{bank.id}/physics/solutions/{source.id}-{question.id}",put)
+                interaction["ingestion_issues"]=list(dict.fromkeys((interaction.get("ingestion_issues") or [])+visual_issues))
+                if diagrams:
+                    question.diagrams=[d for d in (question.diagrams or []) if d.get("role")!="solution" or d.get("page")!=selected["page"]]+diagrams
+                    stats["solution_diagrams"]+=len(diagrams)
+            ready=bool((answer or kind==QuestionKind.SUBJECTIVE) and not interaction.get("ingestion_issues"))
+            if publish:
+                question.approved_at=now if ready else None
+                stats["published"]+=int(ready)
+            interaction["seed_status"]="published_native_answer_and_solution" if publish and ready else "native_answer_and_solution_mapped"
             question.interaction = interaction
         if not dry_run:
             db.commit()

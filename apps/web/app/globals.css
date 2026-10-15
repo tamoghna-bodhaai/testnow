@@ -67,3 +67,7 @@ button:not(nav button):not(.logo){background:var(--blue);color:#fff;padding:11px
 
 /* New bank follows the compact vertical form from the approved workbench reference. */
 .new-bank-card .stacked-form{grid-template-columns:1fr;align-content:start;align-items:stretch;gap:11px;flex:0;padding:15px 18px 16px}.new-bank-fields{grid-template-columns:1fr;gap:10px}.new-bank-card label{display:grid;gap:5px}.new-bank-card input{margin:0;min-width:0}.new-bank-card button{width:100%;min-height:40px;margin-top:1px}.bank-workspace{align-items:start}.new-bank-card{min-height:264px}
+
+.option-content{flex:1;min-width:0;text-align:left}.option-content .diagram{max-width:100%;height:auto;margin:8px 0}.option-content .markdown:empty{display:none}
+.figure-review{border:1px solid var(--line);border-radius:8px;padding:14px;margin:14px 0}.figure-review-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px}.figure-review-controls label{display:grid;gap:5px}.figure-source-canvas{display:block;width:100%;max-width:750px;height:auto;border:1px solid var(--line);touch-action:none;cursor:crosshair;background:white}.figure-review>label{display:flex;align-items:center;gap:8px;margin:10px 0}
+.figure-review>label>input{width:auto;flex:0 0 auto}
