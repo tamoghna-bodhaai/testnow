@@ -158,6 +158,12 @@ def run_bank_import(job_id: str) -> None:
         bank=db.get(QuestionBank,job.bank_id);source=db.get(SourceDocument,job.question_document_id)
         if not bank or not source:raise ValueError("Bank or source document not found")
         meta=dict(job.extraction_meta or {});subject=str(meta.get("subject") or "Unclassified")
+        # A queued duplicate or worker restart must not revive an explicitly
+        # paused material. Only the resume endpoint clears this durable flag.
+        if meta.get("pause_requested"):
+            job.status=ImportStatus.UPLOADED;job.extraction_meta={**meta,"phase":"Paused by administrator"};db.commit();return
+        if meta.get("cancel_requested"):
+            job.status=ImportStatus.FAILED;job.error="Cancelled by administrator";job.extraction_meta={**meta,"phase":"Cancelled"};db.commit();return
         job.status=ImportStatus.PROCESSING;job.extraction_meta={**meta,"phase":"Reading source"};db.commit()
         raw=_pdf_bytes(source);reader=PdfReader(BytesIO(raw));page_count=len(reader.pages)
         if not page_count:raise ValueError("The document contains no pages")
@@ -200,8 +206,16 @@ def run_bank_import(job_id: str) -> None:
                 minimum=1 if expected_questions("\n".join(page_texts[start:end])) else 0
                 parsed=request_extraction(payload,"TestNow Bank Importer",minimum)
             except Exception as page_error:
-                failed_pages.append({"page":start+1,"error":str(page_error)[:300]})
-                job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit();continue
+                message=str(page_error)[:300]
+                failed_pages.append({"page":start+1,"error":message})
+                errors=list(meta.get("error_log") or [])[-49:]+[{"page":start+1,"message":message}]
+                # Authentication, quota and model-access errors cannot improve
+                # on the next page. Stop immediately, preserve the extracted
+                # questions, and present a useful material-level error.
+                if "403" in message or "key limit" in message.lower() or "api key" in message.lower():
+                    job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access."
+                    job.extraction_meta={**meta,"phase":"Stopped: provider access error","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors};db.commit();return
+                job.extraction_meta={**meta,"phase":f"Skipped unreadable page {start+1} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors};meta=dict(job.extraction_meta);db.commit();continue
             added, new_flags, new_skipped=_save_questions(db,bank,job,source,subject,rendered,regions,parsed.get("questions",[]),numbers,set(range(start+1,end+1)),answer_lookup_text);saved+=added;flagged+=new_flags;skipped+=new_skipped
             job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
         job.status=ImportStatus.REVIEW if flagged or failed_pages else ImportStatus.APPROVED

@@ -49,6 +49,10 @@ class ImportJob(Timestamped, Base):
     bank_id: Mapped[str | None] = mapped_column(ForeignKey("question_banks.id", ondelete="CASCADE"), index=True)
     status: Mapped[ImportStatus] = mapped_column(Enum(ImportStatus), default=ImportStatus.UPLOADED)
     error: Mapped[str | None] = mapped_column(Text); extraction_meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    # A source document is a separately reviewable and releasable material.
+    # It may be fully reviewed without becoming visible in a live bank until an
+    # administrator explicitly confirms publication for that material.
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 class QuestionBank(Timestamped, Base):
     __tablename__="question_banks"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
