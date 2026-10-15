@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-import csv, io, re
+import csv, io, logging, re
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -627,7 +627,15 @@ def question_view(q:Question, db:Session|None=None):
 @app.get("/questions")
 def questions(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     rows=db.query(Question).filter((Question.owner_id==user.id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
-    return [question_view(q,db) for q in rows]
+    # Do not make the whole teacher library unavailable because a legacy import
+    # has malformed optional display metadata. It remains repairable in review.
+    visible=[]
+    for question in rows:
+        try:
+            visible.append(question_view(question,db))
+        except (KeyError, TypeError, ValueError) as exc:
+            logging.getLogger(__name__).warning("Skipping malformed question %s in library: %s",question.id,exc)
+    return visible
 @app.get("/question-banks")
 def question_banks(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     return [{"id":b.id,"slug":b.slug,"name":b.name,"exam_code":b.exam_code,"is_global":b.is_global,"question_count":db.query(Question).filter_by(bank_id=b.id,scope=QuestionScope.GLOBAL).filter(Question.approved_at.is_not(None)).count()} for b in db.query(QuestionBank).filter_by(is_global=True).order_by(QuestionBank.name)]

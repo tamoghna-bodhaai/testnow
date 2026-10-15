@@ -2114,7 +2114,7 @@ function Builder({
               <div className="selection-preview">
                 {selected.slice(0, 4).map((id, index) => {
                   const question = selectedQuestions.find((item) => item.id === id);
-                  return <span key={id}>Q{questionNumber(question?.source_number || String(index + 1))}</span>;
+                  return <span key={id}>{questionNumber(question?.source_number || String(index + 1))}</span>;
                 })}
                 {selected.length > 4 && <span>+{selected.length - 4} more</span>}
               </div>
@@ -2122,7 +2122,7 @@ function Builder({
                 <summary>Manage selected questions</summary>
                 <div>{selected.map((id, index) => {
                   const question = selectedQuestions.find((item) => item.id === id);
-                  return <span key={id}><b>Q{questionNumber(question?.source_number || String(index + 1))}</b><button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button></span>;
+                  return <span key={id}><b>{questionNumber(question?.source_number || String(index + 1))}</b><button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button></span>;
                 })}</div>
               </details>
             </> : <p>Add questions from the library to build your test.</p>}
