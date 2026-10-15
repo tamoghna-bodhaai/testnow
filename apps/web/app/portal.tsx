@@ -1680,7 +1680,7 @@ function ReviewQuestion({
   return (
     <Card className="review-question">
       <QuestionCard q={question} mode="teacher" />
-      <FigureEditor questionId={question.id} options={question.options} api={api} done={onChanged} />
+      {needsFigureAdjustment(question) && <FigureEditor questionId={question.id} options={question.options} api={api} done={onChanged} />}
       {(question.interaction?.ingestion_issues || []).length > 0 && <Notice kind="error">
         Needs review: {question.interaction.ingestion_issues.join(", ")}
       </Notice>}
@@ -2559,6 +2559,8 @@ function QuestionBankManager({
     [busy, setBusy] = useState(false),
     [editing, setEditing] = useState(false),
     [editingQuestion, setEditingQuestion] = useState<Question | null>(null),
+    [figureEditing, setFigureEditing] = useState(false),
+    [figureRevalidation, setFigureRevalidation] = useState<any>(null),
     [selectedImport, setSelectedImport] = useState<ImportJob | null>(null),
     [selectedQuestions, setSelectedQuestions] = useState<Question[] | null>(
       null,
@@ -2588,7 +2590,7 @@ function QuestionBankManager({
         (job.status === "uploaded" || job.status === "processing") &&
         !job.meta?.pause_requested,
     );
-    if (!detail?.id || !active) return;
+    if (!detail?.id || !active || figureEditing) return;
     const timer = window.setInterval(() => {
       api(`/admin/question-banks/${detail.id}`)
         .then(setDetail)
@@ -2596,7 +2598,24 @@ function QuestionBankManager({
       load().catch(() => {});
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [detail?.id, detail?.imports]);
+  }, [detail?.id, detail?.imports, figureEditing]);
+  useEffect(() => {
+    if (!detail?.id || !figureRevalidation || !["queued", "running"].includes(figureRevalidation.status)) return;
+    const timer = window.setInterval(() => {
+      api(`/admin/question-banks/${detail.id}/figure-revalidation`).then(setFigureRevalidation).catch((e) => setError(e.message));
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [detail?.id, figureRevalidation?.status]);
+  const revalidateFigures = async () => {
+    if (!detail) return;
+    setBusy(true); setError("");
+    try {
+      const run = await api(`/admin/question-banks/${detail.id}/figure-revalidation`, { method: "POST" });
+      setFigureRevalidation(run);
+      notify(`Figure revalidation queued (${String(run.run_id).slice(0, 8)}).`);
+    } catch (e: any) { setError(e.message); }
+    finally { setBusy(false); }
+  };
   const create = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const form = e.currentTarget;
@@ -2925,14 +2944,17 @@ function QuestionBankManager({
                   </div>
                   <div className="bank-actions">
                     {detail.status === "published" && <span className="badge published">Live</span>}
-                    <button onClick={publish} disabled={busy}>Publish all ready materials</button>
+                    <button type="button" onClick={publish} disabled={busy}>Publish all ready materials</button>
+                    <button type="button" className="secondary-action" onClick={revalidateFigures} disabled={busy}>Revalidate figures</button>
                     <button
+                      type="button"
                       className="secondary-action"
                       onClick={() => setEditing(!editing)}
                     >
                       Edit details
                     </button>
                     <button
+                      type="button"
                       className="text-danger"
                       onClick={remove}
                       disabled={busy}
@@ -2941,6 +2963,12 @@ function QuestionBankManager({
                     </button>
                   </div>
                 </div>
+                {figureRevalidation && <Notice kind={figureRevalidation.status === "failed" ? "error" : "info"}>
+                  Figure revalidation: {figureRevalidation.status}
+                  {typeof figureRevalidation.processed === "number" ? ` · ${figureRevalidation.processed}/${figureRevalidation.total} checked` : ""}
+                  {figureRevalidation.status === "completed" ? ` · ${figureRevalidation.cleared || 0} false flags cleared, ${figureRevalidation.needs_review || 0} need review.` : ""}
+                  {figureRevalidation.report_key && <><span> </span><a href={`/api/admin/question-banks/${detail.id}/figure-revalidation/${figureRevalidation.run_id}/report`}>Download audit report</a></>}
+                </Notice>}
                 {editing && (
                   <form
                     className="stacked-form compact-form"
@@ -3043,10 +3071,12 @@ function QuestionBankManager({
                           bankId={detail.id}
                           question={question}
                           done={async () => {
+                            setFigureEditing(false);
                             setEditingQuestion(null);
                             await open(detail.id);
                           }}
-                          cancel={() => setEditingQuestion(null)}
+                          cancel={() => { setFigureEditing(false); setEditingQuestion(null); }}
+                          onFigureActive={setFigureEditing}
                         />
                       )}
                     />
@@ -3060,10 +3090,12 @@ function QuestionBankManager({
                           bankId={detail.id}
                           question={question}
                           done={async () => {
+                            setFigureEditing(false);
                             setEditingQuestion(null);
                             await open(detail.id);
                           }}
-                          cancel={() => setEditingQuestion(null)}
+                          cancel={() => { setFigureEditing(false); setEditingQuestion(null); }}
+                          onFigureActive={setFigureEditing}
                         />
                       )}
                     />
@@ -3165,11 +3197,13 @@ function BankQuestionEditor({
   question,
   done,
   cancel,
+  onFigureActive,
 }: {
   bankId: string;
   question: Question;
   done: () => Promise<void>;
   cancel: () => void;
+  onFigureActive?: (active: boolean) => void;
 }) {
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
@@ -3286,7 +3320,7 @@ function BankQuestionEditor({
       {tab === "rendered" && (
         <div className="bank-rendered-question">
           <QuestionCard q={question} mode="teacher" />
-          <FigureEditor questionId={question.id} options={question.options} api={api} done={done} />
+          {needsFigureAdjustment(question) && <FigureEditor questionId={question.id} options={question.options} api={api} done={done} onActiveChange={onFigureActive} />}
           {!!(question.interaction?.ingestion_issues || []).length && (
             <div className="review-buttons warning-override-action">
               <button type="button" className="secondary-action" disabled={busy} onClick={ignoreWarningsAndApprove}>
@@ -3393,6 +3427,12 @@ function optionMarkdown(option: any) {
   if (option && typeof option === "object")
     return "markdown" in option ? (option.markdown ?? "") : (option.text || option.value || "");
   return String(option || "");
+}
+function needsFigureAdjustment(question: Question) {
+  if ((question.diagrams || []).length) return true;
+  return (question.interaction?.ingestion_issues || []).some((issue: unknown) =>
+    /^diagram_|^option_diagram_/.test(String(issue))
+  );
 }
 function QuestionDiagram({ q, diagram, index }: {
   q: Question; diagram: NonNullable<Question["diagrams"]>[number]; index: number;

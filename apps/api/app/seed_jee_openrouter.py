@@ -49,7 +49,7 @@ Classify a question as `single_choice`, `multiple_choice`, or `assertion_reason`
 SYSTEM += VISUAL_INSTRUCTIONS
 ITEM_SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["number", "chapter", "kind", "stem_markdown", "options", "answer", "confidence", "source_spans", "diagrams"],
+    "required": ["number", "chapter", "kind", "stem_markdown", "options", "answer", "confidence", "source_spans", "visual_intent", "diagrams"],
     "properties": {
         "number": {"type": "string", "minLength": 1},
         "chapter": {"type": "string", "minLength": 1},
@@ -59,6 +59,7 @@ ITEM_SCHEMA = {
         "answer": {"type": ["object", "null"], "additionalProperties": True},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "source_spans": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["page", "bbox"], "properties": {"page": {"type": "integer", "minimum": 1}, "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}}},
+        "visual_intent": {"type": "string", "enum": ["none", "required", "uncertain"]},
         "diagrams": {"type": "array", "items": DIAGRAM_SCHEMA},
     },
 }
@@ -290,7 +291,7 @@ def store_item(db: Session, bank: QuestionBank, owner: User, source: SourceDocum
     # An A--D answer-key label is not a meaningful answer for a written
     # question, so do not expose it as one after normalizing its type.
     answer = None if kind == QuestionKind.SUBJECTIVE and len(options) < 2 else normalize_answer(item.get("answer"), options)
-    interaction = {"seed_mode": "openrouter_text_first", "seed_status": "awaiting_native_answer_solution_verification", "source_document_id": source.id, "source_page": page_no, "model": settings().openrouter_model, "diagram_validation": "figures_v3", "ingestion_issues": visual_issues}
+    interaction = {"seed_mode": "openrouter_text_first", "seed_status": "awaiting_native_answer_solution_verification", "source_document_id": source.id, "source_page": page_no, "model": settings().openrouter_model, "diagram_validation": "figures_v6", "visual_intent": item.get("visual_intent", "none"), "ingestion_issues": visual_issues}
     q = Question(id=uid(), owner_id=owner.id, bank_id=bank.id, scope=QuestionScope.GLOBAL, source_number=number, source_key=source_key, kind=kind, stem_markdown=stem, options=options, answer=answer, solution_markdown=None, diagrams=diagrams, source_spans=spans, interaction=interaction, confidence=confidence, approved_at=None)
     db.add(q); db.flush(); db.add(QuestionTaxonomy(question_id=q.id, taxonomy_node_id=subject_node.id)); db.add(QuestionTaxonomy(question_id=q.id, taxonomy_node_id=chapter.id)); return True
 

@@ -16,7 +16,7 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
-from .figures import save_figures, visual_context, mark_scope_conflicts, ground_question_spans, docx_visual_inventory, docx_conversion_issues
+from .figures import save_figures, visual_context, mark_scope_conflicts, ground_question_spans, docx_visual_inventory, docx_conversion_issues, requires_source_figure, visual_intent
 from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
 
 
@@ -150,7 +150,13 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
         item,preflight_issues=prepare_item_for_ingestion(raw_item)
         if item is None:
             skipped+=1;continue
-        item["_ingestion_issues"]=preflight_issues+list(source_issues or []);number=str(item["number"]).strip()
+        # DOCX conversion inventory is source-level evidence, not a reason to
+        # mark every text question.  Surface it only for a question that has a
+        # visual candidate or an explicit visual contract.
+        source_visual_issues = list(source_issues or []) if (
+            visual_intent(item) != "none" or requires_source_figure(item)
+        ) else []
+        item["_ingestion_issues"]=preflight_issues+source_visual_issues;number=str(item["number"]).strip()
         # A source can contain a repeated number at a section boundary.  The
         # page span makes its identity stable, while repeated batch output is
         # discarded by the source-key check below.
@@ -170,7 +176,7 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
             item["answer"]=answer_from_key(number,item.get("options") or [],answer_text)
         answer=_answer_from_solution(item);issues=_issues(item,answer,diagrams);flagged+=bool(issues)
         chapter=_node(db,bank.id,subject_node.id,"chapter",str(item.get("chapter") or "Unmapped chapter"));topic_name=str(item.get("topic") or "").strip();topic=_node(db,bank.id,chapter.id,"topic",topic_name) if topic_name else None
-        interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"answer_inferred_from_solution":bool(answer and not item.get("answer"))}
+        interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"visual_intent":item.get("visual_intent","none"),"answer_inferred_from_solution":bool(answer and not item.get("answer"))}
         q=Question(id=uid(),owner_id=job.owner_id,bank_id=bank.id,scope=QuestionScope.GLOBAL,import_job_id=job.id,source_number=number,source_key=source_key,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=answer,solution_markdown=item.get("solution_markdown"),confidence=item.get("confidence"),source_spans=item.get("source_spans") or [],diagrams=diagrams,interaction=interaction,approved_at=None if issues else datetime.now(timezone.utc))
         try:
             with db.begin_nested():db.add(q);db.flush()

@@ -13,6 +13,7 @@ from .security import COOKIE, current_user, hash_password, new_session, require,
 from .services import audit, ensure_live, publish, score, safe_question_kind, snapshot_questions
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
 from .tasks import extract_import, extract_bank_import
+from .figure_repairs import revalidate_bank_figures
 from .seed import ensure_demo_data
 from .figures import is_visual_issue, option_media_issues
 
@@ -261,6 +262,32 @@ async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:l
     audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"files":len(seen_source_ids)});db.commit()
     for job in jobs_to_dispatch:extract_bank_import.delay(job.id)
     return {"bank":bank_view(bank,db),"imports":[import_view(job,db) for job in jobs]}
+
+@app.post("/admin/question-banks/{bank_id}/figure-revalidation")
+def start_figure_revalidation(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    bank=db.get(QuestionBank,bank_id)
+    if not bank:raise HTTPException(404,"Question bank not found")
+    run_id=uid()
+    audit(db,user.id,"question_bank.figure_revalidation_started","question_bank",bank.id,{"run_id":run_id})
+    db.commit()
+    revalidate_bank_figures.delay(bank.id,run_id,user.id)
+    return {"run_id":run_id,"status":"queued"}
+
+@app.get("/admin/question-banks/{bank_id}/figure-revalidation")
+def figure_revalidation_status(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    if not db.get(QuestionBank,bank_id):raise HTTPException(404,"Question bank not found")
+    jobs=db.query(ImportJob).filter_by(bank_id=bank_id).order_by(ImportJob.updated_at.desc()).all()
+    runs=[(job.extraction_meta or {}).get("figure_revalidation") for job in jobs]
+    runs=[run for run in runs if isinstance(run,dict)]
+    return max(runs,key=lambda run:run.get("finished_at") or run.get("started_at") or "") if runs else {"status":"idle"}
+
+@app.get("/admin/question-banks/{bank_id}/figure-revalidation/{run_id}/report")
+def figure_revalidation_report(bank_id:str,run_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    if not db.get(QuestionBank,bank_id):raise HTTPException(404,"Question bank not found")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}",run_id):raise HTTPException(404,"Report not found")
+    try: raw=get(f"figure-revalidation/{bank_id}/{run_id}.json")
+    except Exception: raise HTTPException(404,"Report not ready")
+    return Response(raw,media_type="application/json",headers={"Content-Disposition":f'attachment; filename="figure-revalidation-{run_id}.json"'})
 
 @app.post("/admin/question-banks/{bank_id}/questions/{question_id}/resolve")
 def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db),ignore_warnings:bool=False):

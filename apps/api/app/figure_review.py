@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from .db import get_db
-from .figures import extract_figures, image_regions, is_visual_issue, option_media_issues, page_number, unrotated, vector_regions
+from .figures import coverage, extract_figures, ground_question_spans, image_regions, is_visual_issue, option_media_issues, page_number, rect, unrotated, vector_regions
 from .models import ImportJob, ImportStatus, Question, Role, SourceDocument, User
 from .schemas import FigureReviewIn, QuestionIn
 from .security import require, uid
@@ -54,10 +54,48 @@ def figure_source(question_id:str, user:User=Depends(require(Role.TEACHER,Role.A
         for number, page in enumerate(document,1):
             with unrotated(page):
                 pages.append({"page":number,"width":page.rect.width,"height":page.rect.height})
+        # The source canvas remains available for corrections, but opening the
+        # editor should begin at the saved crop or grounded question scope.
+        item={"number":question.source_number,"stem_markdown":question.stem_markdown,
+              "options":question.options or [],"source_spans":question.source_spans or [],
+              "diagrams":question.diagrams or [],"visual_intent":(question.interaction or {}).get("visual_intent")}
+        ground_question_spans([item], document)
+        candidates=[]
+        # Prefer the accepted crop.  The grounded question span is a fallback
+        # for a missing/uncertain figure, not something to merge into it.
+        for record in item["diagrams"]:
+            number=page_number(record.get("page"),document) if isinstance(record,dict) else None
+            box=rect(record.get("bbox")) if isinstance(record,dict) else None
+            if number and box:
+                with unrotated(document[number-1]) as page:
+                    box &= page.rect
+                    if not box.is_empty and box.get_area() < page.rect.get_area()*.75:
+                        candidates.append((number,box))
+        if not candidates:
+            for record in item["source_spans"]:
+                number=page_number(record.get("page"),document) if isinstance(record,dict) else None
+                box=rect(record.get("bbox")) if isinstance(record,dict) else None
+                if number and box:
+                    with unrotated(document[number-1]) as page:
+                        box &= page.rect
+                        if not box.is_empty and box.get_area() < page.rect.get_area()*.75:
+                            candidates.append((number,box))
+        focus=None
+        if candidates:
+            focus_page=candidates[0][0]
+            same=[box for number,box in candidates if number==focus_page]
+            merged=fitz.Rect(same[0])
+            for box in same[1:]: merged |= box
+            with unrotated(document[focus_page-1]) as page:
+                # Keep a useful context margin without reverting to the full page.
+                merged=(merged+(-24,-24,24,24)) & page.rect
+                focus={"page":focus_page,"bbox":[round(v,2) for v in merged]}
         return {"filename":source.filename,"pages":pages,"diagrams":question.diagrams,"stem_markdown":question.stem_markdown,
                 "original_url":f"/api/teacher/imports/{_job.id}/source" if _job else None,
                 "conversion_issues":(_job.extraction_meta or {}).get("docx_visual_issues",[]) if _job else [],
-                "source_page":(question.interaction or {}).get("source_page") or ((question.source_spans or [{}])[0].get("page")) or 1}
+                "source_page":(focus or {}).get("page") or (question.interaction or {}).get("source_page") or ((question.source_spans or [{}])[0].get("page")) or 1,
+                "focus":focus,
+                "visual_intent":(question.interaction or {}).get("visual_intent","none")}
 
 
 @router.put("/questions/{question_id}/draft")

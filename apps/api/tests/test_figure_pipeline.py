@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from app.bank_imports import _is_critical_provider_error, _pdf_bytes, _save_questions
 from app.config import settings
 from app.db import Base
-from app.figure_review import review_figures, figure_source_page, save_question_draft
+from app.figure_review import review_figures, figure_source, figure_source_page, save_question_draft
 from app.figures import image_regions, vector_regions, extract_figures, mark_scope_conflicts
 from app.figure_repairs import propose_repair, repair_needed, stage_repair
 from app.main import question_media, resolve_bank_question
@@ -83,6 +83,14 @@ def test_plain_text_question_still_imports_without_diagrams(monkeypatch):
     monkeypatch.setattr("app.bank_imports.put",lambda *args:None)
     assert _save_questions(db,bank,job,source,"Physics",doc,[],[data],set(),{1})==(1,0,0)
     assert db.query(Question).one().diagrams==[]
+
+
+def test_docx_source_conversion_warning_does_not_flag_unrelated_text_questions(monkeypatch):
+    db,admin,bank,source,job=setup_db();doc=fixture_pdf();data=model_item()
+    data.update(stem_markdown="What is two plus two?",diagrams=[],options=[{"value":"a","markdown":"4"},{"value":"b","markdown":"5"}],visual_intent="none")
+    monkeypatch.setattr("app.bank_imports.put",lambda *args:None)
+    assert _save_questions(db,bank,job,source,"Physics",doc,[],[data],set(),{1},source_issues=["diagram_docx_complex_visual_review"])==(1,0,0)
+    assert db.query(Question).one().interaction["ingestion_issues"]==[]
 
 
 @pytest.mark.parametrize("stem", [
@@ -198,6 +206,31 @@ def test_stale_scan_warning_is_included_in_repair_even_without_image_changes():
     assert repair_needed(q,[],[]) is True
     q.interaction={"ingestion_issues":[]}
     assert repair_needed(q,[],[]) is False
+
+
+def test_text_only_docx_conversion_warning_is_revalidation_candidate():
+    db,admin,bank,source,job=setup_db();q=question_record(db)
+    q.stem_markdown="Calculate two plus two.";q.options=[];q.diagrams=[]
+    q.interaction={"visual_intent":"none","ingestion_issues":["diagram_docx_complex_visual_review"]}
+    assert repair_needed(q,[],[]) is True
+
+
+def test_repair_clear_removes_stale_visual_flags_without_unapproving_text_question():
+    db,admin,bank,source,job=setup_db();q=question_record(db)
+    approved=q.approved_at
+    q.diagrams=[];q.interaction={"ingestion_issues":["diagram_scanned_source_review","missing_answer"]}
+    stage_repair(db,q,[],[],admin.id)
+    assert q.approved_at==approved
+    assert q.interaction["ingestion_issues"]==["missing_answer"]
+
+
+def test_figure_source_focus_prefers_saved_crop_over_full_question_page(monkeypatch):
+    db,admin,bank,source,job=setup_db();q=question_record(db)
+    q.diagrams=[{"object_key":"crop.png","page":1,"bbox":[85,105,175,195],"role":"option","option_index":0}]
+    monkeypatch.setattr("app.figure_review.get",lambda key:fixture_pdf().tobytes())
+    result=figure_source(q.id,admin,db)
+    assert result["focus"]["page"]==1
+    assert result["focus"]["bbox"][0] < 85 < result["focus"]["bbox"][2] < 230
 
 
 def question_record(db):

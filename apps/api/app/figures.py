@@ -19,7 +19,8 @@ import xml.etree.ElementTree as ET
 
 import fitz
 
-VERSION = "figures_v5"
+VERSION = "figures_v6"
+VISUAL_STATES = {"none", "required", "uncertain"}
 
 
 def docx_visual_inventory(raw):
@@ -61,7 +62,10 @@ OPTION_SCHEMA = {
                    "requires_diagram": {"type": "boolean"}},
 }
 VISUAL_INSTRUCTIONS = """
-VISUAL CONTRACT: Diagrams are optional. Return diagrams=[] when no source
+VISUAL CONTRACT: Diagrams are optional. Return visual_intent for every question:
+none when no supplied visual belongs to it, required when a supplied visual is
+needed to answer it, and uncertain only when the visual boundary is unclear.
+Return diagrams=[] when no source
 illustration belongs to the question. Do not create a diagram entry merely
 because the question mentions a graph, circuit, figure, or asks the student to
 draw one. Text, equations, whitespace, and the question's source_spans are not
@@ -76,8 +80,9 @@ value, use empty markdown if no prose exists, set requires_diagram=true and
 provide their individual diagram(s). Mixed text/image choices also require the
 diagram. Never replace diagram choices with descriptions or merge all choices
 into one stem image. Text-only choices have requires_diagram=false. Inspect
-all visual pages even when a native text layer exists. If uncertain, lower
-confidence; never invent figure coordinates or silently omit visual choices.
+all visual pages even when a native text layer exists. If uncertain, set
+visual_intent=uncertain and lower confidence; never invent figure coordinates
+or silently omit visual choices.
 If the response schema uses box_2d instead of bbox, use normalized 0-1000
 [ymin,xmin,ymax,xmax] for that field; the server converts it to PDF points.
 """
@@ -175,6 +180,37 @@ def coverage(box, container):
     return (box & container).get_area() / max(box.get_area(), 0.001)
 
 
+def option_requires_diagram(option):
+    """Only an explicit true is a visual-option contract.
+
+    Historic provider payloads can contain strings such as ``"false"``. Python
+    treats those as truthy, so normalize at every validation boundary instead
+    of relying on a prior ingestion pass.
+    """
+    if not isinstance(option, dict):
+        return False
+    value = option.get("requires_diagram")
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def visual_intent(item):
+    """Return a conservative visual state for new and legacy extraction data."""
+    value = str((item or {}).get("visual_intent") or "").strip().lower()
+    if value in VISUAL_STATES:
+        return value
+    if (references_source_figure((item or {}).get("stem_markdown"))
+            or any(option_requires_diagram(o) for o in (item or {}).get("options") or [])):
+        return "required"
+    # A legacy crop is evidence to validate, not proof that a diagram exists.
+    return "uncertain" if (item or {}).get("diagrams") else "none"
+
+
+def requires_source_figure(item):
+    """A hard requirement cannot be inferred from a topic keyword."""
+    return (references_source_figure((item or {}).get("stem_markdown"))
+            or any(option_requires_diagram(o) for o in (item or {}).get("options") or []))
+
+
 def page_words(page):
     """Native or cached OCR words in the same unrotated PDF-point space.
 
@@ -258,6 +294,23 @@ def _prose(page, box):
     # sentence-like text in an otherwise vector-only crop needs review.
     long_words = sum(len(re.sub(r"\W", "", w[4])) >= 4 for w in words)
     return len(words) >= 18 and long_words >= 9
+
+
+def _text_block(page, box):
+    """Conservative OCR/native indication that a crop is ordinary prose."""
+    words = [w for w in page_words(page) if coverage(fitz.Rect(w[:4]), box) > .75]
+    long_words = sum(len(re.sub(r"\W", "", w[4])) >= 4 for w in words)
+    return len(words) >= 6 and long_words >= 3
+
+
+def _local_graphics(page, box):
+    """True for a bounded source asset/path, never for a page scan canvas."""
+    if any((path & box).get_area() > 1 for path in _paths(page)):
+        return True
+    return any((image := rect(info.get("bbox"))) is not None
+               and image.get_area() < page.rect.get_area() * .8
+               and (image & box).get_area() > 1
+               for info in page.get_image_info())
 
 
 def mark_scope_conflicts(items):
@@ -468,18 +521,15 @@ def references_source_figure(stem):
 
 
 def _unsupported_text_crop(raw, item, document):
-    """Ignore invented crops only with positive evidence of text-only scope.
+    """Discard a model crop only when the local source proves it is prose.
 
-    Never apply to scans, visual choices, explicit image references, invalid
-    geometry or a crop containing graphics (even outside the question scope).
-    Those still need the normal validation/review path.
+    OCR is deliberately used for scans.  A page-sized raster is the scan's
+    canvas, not evidence that a prose crop is a figure.  Real bounded native
+    vectors/raster assets still win over this filter.
     """
     if not isinstance(raw, dict) or raw.get("role", "question") != "question":
         return False
-    if references_source_figure(item.get("stem_markdown")) or any(
-        o.get("requires_diagram") or not str(o.get("markdown") or "").strip()
-        for o in item.get("options") or []
-    ):
+    if requires_source_figure(item) or visual_intent(item) == "required":
         return False
     number = page_number(raw.get("page"), document)
     box = rect(raw.get("bbox"))
@@ -489,14 +539,12 @@ def _unsupported_text_crop(raw, item, document):
         spans = _spans(item, number, page)
         if not spans or coverage(box, page.rect) < .95:
             return False
-        words = page.get_text("words")
-        if sum(any(coverage(fitz.Rect(w[:4]), s) > .8 for s in spans) for w in words) < 8:
+        if not _text_block(page, box):
             return False
         graphics = _paths(page) + [b for info in page.get_image_info()
-                                  if (b := rect(info.get("bbox"))) is not None]
-        # Check the proposal as well as scope: a misplaced real figure must
-        # remain flagged rather than disappearing as a text-only question.
-        return not any((g & area).get_area() > 1 for g in graphics for area in [box, *spans])
+                                  if (b := rect(info.get("bbox"))) is not None
+                                  and b.get_area() < page.rect.get_area() * .8]
+        return not any((g & box).get_area() > 1 for g in graphics)
 
 
 def extract_figures(item, document, regions, reviewed=False):
@@ -508,6 +556,7 @@ def extract_figures(item, document, regions, reviewed=False):
     """
     accepted, issues = [], list(item.get("_visual_scope_issues") or [])
     options = item.get("options") or []
+    intent = visual_intent(item)
     proposed = [(d, False) for d in (item.get("diagrams") or [])
                 if reviewed or not _unsupported_text_crop(d, item, document)]
     for region in regions:
@@ -534,9 +583,9 @@ def extract_figures(item, document, regions, reviewed=False):
                 continue
             # An unclaimed graphic is a possible model omission, not license
             # to silently attach an unrelated formula or picture to the stem.
-            if not (any(o.get("requires_diagram") for o in options)
-                    or re.search(r"\b(?:diagram|figure|graph|circuit|shown)\b",str(item.get("stem_markdown") or ""),re.I)):
-                issues.append("diagram_unassigned_native_candidate")
+            # A text-only model decision is enough to ignore decorative rules
+            # and formula strokes; it must never flag the whole question.
+            if not (requires_source_figure(item) or intent in {"required", "uncertain"}):
                 continue
             proposed.append((region, True))
 
@@ -556,6 +605,8 @@ def extract_figures(item, document, regions, reviewed=False):
             box &= page.rect
             spans = _spans(item, number, page)
             if not spans or not any(coverage(box, s) >= .95 for s in spans):
+                if not reviewed and not native and intent != "required" and not requires_source_figure(item) and not _local_graphics(page, box):
+                    continue
                 issues.append("diagram_outside_question")
                 continue
             if not reviewed:
@@ -568,7 +619,10 @@ def extract_figures(item, document, regions, reviewed=False):
                     if any(coverage(complete,s)>=.95 for s in spans) and coverage(complete,box+(-24,-24,24,24))>.98:
                         box=complete
             if min(box.width, box.height) < 6 or box.get_area() > page.rect.get_area() * .65:
-                issues.append("diagram_not_bounded")
+                # A full-page/question screenshot is not a review burden for a
+                # text-only question.  Keep an explicit visual request visible.
+                if requires_source_figure(item) or intent == "required":
+                    issues.append("diagram_not_bounded")
                 continue
             role = raw.get("role", "question")
             option_index = raw.get("option_index")
@@ -585,7 +639,7 @@ def extract_figures(item, document, regions, reviewed=False):
                     continue
                 if isinstance(inferred, int):
                     role, option_index = "option", inferred
-                elif native and any(o.get("requires_diagram") or not str(o.get("markdown", "")).strip() for o in options):
+                elif native and any(option_requires_diagram(o) for o in options):
                     issues.append("diagram_option_ownership_uncertain")
                     continue
             if role not in {"question", "option", "solution"} or (role == "option" and (
@@ -605,14 +659,13 @@ def extract_figures(item, document, regions, reviewed=False):
             raster = any(r.get("origin") == "raster" and r["page"] == number
                          and coverage(box, fitz.Rect(r["bbox"])) > .8 for r in regions)
             if not reviewed and raster and _prose(page, box):
-                issues.append("diagram_excessive_prose")
+                if requires_source_figure(item) or intent == "required":
+                    issues.append("diagram_excessive_prose")
                 continue
-            full_scan = any(r.get("origin") == "raster" and r["page"] == number
-                            and fitz.Rect(r["bbox"]).get_area() > page.rect.get_area() * .8 for r in regions)
-            if not reviewed and (full_scan or len(page.get_text().strip()) < 40):
-                issues.append("diagram_scanned_source_review")
             paths = [p for p in _paths(page) if (p & box).get_area() > 1]
             if not reviewed and not raster and (not paths or _prose(page, box)):
+                if not native and intent != "required" and not requires_source_figure(item):
+                    continue
                 issues.append("diagram_text_or_no_graphics")
                 continue
             # A box that cuts vector objects is likely missing part of a figure.
@@ -631,9 +684,15 @@ def extract_figures(item, document, regions, reviewed=False):
                              "extraction": VERSION, "coordinate_space": "pdf_points_unrotated",
                              "png": pix.tobytes("png")})
     for index, option in enumerate(options):
-        visual = option.get("requires_diagram") or not str(option.get("markdown") or "").strip()
+        visual = option_requires_diagram(option)
         if visual and not any(d["role"] == "option" and d["option_index"] == index for d in accepted):
             issues.append(f"option_diagram_missing:{index}")
+    # Explicit uncertainty is localized to this question.  Legacy records do
+    # not gain a new warning merely because they predate visual_intent.
+    if not reviewed and str(item.get("visual_intent") or "").strip().lower() == "uncertain":
+        issues.append("diagram_candidate_unverified")
+    # Model intent alone is advisory.  A missing diagram blocks only an
+    # explicit source reference or a real visual answer choice.
     if not reviewed and not accepted and references_source_figure(item.get("stem_markdown")):
         issues.append("diagram_expected_missing")
     return accepted, list(dict.fromkeys(issues))
@@ -662,7 +721,7 @@ def is_visual_issue(issue):
 def option_media_issues(options, diagrams):
     issues = []
     for index, option in enumerate(options or []):
-        if (option.get("requires_diagram") or not str(option.get("markdown") or option.get("text") or "").strip()) and not any(
+        if option_requires_diagram(option) and not any(
             d.get("role") == "option" and d.get("option_index") == index for d in diagrams or []
         ):
             issues.append(f"option_diagram_missing:{index}")

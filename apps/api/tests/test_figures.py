@@ -11,7 +11,7 @@ from app.figures import (
     image_regions, model_visual_request, save_figures, vector_regions, visual_context,
     ground_question_spans,
     docx_conversion_issues,
-    page_words, mark_scope_conflicts,
+    page_words, mark_scope_conflicts, option_media_issues,
 )
 from app.tasks import normalize_item, prepare_item_for_ingestion
 
@@ -175,10 +175,10 @@ def test_text_only_page_does_not_require_vision():
     assert not any(p["type"] == "image_url" for p in parts)
 
 
-def test_outline_only_or_scanned_source_requires_visual_review():
+def test_bounded_outline_figure_is_kept_without_a_blanket_scan_warning():
     doc=fitz.open();doc.new_page(width=400,height=500);square(doc[0])
     figures,issues=extract_figures(item([diagram()]),doc,[])
-    assert len(figures)==1 and "diagram_scanned_source_review" in issues
+    assert len(figures)==1 and issues == []
 
 
 def test_white_raster_cannot_pass_as_a_diagram():
@@ -253,10 +253,10 @@ def test_missing_option_records_can_be_recovered_from_explicit_figure_owners():
     assert "diagram_options_recovered" in issues
 
 
-def test_unclaimed_graphic_is_not_silently_omitted_or_auto_attached():
+def test_text_only_visual_intent_does_not_turn_an_unclaimed_native_mark_into_a_warning():
     doc=document();square(doc[0]);data=item();data["stem_markdown"]="Select the correct representation."
     figures,issues=extract_figures(data,doc,regions(doc))
-    assert not figures and "diagram_unassigned_native_candidate" in issues
+    assert not figures and issues == []
 
 
 def test_real_gemini_response_recovers_all_four_options_without_duplicates():
@@ -410,6 +410,25 @@ def test_false_visual_option_flags_are_not_coerced_to_true(flag):
     assert data["options"][0]["requires_diagram"] is False
 
 
+@pytest.mark.parametrize("flag", ["false", "False", False, None, 0])
+def test_legacy_false_option_never_requires_a_crop_at_validation_time(flag):
+    assert option_media_issues([{"value":"a", "markdown":"Text", "requires_diagram":flag}], []) == []
+
+
+def test_visual_intent_none_discards_a_prose_model_crop_without_a_review_flag():
+    doc=document()
+    data=item([diagram((20,20,380,100))])
+    data.update(stem_markdown="Calculate the result.", visual_intent="none")
+    assert extract_figures(data,doc,regions(doc)) == ([], [])
+
+
+def test_explicit_uncertain_visual_is_reviewed_only_for_its_question():
+    doc=document();data=item(diagrams=[])
+    data.update(stem_markdown="Describe the object.", visual_intent="uncertain")
+    figures, issues = extract_figures(data,doc,regions(doc))
+    assert figures == [] and issues == ["diagram_candidate_unverified"]
+
+
 def test_bounded_visual_options_on_scan_are_kept_with_correct_owners():
     source=fitz.open();page=source.new_page(width=500,height=650)
     page.insert_text((35,50),"1. Select the correct answer from the two choices below.",fontsize=14)
@@ -424,4 +443,4 @@ def test_bounded_visual_options_on_scan_are_kept_with_correct_owners():
                         diagram((365,140,455,230),role="option",index=1)])
     figures,issues=extract_figures(data,doc,regions(doc))
     assert [(f["role"],f["option_index"]) for f in figures]==[("option",0),("option",1)]
-    assert issues==["diagram_scanned_source_review"]
+    assert issues == []
