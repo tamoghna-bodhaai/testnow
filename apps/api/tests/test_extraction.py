@@ -60,6 +60,11 @@ def test_sparse_pages_are_batched_but_dense_pages_are_bounded():
     pages=["cover", "index", "1 Let x be real\n2. If y is positive\n3. Find z\n4. Given a\n5. Which value\n6. The result\n7. In a set\n8. Prove that\n9. Evaluate x", "10. Let j be real"]
     assert extraction_units(pages) == [(0,3),(3,4)]
 
+
+def test_scan_pages_without_text_are_independent_extraction_units():
+    assert extraction_units(["", "", "", ""]) == [(0,1),(1,2),(2,3),(3,4)]
+    assert extraction_units(["Readable cover", "", "Native text", ""]) == [(0,1),(1,2),(2,3),(3,4)]
+
 def test_coaching_book_question_numbers_without_a_dot_are_detected():
     # This is the printing convention on Arihant PDF page 10, where the old
     # `number.` detector returned zero and allowed an empty model response.

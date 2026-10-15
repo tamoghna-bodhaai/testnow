@@ -3175,6 +3175,37 @@ function BankQuestionEditor({
     [error, setError] = useState(""),
     [tab, setTab] = useState<"rendered" | "json" | "edit">("rendered");
   const suggestedAnswer = inferredChoiceFromSolution(question);
+  const ignoreWarningsAndApprove = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api(
+        `/admin/question-banks/${bankId}/questions/${question.id}/resolve?ignore_warnings=true`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            source_number: question.source_number,
+            kind: question.kind,
+            stem_markdown: question.stem_markdown,
+            options: question.options,
+            answer: suggestedAnswer ?? question.answer,
+            solution_markdown: question.solution_markdown || null,
+            scoring: question.scoring || {
+              correct: 4,
+              incorrect: -1,
+              unanswered: 0,
+            },
+            confidence: question.confidence,
+          }),
+        },
+      );
+      await done();
+    } catch (e: any) {
+      setError(e.message || "This question still needs an answer before approval.");
+    } finally {
+      setBusy(false);
+    }
+  };
   const save = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -3256,6 +3287,14 @@ function BankQuestionEditor({
         <div className="bank-rendered-question">
           <QuestionCard q={question} mode="teacher" />
           <FigureEditor questionId={question.id} options={question.options} api={api} done={done} />
+          {!!(question.interaction?.ingestion_issues || []).length && (
+            <div className="review-buttons warning-override-action">
+              <button type="button" className="secondary-action" disabled={busy} onClick={ignoreWarningsAndApprove}>
+                {busy ? "Saving…" : "Ignore warnings & approve"}
+              </button>
+              <small>Approves this question for publication and records the warnings in its audit trail.</small>
+            </div>
+          )}
         </div>
       )}
       {tab === "json" && (

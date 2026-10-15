@@ -11,6 +11,7 @@ from app.figures import (
     image_regions, model_visual_request, save_figures, vector_regions, visual_context,
     ground_question_spans,
     docx_conversion_issues,
+    page_words, mark_scope_conflicts,
 )
 from app.tasks import normalize_item, prepare_item_for_ingestion
 
@@ -339,3 +340,88 @@ def test_false_crop_filter_never_suppresses_missing_visual_options():
     data["stem_markdown"]="Select the correct answer."
     figures,issues=extract_figures(data,doc,regions(doc))
     assert not figures and "option_diagram_missing:0" in issues
+
+
+def scanned_document():
+    source=fitz.open();page=source.new_page(width=500,height=650)
+    page.insert_text((35,50),"1. Calculate the speed of the moving train.",fontsize=14)
+    page.insert_text((35,80),"Use a distance of 120 metres and a time of 10 seconds.",fontsize=12)
+    page.insert_text((35,330),"2. Determine the resistance of the given wire.",fontsize=14)
+    page.insert_text((35,360),"Use its length and cross section to find the answer.",fontsize=12)
+    scan=fitz.open();target=scan.new_page(width=500,height=650)
+    target.insert_image(target.rect,stream=page.get_pixmap(matrix=fitz.Matrix(2,2)).tobytes("png"))
+    return scan
+
+
+def test_scanned_text_only_questions_do_not_require_diagrams_or_attach_page_image():
+    doc=scanned_document();data=item(spans=[{"page":1,"bbox":[0,0,500,650]}])
+    data["stem_markdown"]="Calculate the speed of the moving train."
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert figures==[] and issues==[]
+
+
+def test_real_scan_ocr_grounds_question_scopes_without_overlap():
+    import shutil
+    if not shutil.which("tesseract"):pytest.skip("Tesseract is required by the API Docker image")
+    doc=scanned_document()
+    assert not doc[0].get_text("words") and len(page_words(doc[0]))>20
+    first=item(spans=[{"page":1,"bbox":[0,0,500,650]}])
+    first.update(number="1",stem_markdown="Calculate the speed of the moving train.")
+    second=item(spans=[{"page":1,"bbox":None}])
+    second.update(number="2",stem_markdown="Determine the resistance of the given wire.")
+    grounded=mark_scope_conflicts(ground_question_spans([first,second],doc))
+    assert grounded[0]["source_spans"][0]["bbox"][3]<330
+    assert grounded[1]["source_spans"][0]["bbox"][1]>300
+    assert all(i.get("_source_geometry")=="ocr_question_anchor" for i in grounded)
+    assert all(not extract_figures(i,doc,regions(doc))[1] for i in grounded)
+
+
+def test_scan_layout_supplies_ocr_words_without_whole_page_figure_candidate():
+    doc=scanned_document()
+    parts=visual_context(doc,0,1,[""],regions(doc),10_000_000)
+    layout=json.loads(next(p["text"][len("SOURCE LAYOUT "):] for p in parts if p.get("text", "").startswith("SOURCE LAYOUT ")))
+    assert layout["figure_candidates"]==[]
+    assert "ocr_words" in layout
+    assert any(p["type"]=="image_url" for p in parts)
+
+
+def test_scan_with_missing_image_options_keeps_real_option_failures():
+    doc=scanned_document();data=item(options=[
+        {"value":"a","markdown":"","requires_diagram":True},
+        {"value":"b","markdown":"","requires_diagram":True}],
+        spans=[{"page":1,"bbox":[0,0,500,650]}])
+    data["stem_markdown"]="Select the correct answer."
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert figures==[] and issues==["option_diagram_missing:0","option_diagram_missing:1"]
+
+
+def test_ocr_unavailable_does_not_create_a_diagram_requirement(monkeypatch):
+    doc=scanned_document();data=item(spans=[{"page":1,"bbox":[0,0,500,650]}])
+    data["stem_markdown"]="Calculate the speed of the moving train."
+    def unavailable(*args,**kwargs):raise RuntimeError("OCR not installed")
+    monkeypatch.setattr(fitz.Page,"get_textpage_ocr",unavailable)
+    assert page_words(doc[0])==[]
+    assert extract_figures(data,doc,regions(doc))==([],[])
+
+
+@pytest.mark.parametrize("flag",[False,"false","False"," false ",None,0])
+def test_false_visual_option_flags_are_not_coerced_to_true(flag):
+    data=normalize_item({"options":[{"value":"a","markdown":"Text answer","requires_diagram":flag}]})
+    assert data["options"][0]["requires_diagram"] is False
+
+
+def test_bounded_visual_options_on_scan_are_kept_with_correct_owners():
+    source=fitz.open();page=source.new_page(width=500,height=650)
+    page.insert_text((35,50),"1. Select the correct answer from the two choices below.",fontsize=14)
+    page.insert_text((45,150),"(A)",fontsize=14);page.insert_text((275,150),"(B)",fontsize=14)
+    page.draw_circle((140,185),40);page.draw_rect(fitz.Rect(370,145,450,225))
+    doc=fitz.open();target=doc.new_page(width=500,height=650)
+    target.insert_image(target.rect,stream=page.get_pixmap(matrix=fitz.Matrix(2,2)).tobytes("png"))
+    data=item(options=[{"value":"a","markdown":"","requires_diagram":True},
+                       {"value":"b","markdown":"","requires_diagram":True}],
+              spans=[{"page":1,"bbox":[20,20,480,300]}],
+              diagrams=[diagram((95,140,185,230),role="option",index=0),
+                        diagram((365,140,455,230),role="option",index=1)])
+    figures,issues=extract_figures(data,doc,regions(doc))
+    assert [(f["role"],f["option_index"]) for f in figures]==[("option",0),("option",1)]
+    assert issues==["diagram_scanned_source_review"]

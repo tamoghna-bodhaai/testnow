@@ -54,7 +54,12 @@ def repair_needed(question, figures, issues):
     def signatures(items):
         return [(d.get("page"),tuple(round(v,2) for v in d.get("bbox",[])),d.get("role","question"),d.get("option_index"))
                 for d in items if d.get("role")!="solution"]
-    return bool(issues or signatures(question.diagrams or [])!=signatures(figures))
+    previous_issues={i for i in (question.interaction or {}).get("ingestion_issues",[]) if is_visual_issue(i)}
+    # A text-only scan can have stale flags with no crop signature to change.
+    # Include changed validation findings in the repair preview as well.
+    stale_scan_warning = previous_issues == {"diagram_scanned_source_review"} and not issues
+    return bool(issues or stale_scan_warning
+                or signatures(question.diagrams or [])!=signatures(figures))
 
 
 def main():

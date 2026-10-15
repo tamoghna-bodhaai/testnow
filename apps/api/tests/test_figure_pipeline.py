@@ -192,6 +192,14 @@ def test_legacy_failed_page_error_is_returned_as_readable_message():
     assert import_view(job,db)["errors"][0]["message"]=="Provider timed out"
 
 
+def test_stale_scan_warning_is_included_in_repair_even_without_image_changes():
+    db,admin,bank,source,job=setup_db();q=question_record(db)
+    q.diagrams=[];q.interaction={"ingestion_issues":["diagram_scanned_source_review"]}
+    assert repair_needed(q,[],[]) is True
+    q.interaction={"ingestion_issues":[]}
+    assert repair_needed(q,[],[]) is False
+
+
 def question_record(db):
     q=Question(id="q",owner_id="admin",bank_id="bank",scope=QuestionScope.GLOBAL,import_job_id="job",source_number="1",
                kind=QuestionKind.SINGLE,stem_markdown="Which diagram is correct?",options=model_item()["options"],answer={"option":0},

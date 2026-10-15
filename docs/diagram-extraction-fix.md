@@ -47,6 +47,40 @@ Follow-up verification: 102 extraction tests pass and the production web build
 passes. The full backend suite still has the unrelated datetime failure noted
 below. These changes do not retry or rewrite production imports automatically.
 
+## Follow-up: blanket scan review and overlapping scan boundaries
+
+The earlier implementation added `diagram_scanned_source_review` to every
+question with a scanned/low-text source span, regardless of whether the question
+had a diagram. That rule is removed. The warning now applies when an actual
+figure crop comes from a scan or another low-text source. Full-page raster
+images are source canvases; they are excluded from automatic diagram recovery
+and the model's native figure-candidate list.
+
+Sparse native text on a raster scan now triggers cached Tesseract OCR. Word
+coordinates are supplied in the model's page layout and used to ground printed
+question numbers and nearby stem text. This can recover missing source boxes
+and separate overlapping question regions without deriving ownership from
+figure boxes. The API/worker image installs `tesseract-ocr`; OCR failure leaves
+existing geometry reviewable rather than fabricating coordinates. Pages with
+no extracted text are sent as individual primary extraction units instead of
+eight-page batches, retaining the next page as continuation context.
+
+String values such as `requires_diagram="false"` no longer become true through
+Python truthiness. Empty genuine image-only choices still require images, and
+invalid/outside/overlapping geometry still requires correction when grounding
+cannot resolve it. The repair dry run also detects changed validation findings
+when a question has no image assets, so old blanket scan warnings are included
+in a staged repair rather than silently skipped.
+
+Verification includes an actual raster-only PDF with zero native words: OCR
+separates two questions whose proposed boxes cover the full page, and repairs
+one missing box. Both text-only questions produce no diagram issues. Other
+tests preserve scanned option images/owners, missing-option failures, OCR
+unavailability, scan batching and false boolean handling. These are controlled
+fixtures; the original 95 production records and their source were not examined
+in this follow-up. Rebuild API/workers and reprocess or stage repairs for stored
+records; existing database warnings are not rewritten by deployment alone.
+
 ## What changed
 
 The fix covers PDF and DOCX inputs, stem figures, image-only answer choices, mixed text/image options, and solution figures. It keeps the existing Celery, database, storage, batching, checkpoints, and scoring architecture. Figure ownership and validation now have one implementation in `apps/api/app/figures.py`.

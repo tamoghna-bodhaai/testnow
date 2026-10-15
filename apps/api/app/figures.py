@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 import fitz
 
-VERSION = "figures_v4"
+VERSION = "figures_v5"
 
 
 def docx_visual_inventory(raw):
@@ -175,6 +175,34 @@ def coverage(box, container):
     return (box & container).get_area() / max(box.get_area(), 0.001)
 
 
+def page_words(page):
+    """Native or cached OCR words in the same unrotated PDF-point space.
+
+    OCR is restricted to raster scan pages with insufficient native text. A
+    missing OCR runtime leaves model geometry reviewable rather than invented.
+    Cache plain word records on the document, not page-bound TextPage objects.
+    """
+    words = page.get_text("words", sort=True)
+    if len(words) >= 40:
+        return words
+    if not any((b := rect(info.get("bbox"))) is not None
+               and b.get_area() > page.rect.get_area() * .5 for info in page.get_image_info()):
+        return words
+    document = page.parent
+    cache = getattr(document, "_figure_ocr_words", None)
+    if cache is None:
+        cache = {}
+        document._figure_ocr_words = cache
+    key = (page.number, tuple(page.rect), page.rotation)
+    if key not in cache:
+        try:
+            textpage = page.get_textpage_ocr(dpi=150, full=True, language="eng")
+            cache[key] = page.get_text("words", textpage=textpage, sort=True)
+        except (RuntimeError, ValueError):
+            cache[key] = words
+    return cache[key] if len(cache[key]) > len(words) else words
+
+
 def page_number(value, document):
     # Do not allow Python's negative indexing, fractional pages, or bools.
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= len(document):
@@ -225,7 +253,7 @@ def _clusters(boxes, gap=6):
 
 
 def _prose(page, box):
-    words = [w for w in page.get_text("words") if coverage(fitz.Rect(w[:4]), box) > .8]
+    words = [w for w in page_words(page) if coverage(fitz.Rect(w[:4]), box) > .8]
     # Labels and short captions are legitimate parts of figures. Sustained
     # sentence-like text in an otherwise vector-only crop needs review.
     long_words = sum(len(re.sub(r"\W", "", w[4])) >= 4 for w in words)
@@ -273,7 +301,7 @@ def ground_question_spans(items, document):
             if page_no is None:
                 grounded.append(span);continue
             with unrotated(document[page_no-1]) as page:
-                words=page.get_text("words",sort=True)
+                words=page_words(page)
                 anchors=[]
                 for word in words:
                     match=re.fullmatch(r"(?:[Qq])?(\d{1,4})[.)]?",word[4])
@@ -299,7 +327,7 @@ def ground_question_spans(items, document):
                 right=min((x-8 for x in column_x if x>anchor[0]),default=page.rect.width-12)
                 next_y=min((w[1]-4 for _,w in anchors if abs(w[0]-anchor[0])<30 and w[1]>anchor[1]+12),default=page.rect.height-12)
                 grounded.append({"page":page_no,"bbox":[max(0,anchor[0]-5),max(0,anchor[1]-5),right,next_y]})
-                item["_source_geometry"]="native_question_anchor"
+                item["_source_geometry"]="ocr_question_anchor" if words != page.get_text("words",sort=True) else "native_question_anchor"
         item["source_spans"]=grounded
     return items
 
@@ -364,7 +392,14 @@ def visual_context(document, start, end, page_texts, regions, max_bytes):
                       for b in page.get_text("blocks") if len(b) > 6 and b[6] == 0]
             layout = {"page": index + 1, "width_points": page.rect.width,
                       "height_points": page.rect.height, "coordinate_space": "pdf_points_unrotated",
-                      "blocks": blocks, "figure_candidates": candidates}
+                      "blocks": blocks, "figure_candidates": [r for r in candidates if not (
+                          r.get("origin") == "raster" and fitz.Rect(r["bbox"]).get_area() > page.rect.get_area() * .8)]}
+            native_words=page.get_text("words",sort=True)
+            localized_words=page_words(page)
+            if localized_words != native_words or len(native_words) < 8:
+                # Scans need localizable text, not just a full-page image asset
+                # misleadingly presented as a diagram candidate.
+                layout["ocr_words"] = [{"bbox":list(w[:4]),"text":w[4]} for w in localized_words]
             content.append({"type": "text", "text": "SOURCE LAYOUT " + json.dumps(layout, ensure_ascii=False)})
             # Paths that were excluded from safe automatic grouping may still
             # be meaningful graphics. Show them to vision rather than losing
@@ -392,7 +427,7 @@ def _spans(item, number, page):
 def _option_at(page, box, spans, options):
     """Infer ownership only from unambiguous nearby printed option labels."""
     anchors = []
-    for word in page.get_text("words"):
+    for word in page_words(page):
         label = re.fullmatch(r"\(?([A-Ha-h1-8])[.)]", word[4].strip())
         bounds = fitz.Rect(word[:4])
         if not label or not any(coverage(bounds, s) >= .9 for s in spans):
@@ -475,14 +510,6 @@ def extract_figures(item, document, regions, reviewed=False):
     options = item.get("options") or []
     proposed = [(d, False) for d in (item.get("diagrams") or [])
                 if reviewed or not _unsupported_text_crop(d, item, document)]
-    if not reviewed:
-        for span in item.get("source_spans") or []:
-            if isinstance(span,dict) and (n:=page_number(span.get("page"),document)) is not None:
-                with unrotated(document[n-1]) as page:
-                    full_scan=any(r.get("origin")=="raster" and r["page"]==n
-                                  and fitz.Rect(r["bbox"]).get_area()>page.rect.get_area()*.8 for r in regions)
-                    if full_scan or len(page.get_text().strip())<40:
-                        issues.append("diagram_scanned_source_review")
     for region in regions:
         if reviewed:
             break
@@ -491,6 +518,10 @@ def extract_figures(item, document, regions, reviewed=False):
         if number is None or box is None:
             continue
         with unrotated(document[number - 1]) as page:
+            # The scanned page is the source canvas, not an omitted diagram.
+            # Only explicit bounded model crops may select content from it.
+            if region.get("origin") == "raster" and box.get_area() > page.rect.get_area() * .8:
+                continue
             spans = _spans(item, number, page)
             if not any(coverage(box, s) >= .95 for s in spans):
                 continue
@@ -576,7 +607,9 @@ def extract_figures(item, document, regions, reviewed=False):
             if not reviewed and raster and _prose(page, box):
                 issues.append("diagram_excessive_prose")
                 continue
-            if not reviewed and len(page.get_text().strip()) < 40:
+            full_scan = any(r.get("origin") == "raster" and r["page"] == number
+                            and fitz.Rect(r["bbox"]).get_area() > page.rect.get_area() * .8 for r in regions)
+            if not reviewed and (full_scan or len(page.get_text().strip()) < 40):
                 issues.append("diagram_scanned_source_review")
             paths = [p for p in _paths(page) if (p & box).get_area() > 1]
             if not reviewed and not raster and (not paths or _prose(page, box)):

@@ -68,7 +68,9 @@ def normalize_item(item:dict)->dict:
             options.append({"value":chr(97+index),"markdown":option})
         elif isinstance(option, dict):
             clean={"value":str(option.get("value",chr(97+index))),"markdown":str(option.get("markdown") or option.get("text") or "")}
-            if "requires_diagram" in option:clean["requires_diagram"]=bool(option["requires_diagram"])
+            if "requires_diagram" in option:
+                flag=option["requires_diagram"]
+                clean["requires_diagram"]=flag is True or (isinstance(flag,str) and flag.strip().lower()=="true")
             options.append(clean)
     if len(options)<2:
         stem,recovered=options_embedded_in_stem(item.get("stem_markdown"))
@@ -210,11 +212,14 @@ def extraction_units(page_texts:list[str], max_pages:int=8, max_characters:int=7
         end=start;characters=0;questions=0
         while end<len(page_texts) and end-start<max_pages:
             text=page_texts[end] or ""; found=expected_questions(text)
+            # A scan's empty text is not evidence of a sparse source page.
+            # Do not combine eight unreadable pages into one large vision call.
+            if end>start and not text.strip():break
             if end>start and (characters+len(text)>max_characters or (questions and questions+found>max_questions)):
                 break
             characters+=len(text);questions+=found;end+=1
             # A page that is already a full text chunk must be sent by itself.
-            if characters>=max_characters or questions>=max_questions:break
+            if not text.strip() or characters>=max_characters or questions>=max_questions:break
         units.append((start,end));start=end
     return units
 
