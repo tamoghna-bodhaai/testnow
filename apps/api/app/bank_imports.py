@@ -100,6 +100,13 @@ def _failure_message(exc: Exception) -> str:
     return message
 
 
+def _is_critical_provider_error(message: str) -> bool:
+    """Provider HTTP failures will not be repaired by trying later pages."""
+    return bool(re.search(r"\b[45]\d{2}\b", message)) or any(
+        phrase in message.lower() for phrase in ("key limit", "api key", "model access")
+    )
+
+
 def _control_state(db, job_id: str) -> str | None:
     """Read admin controls between page batches without holding stale ORM state."""
     db.expire_all()
@@ -243,7 +250,7 @@ def run_bank_import(job_id: str) -> None:
                 # Authentication, quota and model-access errors cannot improve
                 # on the next page. Stop immediately, preserve the extracted
                 # questions, and present a useful material-level error.
-                if "403" in message or "key limit" in message.lower() or "api key" in message.lower():
+                if _is_critical_provider_error(message):
                     job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access."
                     job,meta=_checkpoint(db,job_id,{"phase":"Stopped: provider access error","processed_pages":start,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index-1,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages[-50:],"error_log":errors});job.status=ImportStatus.FAILED;job.error="Extraction stopped: the configured model provider rejected this request. Check the OpenRouter key limit or model access.";db.commit();return
                 job,meta=_checkpoint(db,job_id,{"phase":f"Skipped failed extraction pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"chunks_total":len(ranges),"chunks_complete":chunk_index,"question_count":saved,"flagged_count":flagged,"skipped_count":skipped,"failed_pages":failed_pages,"error_log":errors});db.commit();continue

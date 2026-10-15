@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.bank_imports import _pdf_bytes, _save_questions
+from app.bank_imports import _is_critical_provider_error, _pdf_bytes, _save_questions
 from app.config import settings
 from app.db import Base
 from app.figure_review import review_figures, figure_source_page, save_question_draft
@@ -324,6 +324,15 @@ def test_admin_can_ignore_a_false_positive_warning_and_approve_with_audit_trail(
     assert q.interaction["ingestion_issues"]==[]
     assert q.interaction["ignored_ingestion_issues"]==["diagram_unassigned_native_candidate"]
     assert q.interaction["warnings_ignored_by"]==admin.id
+
+
+@pytest.mark.parametrize("message", ["Client error '403 Forbidden'", "404 Not Found", "Server error '500 Internal Server Error'"])
+def test_provider_http_errors_are_critical(message):
+    assert _is_critical_provider_error(message)
+
+
+def test_non_http_page_extraction_issue_is_not_critical():
+    assert not _is_critical_provider_error("provider returned malformed JSON")
 
 
 @pytest.mark.skipif(not shutil.which("soffice"),reason="LibreOffice is not installed")

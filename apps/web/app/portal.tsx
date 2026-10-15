@@ -2442,13 +2442,9 @@ function BankImportStatus({
                           {job.error}
                         </p>
                       )}
-                      {job.meta?.failed_pages?.length ? <p className="import-error">
-                        <strong>{job.meta.failed_pages.length} source page range{job.meta.failed_pages.length === 1 ? "" : "s"} skipped</strong>
-                        Questions from these ranges may be missing even while extraction continues. Inspect the failures before publishing.
-                      </p> : null}
                       {job.errors?.length ? <details className="import-error-log">
-                        <summary>Recent extraction failures ({job.errors.length})</summary>
-                        <p>These requests failed after retries. Continuing with later pages does not recover the skipped questions.</p>
+                        <summary>Recent extraction issues ({job.errors.length})</summary>
+                        <p>{job.meta?.failed_pages?.length || job.errors.length} source page range{(job.meta?.failed_pages?.length || job.errors.length) === 1 ? "" : "s"} skipped. Questions may be missing from those ranges; extraction is continuing.</p>
                         <ul>{job.errors.map((error,index)=><li key={`${error.page||"job"}-${index}`}>
                           {error.page ? error.end_page && error.end_page > error.page ? `Pages ${error.page}–${error.end_page}: ` : `Page ${error.page}: ` : ""}{error.message}
                         </li>)}</ul>
