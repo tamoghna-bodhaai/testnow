@@ -1,4 +1,5 @@
 import base64, json, re, time
+from datetime import datetime, timezone
 from celery import Celery
 from pypdf import PdfReader
 from io import BytesIO
@@ -6,12 +7,19 @@ import fitz
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import SessionLocal
-from .models import ImportJob, ImportStatus, Question, QuestionKind, SourceDocument
+from .models import Attempt, ImportJob, ImportStatus, Question, QuestionKind, SourceDocument
+from .services import finalize_if_expired
 from .security import uid
 from .storage import get, put
 from .figures import DIAGRAM_SCHEMA, OPTION_SCHEMA, VISUAL_INSTRUCTIONS, image_regions, vector_regions, save_figures, visual_context, model_visual_request, canonical_visual_response, mark_scope_conflicts, ground_question_spans, rect
 
 celery_app=Celery("testnow",broker=settings().redis_url,backend=settings().redis_url)
+celery_app.conf.beat_schedule={
+    "finalize-expired-attempts-every-minute": {
+        "task":"app.tasks.finalize_expired_attempts",
+        "schedule":60.0,
+    },
+}
 SYSTEM="""You extract educational examination papers into teacher-reviewable records. Return only JSON matching the supplied schema.
 
 Read the full page image and native text together. A question starts at its printed number and ends immediately before the next printed number; never emit fragments, page headers, instructions, or a standalone option as a question. Its source_spans must cover the complete source area for that question, including its options and any associated figure. Preserve ordinary prose as readable Markdown. Preserve every equation as valid LaTeX wrapped in $...$ (or $$...$$ for a display equation), including its backslashes. Each option must be one complete semantic option in its markdown field, never JSON encoded as text. If choices are visibly labelled (A)-(D), (1)-(4), or similar, this is an objective question: return every option and classify it as single_choice or multiple_choice; do not call it subjective merely because an answer key is absent. The separately supplied answer-key document is authoritative: map its answer to the question option, and return its corresponding worked explanation in solution_markdown whenever available. Reuse the exact same chapter/topic spelling for repeated headings; do not make a question wording into a topic or subtopic. Format each solution as readable Markdown: use blank paragraphs, numbered steps for sequential working, and display math for substantial equations. Never flatten a multi-step solution into one paragraph. If an illustration, ray diagram, graph, circuit, table, or labelled figure belongs to a question, add an exact page and PDF-point bounding box for it. Do not make a whole-question screenshot a diagram. If a value cannot be read confidently, leave the relevant answer null and lower confidence. Confidence is a number from 0 to 1."""
@@ -362,3 +370,20 @@ def extract_bank_import(self, job_id: str):
     # The bank importer records a durable terminal state itself.  Retrying every
     # exception made permanent validation failures look like live processing.
     return run_bank_import(job_id)
+
+@celery_app.task
+def finalize_expired_attempts():
+    """Durably submit all attempts whose deadline has passed."""
+    db:Session=SessionLocal()
+    try:
+        now=datetime.now(timezone.utc)
+        attempts=db.query(Attempt).filter(Attempt.submitted_at.is_(None),Attempt.ends_at<=now).all()
+        finalized=sum(finalize_if_expired(db,attempt,now) for attempt in attempts)
+        if finalized:
+            db.commit()
+        return {"finalized":finalized}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

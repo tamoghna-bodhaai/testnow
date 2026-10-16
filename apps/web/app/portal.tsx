@@ -287,7 +287,8 @@ export function Portal() {
     [index, setIndex] = useState(0),
     [message, setMessage] = useState("");
   const previousJobs = useRef<Map<string, string>>(new Map()),
-    sessionVersion = useRef(0);
+    sessionVersion = useRef(0),
+    finishingAttempt = useRef<string | null>(null);
   const loadImports = async (version = sessionVersion.current) => {
     if (version !== sessionVersion.current) return [];
     const next: ImportJob[] = await api("/teacher/imports");
@@ -584,11 +585,16 @@ export function Portal() {
           index={index}
           setIndex={setIndex}
           finish={async () => {
+            if (finishingAttempt.current === attempt.id) return false;
+            finishingAttempt.current = attempt.id;
             try {
               await api(`/attempts/${attempt.id}/submit`, { method: "POST" });
               setView("result");
+              return true;
             } catch (e: any) {
+              finishingAttempt.current = null;
               setMessage(e.message);
+              return false;
             }
           }}
           update={async (qid, answer, marked) => {
@@ -3710,19 +3716,34 @@ function Exam({
   index: number;
   setIndex: (n: number) => void;
   update: (q: string, a: any, m: boolean) => void;
-  finish: () => void;
+  finish: () => Promise<boolean>;
 }) {
   const q = attempt.questions[index],
     r = attempt.responses[q.id] || {},
-    [now, setNow] = useState(Date.now());
+    [now, setNow] = useState(Date.now()),
+    [expiryRetry, setExpiryRetry] = useState(0),
+    expirySubmissionStarted = useRef(false),
+    mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   useEffect(() => {
     const x = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(x);
   }, []);
   const left = Math.max(0, new Date(attempt.ends_at).getTime() - now);
   useEffect(() => {
-    if (!left && !attempt.submitted_at) finish();
-  }, [left]);
+    if (!left && !attempt.submitted_at && !expirySubmissionStarted.current) {
+      expirySubmissionStarted.current = true;
+      void finish().then((submitted) => {
+        if (!submitted && mounted.current) {
+          expirySubmissionStarted.current = false;
+          window.setTimeout(() => mounted.current && setExpiryRetry((value) => value + 1), 5000);
+        }
+      });
+    }
+  }, [left, attempt.submitted_at, expiryRetry, finish]);
   const multiple = q.kind === "multiple_choice";
   const matrix = q.kind === "matrix_match";
   const written = ["numerical", "integer", "subjective"].includes(q.kind);

@@ -10,7 +10,7 @@ from .db import Base, engine, get_db
 from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
 from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
-from .services import audit, ensure_live, publish, score, safe_question_kind, snapshot_questions
+from .services import audit, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
 from .tasks import extract_import, extract_bank_import
 from .figure_repairs import revalidate_bank_figures
@@ -956,11 +956,14 @@ def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN
     students=db.query(User).filter(User.id.in_(student_ids)).order_by(User.name).all() if student_ids else []
     for student in students:
         attempts=db.query(Attempt).filter_by(test_id=test.id,student_id=student.id).order_by(Attempt.started_at.desc()).all()
+        for attempt in attempts:
+            finalize_if_expired(db,attempt)
         latest=attempts[0] if attempts else None
         if attempts:started+=1
         if any(a.submitted_at for a in attempts):submitted+=1
         status="not_started" if not latest else "submitted" if latest.submitted_at else "in_progress"
         rows.append({"student":user_public(student),"status":status,"score":latest.score if latest else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"attempt_count":len(attempts)})
+    db.commit()
     return {"test_id":test.id,"summary":{"assigned":len(student_ids),"started":started,"submitted":submitted,"pending":len(student_ids)-started},"students":rows}
 def test_view(t:Test,db:Session,include=False):
     v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids),"assigned_class_names":[c.name for c in classes]}
@@ -976,17 +979,20 @@ def student_tests(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(ge
         if not student_can_access(test,user.id,db):continue
         availability="upcoming" if test.opens_at and now<test.opens_at else "closed" if test.closes_at and now>test.closes_at else "available"
         attempts=db.query(Attempt).filter_by(test_id=test.id,student_id=user.id).order_by(Attempt.started_at.desc()).all()
+        for attempt in attempts:
+            finalize_if_expired(db,attempt,now)
         latest=attempts[0] if attempts else None
         latest_attempt=None
         if latest:
             latest_attempt={
                 "id":latest.id,
-                "status":"submitted" if latest.submitted_at else "in_progress" if now<latest.ends_at else "expired",
+                "status":"submitted" if latest.submitted_at else "in_progress",
                 "started_at":latest.started_at,
                 "submitted_at":latest.submitted_at,
                 "score":latest.score,
             }
         rows.append({**test_view(test,db),"availability":availability,"attempts_remaining":max(test.max_attempts-len(attempts),0),"latest_attempt":latest_attempt})
+    db.commit()
     return rows
 @app.get("/student/classes")
 def student_classes(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
@@ -1004,7 +1010,9 @@ def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessio
     if db.bind and db.bind.dialect.name=="postgresql":
         db.execute(__import__("sqlalchemy").text("SELECT pg_advisory_xact_lock(hashtext(:key))"),{"key":f"attempt:{test_id}:{user.id}"})
     active=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id,submitted_at=None).first()
-    if active:return attempt_view(active,db)
+    if active:
+        if finalize_if_expired(db,active):db.commit()
+        return attempt_view(active,db)
     prior=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id).count()
     if prior>=test.max_attempts:raise HTTPException(409,"Attempt limit reached")
     now=datetime.now(timezone.utc); ends=min(now+timedelta(seconds=test.duration_seconds),test.closes_at) if test.closes_at else now+timedelta(seconds=test.duration_seconds)
@@ -1013,6 +1021,7 @@ def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessio
 def get_attempt(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
     if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
+    if finalize_if_expired(db,a):db.commit()
     return attempt_view(a,db)
 @app.put("/attempts/{attempt_id}/responses/{question_id}")
 def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
@@ -1028,11 +1037,13 @@ def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depen
     a.revision+=1;db.commit();return {"revision":a.revision,"server_time":datetime.now(timezone.utc)}
 @app.post("/attempts/{attempt_id}/submit")
 def submit(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
-    a=db.get(Attempt,attempt_id)
+    a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
     if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
     if a.submitted_at:return attempt_view(a,db)
-    if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired and cannot be submitted")
-    version=db.get(TestVersion,a.version_id); responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};a.score,_=score(version.content,responses);a.submitted_at=datetime.now(timezone.utc);audit(db,user.id,"attempt.submitted","attempt",a.id);db.commit();return attempt_view(a,db)
+    now=datetime.now(timezone.utc)
+    if not finalize_if_expired(db,a,now):
+        finalize_attempt(db,a,submitted_at=now,actor_id=user.id,action="attempt.submitted")
+    db.commit();return attempt_view(a,db)
 @app.get("/results/{attempt_id}")
 def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)

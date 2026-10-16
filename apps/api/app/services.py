@@ -57,3 +57,27 @@ def score(content:dict,responses:dict[str,dict|None])->tuple[float,list[dict]]:
         points=policy.get("unanswered",0) if given is None else policy.get("correct",4) if correct else policy.get("incorrect",-1)
         total+=points; review.append({**q,"response":given,"correct":correct,"points":points})
     return total,review
+
+def finalize_attempt(db:Session, attempt:Attempt, *, submitted_at:datetime, actor_id:str|None, action:str)->bool:
+    """Score and submit an attempt exactly once using its saved responses."""
+    if attempt.submitted_at:
+        return False
+    version=db.get(TestVersion,attempt.version_id)
+    responses={response.question_id:response.answer for response in db.query(Response).filter_by(attempt_id=attempt.id)}
+    attempt.score,_=score(version.content,responses)
+    attempt.submitted_at=submitted_at
+    audit(db,actor_id,action,"attempt",attempt.id)
+    return True
+
+def finalize_if_expired(db:Session, attempt:Attempt, now:datetime|None=None)->bool:
+    """Finalize an unfinished attempt whose server-authoritative deadline passed."""
+    # The expiry worker, a resumed browser, and a normal submit can race at the
+    # deadline. Re-read under a row lock before scoring so only one path writes
+    # the result and audit event.
+    if db.bind and db.bind.dialect.name=="postgresql":
+        attempt=db.query(Attempt).filter_by(id=attempt.id).with_for_update().one()
+    now=now or datetime.now(timezone.utc)
+    ends_at=attempt.ends_at.replace(tzinfo=timezone.utc) if attempt.ends_at.tzinfo is None else attempt.ends_at.astimezone(timezone.utc)
+    if attempt.submitted_at or now<ends_at:
+        return False
+    return finalize_attempt(db,attempt,submitted_at=ends_at,actor_id=None,action="attempt.auto_submitted")

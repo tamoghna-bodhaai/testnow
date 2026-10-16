@@ -5,7 +5,8 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app import main
 from app.main import assigned_student_ids, create_student, delete_import, delete_test, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
-from app.models import AccountStatus, Attempt, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.models import AccountStatus, Attempt, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.tasks import finalize_expired_attempts
 from app.schemas import LoginIn, RosterUpdate, StudentCreate
 from fastapi import HTTPException
 
@@ -113,18 +114,30 @@ def test_teacher_cannot_take_over_another_teachers_student():
     assert student.name=="Original"
     assert not db.get(ClassMembership,{"class_id":second_class.id,"student_id":student.id})
 
-def test_expired_attempt_cannot_be_submitted():
+def test_expired_attempt_is_auto_submitted_with_saved_responses():
+    db=make_db()
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=1)
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[{"id":"question","kind":"single_choice","answer":{"option":0},"scoring":{"correct":4,"incorrect":-1}}]},published_at=datetime.now(timezone.utc))
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc).replace(year=2020))
+    response=AnswerResponse(attempt_id=attempt.id,question_id="question",answer={"option":0})
+    db.add_all([student,test,version,attempt,response]);db.commit()
+    # Explicit enrolment keeps this test assigned even without a classroom.
+    from app.models import Enrollment
+    db.add(Enrollment(test_id=test.id,student_id=student.id));db.commit()
+    completed=submit(attempt.id,student,db)
+    assert completed["submitted_at"] is not None
+    assert completed["score"]==4
+    assert db.get(Attempt,attempt.id).submitted_at is not None
+
+def test_expiry_worker_finalizes_attempt_without_a_browser(monkeypatch):
     db=make_db()
     student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
     test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=1)
     version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc))
     attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc).replace(year=2020))
     db.add_all([student,test,version,attempt]);db.commit()
-    # Explicit enrolment keeps this test assigned even without a classroom.
-    from app.models import Enrollment
-    db.add(Enrollment(test_id=test.id,student_id=student.id));db.commit()
-    try:
-        submit(attempt.id,student,db)
-        assert False, "expected expiry conflict"
-    except HTTPException as exc:
-        assert exc.status_code==409
+    monkeypatch.setattr("app.tasks.SessionLocal",lambda:db)
+
+    assert finalize_expired_attempts.run()=={"finalized":1}
+    assert db.get(Attempt,attempt.id).submitted_at is not None
