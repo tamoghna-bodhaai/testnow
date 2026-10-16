@@ -21,7 +21,7 @@ from .release import build_release
 
 
 _TOPIC = re.compile(r"^[ \t]*Topic[ \t]+(\d+)[ \t]+([^\n]+)", re.I)
-_NUMBER = re.compile(r"^\s*(\d{1,3})\.?\s+[A-Za-z(]", re.S)
+_NUMBER = re.compile(r"^[ \t]*(\d{1,3})\.?[ \t]+[A-Za-z(]")
 _SOLUTION_NUMBER = re.compile(r"^[ \t]*(\d{1,3})\.[ \t]+[A-Za-z(]", re.S)
 _KEY = re.compile(r"(?m)^\s*(\d{1,3})\.\s*\(([a-d](?:\s*,\s*[a-d])*)\)")
 _INTEGER_KEY = re.compile(r"^\s*(\d{1,3})\.\s*\((-?\d+)\)\s*$")
@@ -63,6 +63,7 @@ def _question_regions(document: fitz.Document, pages: list[int], chapter: str) -
     for page_index in pages:
         page = document[page_index]
         blocks = _blocks(page)
+        words = page.get_text("words")
         headings = sorted(
             [(block["rect"].y0, match.group(1), match.group(2).strip())
              for block in blocks if (match := _TOPIC.match(block["text"]))],
@@ -94,7 +95,10 @@ def _question_regions(document: fitz.Document, pages: list[int], chapter: str) -
             later += [boundary for boundary in section_boundaries if boundary > y + 2]
             bottom = min(later) - 3 if later else min(page.rect.height - 48, 770)
             left, right = (62, 326) if column == 0 else (332, page.rect.width - 55)
-            rect = fitz.Rect(left, max(0, y - 3), right, bottom)
+            printed_markers = [word for word in words if word[4].rstrip(".") == number
+                               and left <= word[0] <= left + 45 and y - 1 <= word[1] <= y + 16]
+            top = min(word[1] for word in printed_markers) - 2 if printed_markers else y - 3
+            rect = fitz.Rect(left, max(0, top), right, bottom)
             if rect.height < 24:
                 continue
             fragment = page.get_text("text", clip=rect)

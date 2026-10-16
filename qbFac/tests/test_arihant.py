@@ -2,7 +2,7 @@ import unittest
 
 import fitz
 
-from qbfac.arihant import _answers, _choice_regions, _solution_regions
+from qbfac.arihant import _answers, _choice_regions, _question_regions, _solution_regions
 
 
 class ArihantRecipeTests(unittest.TestCase):
@@ -68,6 +68,23 @@ class ArihantRecipeTests(unittest.TestCase):
         try:
             solutions = _solution_regions(document, [0])
             self.assertEqual(len(solutions[("1", "1")]), 1)
+        finally:
+            document.close()
+
+    def test_question_crop_starts_at_printed_number_not_previous_option_tail(self):
+        document = fitz.open()
+        page = document.new_page(width=650, height=800)
+        page.insert_text((63, 100), "Topic 1 Algebra", fontsize=12)
+        page.insert_text((342, 160), "(d) Previous option", fontsize=12)
+        page.insert_text((336, 185), "13. New question", fontsize=12)
+        page.insert_text((350, 210), "(a) 1 (b) 2 (c) 3 (d) 4", fontsize=12)
+        page.insert_text((336, 250), "14. Following question", fontsize=12)
+        try:
+            questions = _question_regions(document, [0], "Algebra")
+            target = next(question for question in questions if question["number"] == "13")
+            crop_text = page.get_text("text", clip=target["rect"])
+            self.assertIn("13. New question", crop_text)
+            self.assertNotIn("Previous option", crop_text)
         finally:
             document.close()
 
