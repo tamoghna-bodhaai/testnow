@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .release import build_release
 from .intake import inspect_source_archive
+from .extraction import extract_jee_pdf
 
 
 def main() -> None:
@@ -21,10 +22,16 @@ def main() -> None:
     release.add_argument("--output", required=True, type=Path)
     inspect = subcommands.add_parser("inspect", help="inspect a raw source ZIP before extraction")
     inspect.add_argument("archive", type=Path)
+    extract = subcommands.add_parser("extract-jee-pdf", help="extract chapter/topic/type candidates from a structured JEE PDF")
+    extract.add_argument("source", type=Path)
+    extract.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
     if args.command == "inspect":
         print(json.dumps(inspect_source_archive(args.archive), indent=2))
+        return
+    if args.command == "extract-jee-pdf":
+        print(json.dumps(extract_jee_pdf(args.source, args.output), indent=2))
         return
 
     records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(args.items.glob("*.json"))]

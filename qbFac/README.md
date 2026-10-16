@@ -47,6 +47,17 @@ Inspect a raw corpus before any extraction or LLM work:
 PYTHONPATH=src python3 -m qbfac.cli inspect /imports/physics-corpus.zip
 ```
 
+For an editorially structured, digital JEE book, produce a human-readable
+chapter/topic/type inventory and traceable question candidates without an LLM:
+
+```bash
+PYTHONPATH=src python3 -m qbfac.cli extract-jee-pdf source.pdf --output /tmp/qbfac-run
+```
+
+`review.html` is the reviewer-facing result; `question-inventory.csv` supports
+filtering and batching. `candidates.jsonl` remains internal evidence for the
+subsequent answer/solution linking and approval stages.
+
 ## Release contract
 
 Each package contains:
