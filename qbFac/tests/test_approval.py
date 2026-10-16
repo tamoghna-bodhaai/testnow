@@ -40,6 +40,9 @@ class ApprovalTests(unittest.TestCase):
             candidates.write_text(json.dumps(candidate) + "\n")
             self.assertEqual(prepare_decisions(candidates, decisions), 1)
             self.assertEqual(json.loads(decisions.read_text())["status"], "pending")
+            queued = promote_candidates(candidates_path=candidates, decisions_path=decisions, output=output, report_path=report_path, release_id="sample", title="Sample")
+            self.assertEqual((queued["pending"], queued["rejected"]), (1, 0))
+            self.assertFalse(output.exists())
             decision = {"candidate_id": candidate["candidate_id"], "candidate_sha256": candidate_sha256(candidate), "status": "approved", "item": item}
             decisions.write_text(json.dumps(decision) + "\n")
             report = promote_candidates(candidates_path=candidates, decisions_path=decisions, output=output, report_path=report_path, release_id="sample", title="Sample")

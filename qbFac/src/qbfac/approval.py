@@ -79,6 +79,9 @@ def promote_candidates(
         if decision.get("candidate_sha256") != candidate_sha256(candidate):
             outcomes.append({"candidate_id": identifier, "status": "rejected", "reason": "source evidence changed"})
             continue
+        if decision.get("status") == "pending":
+            outcomes.append({"candidate_id": identifier, "status": "pending", "reason": "awaiting complete item and approval"})
+            continue
         if decision.get("status") != "approved":
             outcomes.append({"candidate_id": identifier, "status": "rejected", "reason": "decision is not approved"})
             continue
