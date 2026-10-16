@@ -28,3 +28,16 @@ Objective Questions I (Only one correct option)
         self.assertEqual(classify_question_kind("Assertion Reason"), "assertion_reason")
         self.assertEqual(classify_question_kind("Integer Type Questions"), "integer")
 
+    def test_applies_a_new_type_only_to_following_questions_on_the_same_page(self):
+        records, _ = parse_page_text(
+            """True/False
+1 Statement one is true.
+Analytical & Descriptive Questions
+2 Prove statement two.
+""",
+            page_number=1,
+            chapter="Test",
+            state={},
+        )
+        self.assertEqual([record["question_type"] for record in records], ["true_false", "subjective"])
+

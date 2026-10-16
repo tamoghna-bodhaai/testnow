@@ -54,11 +54,10 @@ def classify_question_kind(heading: str) -> str | None:
 
 def _editorial_headings(text: str) -> list[tuple[int, str]]:
     matches: list[tuple[int, str]] = []
-    for line in text.splitlines():
-        kind = classify_question_kind(line)
+    for line in re.finditer(r"(?m)^(.+)$", text):
+        kind = classify_question_kind(line.group(1))
         if kind:
-            offset = text.find(line)
-            matches.append((offset, kind))
+            matches.append((line.start(), kind))
     return matches
 
 
@@ -82,15 +81,17 @@ def parse_page_text(
     headings = _editorial_headings(text)
     if re.search(r"(?im)^\s*(objective questions|true\s*/\s*false|fill in the blanks|integer type|numerical value|assertion.{0,24}reason|matrix.{0,24}match)", text):
         state["phase"] = "questions"
-    for _, kind in headings:
-        state["question_type"] = kind
-
     if state.get("phase", "questions") != "questions":
         return [], state
 
     matches = list(_QUESTION.finditer(text))
     records = []
+    heading_index = 0
+    question_type = state.get("question_type", "unclassified")
     for index, match in enumerate(matches):
+        while heading_index < len(headings) and headings[heading_index][0] < match.start():
+            question_type = headings[heading_index][1]
+            heading_index += 1
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         candidate = normalize_text(text[match.start() : end])
         # Page headers and equation artefacts are never viable questions. A
@@ -103,13 +104,15 @@ def parse_page_text(
                 "chapter": chapter,
                 "topic": state.get("topic"),
                 "topic_number": state.get("topic_number"),
-                "question_type": state.get("question_type", "unclassified"),
+                "question_type": question_type,
                 "page_start": page_number,
                 "page_end": page_number,
                 "source_text": candidate,
-                "needs_review": state.get("question_type") in {None, "subjective", "passage"},
+                "needs_review": question_type in {"unclassified", "subjective", "passage"},
             }
         )
+    if headings:
+        state["question_type"] = headings[-1][1]
     return records, state
 
 
