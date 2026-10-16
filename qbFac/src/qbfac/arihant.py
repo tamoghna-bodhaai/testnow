@@ -24,7 +24,9 @@ _TOPIC = re.compile(r"^[ \t]*Topic[ \t]+(\d+)[ \t]+([^\n]+)", re.I)
 _NUMBER = re.compile(r"^\s*(\d{1,3})\.?\s+[A-Za-z(]", re.S)
 _SOLUTION_NUMBER = re.compile(r"^[ \t]*(\d{1,3})\.[ \t]+[A-Za-z(]", re.S)
 _KEY = re.compile(r"(?m)^\s*(\d{1,3})\.\s*\(([a-d](?:\s*,\s*[a-d])*)\)")
+_INTEGER_KEY = re.compile(r"^\s*(\d{1,3})\.\s*\((-?\d+)\)\s*$")
 _OPTION = re.compile(r"\(([a-d])\)", re.I)
+_NAMED_TOPIC = re.compile(r"^Topic[ \t]+(\d+)(?:[ \t]+([^\n]+)|[ \t]*\n([^\n]+))", re.I)
 
 
 def _blocks(page: fitz.Page) -> list[dict[str, Any]]:
@@ -90,7 +92,7 @@ def _question_regions(document: fitz.Document, pages: list[int], chapter: str) -
             later = [other_y for other_y, other_col, _ in starts if other_col == column and other_y > y + 2]
             later += [heading_y for heading_y, _, _ in headings if heading_y > y + 2]
             later += [boundary for boundary in section_boundaries if boundary > y + 2]
-            bottom = min(later) - 8 if later else min(page.rect.height - 48, 770)
+            bottom = min(later) - 3 if later else min(page.rect.height - 48, 770)
             left, right = (62, 326) if column == 0 else (332, page.rect.width - 55)
             rect = fitz.Rect(left, max(0, y - 3), right, bottom)
             if rect.height < 24:
@@ -109,29 +111,41 @@ def _question_regions(document: fitz.Document, pages: list[int], chapter: str) -
 
 def _answers(document: fitz.Document, pages: list[int]) -> dict[tuple[str, str], dict[str, Any]]:
     answers: dict[tuple[str, str], dict[str, Any]] = {}
-    topic: str | None = None
     for page_index in pages:
         page = document[page_index]
-        text = page.get_text("text")
-        if not re.search(r"(?m)^\s*Answers\s*$", text):
+        blocks = _blocks(page)
+        headings = [block["rect"].y0 for block in blocks if block["text"].strip() == "Answers"]
+        if not headings:
             continue
-        key_text = text.split("Answers", 1)[1]
-        # The first named topic marks the start of the worked solutions.
-        key_text = re.split(r"(?m)^Topic[ \t]+\d+[ \t]+\S", key_text, maxsplit=1)[0]
-        for line in key_text.splitlines():
-            heading = re.match(r"^\s*Topic\s+(\d+)\s*$", line)
-            if heading:
-                topic = heading.group(1)
-                continue
-            match = _KEY.match(line)
-            if not match or topic is None:
-                continue
-            selected = [letter.strip().upper() for letter in match.group(2).split(",")]
-            key = (topic, match.group(1))
-            if key in answers and answers[key]["selected"] != selected:
-                answers[key]["ambiguous"] = True
-            else:
-                answers[key] = {"selected": selected, "page": page_index + 1}
+        top = min(headings)
+        boundaries = [block["rect"].y0 for block in blocks if block["rect"].y0 > top and (
+            block["text"].strip() == "Hints & Solutions"
+            or re.match(r"^Topic[ \t]+\d+[ \t]+\S", block["text"])
+            or re.match(r"^Topic[ \t]+\d+[ \t]*\n(?!\d+\.)[A-Za-z]", block["text"])
+        )]
+        bottom = min(boundaries) if boundaries else page.rect.height - 35
+        key_blocks = [block for block in blocks if top < block["rect"].y0 < bottom and block["rect"].x0 < page.rect.width - 35]
+        # MuPDF's text order may put the centered heading after both columns.
+        # The printed key, however, reads down the left column then the right.
+        key_blocks.sort(key=lambda block: (block["rect"].x0 >= page.rect.width / 2, block["rect"].y0))
+        topic: str | None = None
+        for block in key_blocks:
+            for line in block["text"].splitlines():
+                heading = re.match(r"^Topic[ \t]+(\d+)[ \t]*$", line)
+                if heading:
+                    topic = heading.group(1)
+                    continue
+                match = _KEY.match(line)
+                integer_match = _INTEGER_KEY.match(line) if match is None else None
+                if (match is None and integer_match is None) or topic is None:
+                    continue
+                parsed = ({"selected": [letter.strip().upper() for letter in match.group(2).split(",")]} if match
+                          else {"value": int(integer_match.group(2))})
+                key = (topic, (match or integer_match).group(1))
+                if key in answers and any(answers[key].get(field) != value for field, value in parsed.items()):
+                    answers[key]["ambiguous"] = True
+                else:
+                    answers[key] = {**parsed, "page": page_index + 1}
     return answers
 
 
@@ -142,32 +156,44 @@ def _solution_regions(document: fitz.Document, pages: list[int]) -> dict[tuple[s
     for page_index in pages:
         page = document[page_index]
         blocks = _blocks(page)
+        solution_headings = [block["rect"].y0 for block in blocks if block["text"].strip() == "Hints & Solutions"]
+        solution_top = min(solution_headings) if solution_headings else None
         starts: list[tuple[float, int, str, str]] = []
-        headings: list[tuple[float, str]] = []
+        headings: list[tuple[float, int, str]] = []
         for block in blocks:
             rect = block["rect"]
-            heading = _TOPIC.match(block["text"])
-            if heading and heading.group(2).strip():
-                headings.append((rect.y0, heading.group(1)))
+            if solution_top is not None and rect.y0 <= solution_top:
+                continue
+            heading = _NAMED_TOPIC.match(block["text"])
+            if heading and (heading.group(2) or heading.group(3)).strip() and not re.match(r"\d+\.", (heading.group(2) or heading.group(3)).strip()):
+                headings.append((rect.y0, 0 if rect.x0 < 320 else 1, heading.group(1)))
+                # In this PDF the first worked answer is often fused into the
+                # topic-heading text block, not emitted as a separate block.
+                embedded = re.search(r"(?m)^([1-9]\d{0,2})\.[ \t]+[A-Za-z(]", block["text"])
+                if embedded:
+                    markers = [hit for hit in page.search_for(f"{embedded.group(1)}.", clip=rect)
+                               if hit.y0 > rect.y0 + 8 and abs(hit.x0 - rect.x0) < 20]
+                    if markers:
+                        starts.append((markers[0].y0, 0 if rect.x0 < 320 else 1, embedded.group(1), block["text"]))
             if not (60 <= rect.x0 <= 105 or 330 <= rect.x0 <= 365):
                 continue
             match = _SOLUTION_NUMBER.match(block["text"])
             if match:
                 starts.append((rect.y0, 0 if rect.x0 < 320 else 1, match.group(1), block["text"]))
-        headings.sort()
+        headings.sort(key=lambda value: (value[1], value[0]))
         if headings:
             in_solutions = True
         if not in_solutions:
             continue
-        starts.sort()
+        starts.sort(key=lambda value: (value[1], value[0]))
         for y, column, number, text in starts:
-            applicable = [heading for heading in headings if heading[0] < y]
+            applicable = [heading for heading in headings if (heading[1], heading[0]) < (column, y)]
             if applicable:
-                topic = applicable[-1][1]
+                topic = applicable[-1][2]
             if topic is None:
                 continue
             later = [other_y for other_y, other_col, _, _ in starts if other_col == column and other_y > y + 2]
-            later += [heading_y for heading_y, _ in headings if heading_y > y + 2]
+            later += [heading_y for heading_y, heading_col, _ in headings if heading_col == column and heading_y > y + 2]
             # Reject a solution that might continue onto another page.
             if not later:
                 continue
@@ -179,7 +205,7 @@ def _solution_regions(document: fitz.Document, pages: list[int]) -> dict[tuple[s
             key = (topic, number)
             found.setdefault(key, []).append({"page": page_index + 1, "rect": rect})
         if headings:
-            topic = headings[-1][1]
+            topic = headings[-1][2]
     return found
 
 
@@ -206,10 +232,12 @@ def _review_html(items: list[dict[str, Any]], assets: dict[str, bytes]) -> str:
     for item in items:
         taxonomy = item["taxonomy"]
         options = "".join(
-            f'<div class="option"><b>{option["id"]}</b>{picture(option["content"]["value"])}</div>'
+            f'<div class="option"><b>{option["id"]}</b>'
+            + (picture(option["content"]["value"]) if option["content"]["format"] == "asset" else '<span>Choose this printed option in the question image</span>')
+            + '</div>'
             for option in item["interaction"]["options"]
         )
-        selected = ", ".join(item["answer"]["selected"])
+        selected = ", ".join(item["answer"]["selected"]) if "selected" in item["answer"] else str(item["answer"]["value"])
         cards.append(
             f'<article data-chapter="{html.escape(taxonomy["chapter"], quote=True)}" '
             f'data-topic="{html.escape(taxonomy["topic"], quote=True)}">'
@@ -268,6 +296,7 @@ def build_arihant_release(
     items: list[dict[str, Any]] = []
     assets: dict[str, bytes] = {}
     reasons: Counter[str] = Counter()
+    inventory: Counter[str] = Counter()
     examples: list[dict[str, Any]] = []
     try:
         for start, end, chapter in _chapter_ranges(document):
@@ -280,6 +309,7 @@ def build_arihant_release(
             questions = _question_regions(document, question_pages, chapter)
             keys = _answers(document, answer_pages)
             solutions = _solution_regions(document, solution_pages)
+            inventory.update(question_regions=len(questions), answer_keys=len(keys), solution_regions=len(solutions))
             occurrence: Counter[tuple[str, str]] = Counter()
             for question in questions:
                 key = (question["topic_number"], question["number"])
@@ -289,19 +319,20 @@ def build_arihant_release(
                 reason = None
                 answer = keys.get(key)
                 solution_regions = solutions.get(key, [])
+                numeric = bool(answer and "value" in answer)
                 if occurrence[key] != 1:
                     reason = "duplicate_question_number"
-                elif question["option_labels"] != {"a", "b", "c", "d"}:
-                    reason = "incomplete_or_ambiguous_options"
                 elif not answer or answer.get("ambiguous"):
                     reason = "missing_or_ambiguous_answer"
+                elif numeric and question["option_labels"]:
+                    reason = "numeric_answer_has_options"
+                elif not numeric and question["option_labels"] != {"a", "b", "c", "d"}:
+                    reason = "incomplete_or_ambiguous_options"
                 elif not solution_regions or len(solution_regions) != 1:
                     reason = "missing_or_ambiguous_solution"
-                elif any(letter.lower() not in question["option_labels"] for letter in answer["selected"]):
+                elif not numeric and any(letter.lower() not in question["option_labels"] for letter in answer["selected"]):
                     reason = "answer_not_in_options"
-                choice_regions = _choice_regions(document[question["page"] - 1], question["rect"]) if not reason else None
-                if not reason and choice_regions is None:
-                    reason = "option_geometry_unresolved"
+                choice_regions = _choice_regions(document[question["page"] - 1], question["rect"]) if not reason and not numeric else None
                 if reason:
                     reasons[reason] += 1
                     if len(examples) < 100:
@@ -309,11 +340,10 @@ def build_arihant_release(
                     continue
                 if max_items is not None and len(items) >= max_items:
                     break
-                selected = answer["selected"]
-                kind = "single_choice" if len(selected) == 1 else "multiple_select"
-                profile = "jee-main-paper-1" if kind == "single_choice" else "jee-advanced"
+                kind = "integer" if numeric else ("single_choice" if len(answer["selected"]) == 1 else "multiple_select")
+                profile = "jee-advanced" if kind == "multiple_select" else "jee-main-paper-1"
                 item_id = f"arihant-maths-p{question['page']}-t{key[0]}-q{key[1]}"
-                stem_rect, option_rects = choice_regions
+                stem_rect, option_rects = (question["rect"], {}) if numeric or choice_regions is None else choice_regions
                 question_asset = f"assets/{item_id}-stem.png"
                 solution_asset = f"assets/{item_id}-solution.png"
                 option_assets = {}
@@ -322,26 +352,33 @@ def build_arihant_release(
                     path = f"assets/{item_id}-option-{letter}.png"
                     option_assets[letter] = path
                     rendered_options[path] = _checked_png(document, question["page"], rect)
-                if any(payload is None for payload in rendered_options.values()):
-                    reasons["option_crop_touches_edge"] += 1
+                visual_fallback = not numeric and (choice_regions is None or any(payload is None for payload in rendered_options.values()))
+                if visual_fallback:
+                    stem_rect, option_rects, option_assets, rendered_options = question["rect"], {}, {}, {}
+                stem_png = _checked_png(document, question["page"], stem_rect) if numeric or visual_fallback else _png(document, question["page"], stem_rect)
+                if stem_png is None:
+                    reasons["question_crop_touches_edge"] += 1
                     continue
                 sol = solution_regions[0]
                 solution_png = _checked_png(document, sol["page"], sol["rect"])
                 if solution_png is None:
                     reasons["solution_crop_touches_edge"] += 1
                     continue
-                assets[question_asset] = _png(document, question["page"], stem_rect)
+                assets[question_asset] = stem_png
                 assets.update(rendered_options)
                 assets[solution_asset] = solution_png
+                if visual_fallback:
+                    inventory["full_question_choice_fallbacks"] += 1
                 span = lambda role, page, rect: {"role": role, "page": page, "bbox": [round(value, 2) for value in rect]}
                 items.append({
                     "id": item_id, "revision": 1, "exam_profiles": [profile],
                     "taxonomy": {"subject": "Mathematics", "chapter": chapter, "topic": question["topic"]},
                     "interaction": {"kind": kind, "options": [
-                        {"id": letter, "content": {"format": "asset", "value": option_assets[letter]}} for letter in "ABCD"
+                        {"id": letter, "content": ({"format": "markdown", "value": letter} if visual_fallback else {"format": "asset", "value": option_assets[letter]})}
+                        for letter in ("ABCD" if not numeric else ())
                     ]},
                     "content": {"stem": {"format": "asset", "value": question_asset}},
-                    "answer": {"selected": selected},
+                    "answer": {"value": answer["value"]} if numeric else {"selected": answer["selected"]},
                     "solution": {"format": "asset", "value": solution_asset},
                     "scoring": {"type": "exact", "correct": 4, "incorrect": -1, "unanswered": 0},
                     "provenance": {"source_id": source.name, "printed_number": question["number"], "spans": [
@@ -353,7 +390,7 @@ def build_arihant_release(
                 })
             if max_items is not None and len(items) >= max_items:
                 break
-        report: dict[str, Any] = {"source": source.name, "generated_items": len(items), "excluded": dict(reasons), "examples": examples}
+        report: dict[str, Any] = {"source": source.name, "generated_items": len(items), "inventory": dict(inventory), "excluded": dict(reasons), "examples": examples}
         if items:
             report["release"] = build_release(
                 release_id=f"arihant-maths-visual-v1-{len(items)}", title="Arihant JEE Mathematics visual items",

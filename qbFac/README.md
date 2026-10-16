@@ -92,10 +92,13 @@ infer missing answers, repair broken formulae, or approve diagrams by itself.
 
 For the two-column `Arihant_41_Years_Maths.pdf` source, qbFac can now build
 visual CBT items directly. It reads chapter/topic headings, printed MCQ/MSQ
-answer keys, and worked solutions. It separates the question stem and each
-printed option into its own high-resolution image, then binds all six images
-to one canonical CBT item. This preserves equations and diagrams without a
-text-to-LaTeX conversion.
+and parenthesized integer answer keys, and worked solutions. For choice items,
+it separates the question stem and each printed option into its own
+high-resolution image; integer items retain one full question image. This
+preserves equations and diagrams without a text-to-LaTeX conversion.
+If an option diagram cannot be split safely, it retains the entire printed
+question/choice area as one image and exposes A/B/C/D answer buttons. The
+review report counts these full-question visual fallbacks separately.
 
 ```bash
 PYTHONPATH=src python3 -m qbfac.cli build-arihant \
@@ -107,13 +110,18 @@ PYTHONPATH=src python3 -m qbfac.cli build-arihant \
 The ZIP is accepted by TestNow's qbFac release importer. Questions carry
 subject, chapter, topic, printed number, answer, source pages and image
 coordinates. The importer shows the four visual choices as separate response
-buttons and the visual solution after the exam. The command also writes a
+buttons (or a numerical response field) and the visual solution after the exam. The command also writes a
 filterable HTML preview beside the JSON report so the batch can be checked by
 chapter and topic before upload.
 
+The report includes question-region, answer-key, and solution-region counts in
+addition to exclusion reasons. The first-pass `candidates.jsonl` count is not
+the number of bank-ready questions: it can include answer/solution text and
+unbounded fragments. Do not use it as a release-yield denominator.
+
 The recipe is intentionally conservative. It excludes questions with missing
-or repeated keys, uncertain option or solution boundaries, and crops that touch
-an image edge. Its `quality.approval_mode` is `deterministic`; bulk results
+or repeated keys, uncertain solution boundaries, and crops that touch an image
+edge. Its `quality.approval_mode` is `deterministic`; bulk results
 should still be sampled before a bank is published. Scoring is a practice
 default of +4/-1/0 and should be adjusted for a specific exam blueprint.
 

@@ -2,7 +2,7 @@ import unittest
 
 import fitz
 
-from qbfac.arihant import _answers, _choice_regions
+from qbfac.arihant import _answers, _choice_regions, _solution_regions
 
 
 class ArihantRecipeTests(unittest.TestCase):
@@ -14,11 +14,60 @@ class ArihantRecipeTests(unittest.TestCase):
         page.insert_text((70, 140), "1. (c)", fontsize=12)
         page.insert_text((70, 160), "Topic 2", fontsize=12)
         page.insert_text((70, 180), "1. (a, d)", fontsize=12)
+        page.insert_text((70, 195), "2. (6)", fontsize=12)
         page.insert_text((70, 220), "Topic 1 Worked Solutions", fontsize=12)
         try:
             answer = _answers(document, [0])
             self.assertEqual(answer[("1", "1")]["selected"], ["C"])
             self.assertEqual(answer[("2", "1")]["selected"], ["A", "D"])
+            self.assertEqual(answer[("2", "2")]["value"], 6)
+        finally:
+            document.close()
+
+    def test_reads_key_by_visual_position_when_pdf_text_order_is_reversed(self):
+        document = fitz.open()
+        page = document.new_page(width=620, height=800)
+        # Many source pages place the heading last in their PDF text stream.
+        page.insert_text((70, 250), "Topic 1", fontsize=12)
+        page.insert_text((70, 270), "1. (c)", fontsize=12)
+        page.insert_text((340, 250), "Topic 2", fontsize=12)
+        page.insert_text((340, 270), "1. (a, d)", fontsize=12)
+        page.insert_text((70, 550), "Topic 1\nWorked Solutions", fontsize=12)
+        page.insert_text((290, 205), "Answers", fontsize=12)
+        page.insert_text((230, 500), "Hints & Solutions", fontsize=12)
+        try:
+            answer = _answers(document, [0])
+            self.assertEqual(answer[("1", "1")]["selected"], ["C"])
+            self.assertEqual(answer[("2", "1")]["selected"], ["A", "D"])
+        finally:
+            document.close()
+
+    def test_solution_regions_do_not_reuse_answer_key_rows(self):
+        document = fitz.open()
+        page = document.new_page(width=620, height=800)
+        page.insert_text((70, 250), "Topic 1", fontsize=12)
+        page.insert_text((75, 280), "1. (c)", fontsize=12)
+        page.insert_text((290, 205), "Answers", fontsize=12)
+        page.insert_text((230, 500), "Hints & Solutions", fontsize=12)
+        page.insert_text((70, 540), "Topic 1 Worked Solutions", fontsize=12)
+        page.insert_text((75, 570), "1. First worked solution", fontsize=12)
+        page.insert_text((75, 620), "2. Second worked solution", fontsize=12)
+        try:
+            solutions = _solution_regions(document, [0])
+            self.assertEqual(len(solutions[("1", "1")]), 1)
+            self.assertGreater(solutions[("1", "1")][0]["rect"].y0, 500)
+        finally:
+            document.close()
+
+    def test_first_solution_can_share_a_topic_heading_block(self):
+        document = fitz.open()
+        page = document.new_page(width=620, height=800)
+        page.insert_text((230, 100), "Hints & Solutions", fontsize=12)
+        page.insert_text((70, 140), "Topic 1\nAlgebra\n1. First worked solution", fontsize=12)
+        page.insert_text((75, 210), "2. Second worked solution", fontsize=12)
+        try:
+            solutions = _solution_regions(document, [0])
+            self.assertEqual(len(solutions[("1", "1")]), 1)
         finally:
             document.close()
 
