@@ -7,16 +7,25 @@ import json
 from pathlib import Path
 
 from .release import build_release
+from .intake import inspect_source_archive
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="qbfac", description="Build a validated qbFac release")
-    parser.add_argument("items", type=Path, help="Directory containing reviewed item JSON files")
-    parser.add_argument("--release-id", required=True)
-    parser.add_argument("--title", required=True)
-    parser.add_argument("--assets", type=Path, help="Directory copied under assets/ in the release")
-    parser.add_argument("--output", required=True, type=Path)
+    parser = argparse.ArgumentParser(prog="qbfac", description="Create or inspect structured question-bank material")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    release = subcommands.add_parser("release", help="build a release from reviewed canonical items")
+    release.add_argument("items", type=Path, help="Directory containing reviewed item JSON files")
+    release.add_argument("--release-id", required=True)
+    release.add_argument("--title", required=True)
+    release.add_argument("--assets", type=Path, help="Directory copied under assets/ in the release")
+    release.add_argument("--output", required=True, type=Path)
+    inspect = subcommands.add_parser("inspect", help="inspect a raw source ZIP before extraction")
+    inspect.add_argument("archive", type=Path)
     args = parser.parse_args()
+
+    if args.command == "inspect":
+        print(json.dumps(inspect_source_archive(args.archive), indent=2))
+        return
 
     records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(args.items.glob("*.json"))]
     assets = {}

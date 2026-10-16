@@ -23,7 +23,10 @@ sources → source-family extraction recipes → candidate items → validation/
 - Release guardrails: only approved items, valid response contracts, official
   JEE profile compatibility, mapped solutions, audit provenance, complete media,
   and package-wide integrity hashing may leave qbFac.
-- A dependency-free CLI for building a release from reviewed JSON items.
+- A CLI for source inspection and building releases from reviewed canonical items.
+- Raw source ZIP inspection for PDF and DOCX files, including deterministic
+  document-role detection, scan/digital classification, text-density evidence,
+  and embedded-media counts. This is the first stage of the end-to-end factory.
 
 See [JEE profiles](docs/jee-profiles.md) and the [example item](examples/jee-main-single-choice.json).
 
@@ -32,10 +35,16 @@ See [JEE profiles](docs/jee-profiles.md) and the [example item](examples/jee-mai
 ```bash
 cd qbFac
 PYTHONPATH=src python3 -m unittest discover -s tests -v
-PYTHONPATH=src python3 -m qbfac.cli examples \
+PYTHONPATH=src python3 -m qbfac.cli release examples \
   --release-id jee-main-demo-2026.1 \
   --title "JEE Main demo release" \
   --output /tmp/jee-main-demo-2026.1.zip
+```
+
+Inspect a raw corpus before any extraction or LLM work:
+
+```bash
+PYTHONPATH=src python3 -m qbfac.cli inspect /imports/physics-corpus.zip
 ```
 
 ## Release contract

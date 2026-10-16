@@ -7,6 +7,7 @@ name = "qbfac"
 version = "0.1.0"
 description = "Question Bank Factory: validated portable releases for JEE-oriented assessment banks"
 requires-python = ">=3.11"
+dependencies = ["PyMuPDF>=1.27,<2"]
 
 [project.scripts]
 qbfac = "qbfac.cli:main"
