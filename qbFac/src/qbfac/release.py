@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,8 @@ def build_release(*, release_id: str, title: str, items: Iterable[dict[str, Any]
     entries: list[tuple[str, bytes]] = []
     for item in materialized:
         validate_item(item)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item["id"]):
+            raise ValueError(f"unsafe item ID for release path: {item['id']!r}")
         if item["id"] in ids:
             raise ValueError(f"duplicate item ID in release: {item['id']}")
         ids.add(item["id"])
@@ -45,7 +48,7 @@ def build_release(*, release_id: str, title: str, items: Iterable[dict[str, Any]
     missing_assets = sorted(referenced_assets - set(assets))
     if missing_assets:
         raise ValueError(f"missing assets required by items: {', '.join(missing_assets)}")
-    invalid_assets = sorted(name for name, payload in assets.items() if not name.startswith("assets/") or not isinstance(payload, bytes))
+    invalid_assets = sorted(name for name, payload in assets.items() if not name.startswith("assets/") or ".." in Path(name).parts or name.endswith("/") or not isinstance(payload, bytes))
     if invalid_assets:
         raise ValueError(f"assets must be byte payloads below assets/: {', '.join(invalid_assets)}")
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from .release import build_release
 from .intake import inspect_source_archive
 from .extraction import extract_jee_pdf
+from .approval import prepare_decisions, promote_candidates
 
 
 def main() -> None:
@@ -25,6 +26,17 @@ def main() -> None:
     extract = subcommands.add_parser("extract-jee-pdf", help="extract chapter/topic/type candidates from a structured JEE PDF")
     extract.add_argument("source", type=Path)
     extract.add_argument("--output", required=True, type=Path)
+    prepare = subcommands.add_parser("prepare-decisions", help="create an evidence-bound review queue from extracted candidates")
+    prepare.add_argument("candidates", type=Path)
+    prepare.add_argument("--output", required=True, type=Path)
+    promote = subcommands.add_parser("promote", help="validate reviewed candidates and build an approved CBT release")
+    promote.add_argument("candidates", type=Path)
+    promote.add_argument("decisions", type=Path)
+    promote.add_argument("--release-id", required=True)
+    promote.add_argument("--title", required=True)
+    promote.add_argument("--assets", type=Path)
+    promote.add_argument("--output", required=True, type=Path)
+    promote.add_argument("--report", required=True, type=Path)
     args = parser.parse_args()
 
     if args.command == "inspect":
@@ -32,6 +44,16 @@ def main() -> None:
         return
     if args.command == "extract-jee-pdf":
         print(json.dumps(extract_jee_pdf(args.source, args.output), indent=2))
+        return
+    if args.command == "prepare-decisions":
+        print(json.dumps({"queued": prepare_decisions(args.candidates, args.output), "output": str(args.output)}, indent=2))
+        return
+    if args.command == "promote":
+        print(json.dumps(promote_candidates(
+            candidates_path=args.candidates, decisions_path=args.decisions,
+            output=args.output, report_path=args.report, release_id=args.release_id,
+            title=args.title, assets_dir=args.assets,
+        ), indent=2))
         return
 
     records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(args.items.glob("*.json"))]

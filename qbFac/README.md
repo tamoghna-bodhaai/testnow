@@ -58,6 +58,36 @@ PYTHONPATH=src python3 -m qbfac.cli extract-jee-pdf source.pdf --output /tmp/qbf
 filtering and batching. `candidates.jsonl` remains internal evidence for the
 subsequent answer/solution linking and approval stages.
 
+## Promote candidates to approved CBT items
+
+Create a decision queue from the exact extraction output:
+
+```bash
+PYTHONPATH=src python3 -m qbfac.cli prepare-decisions \
+  /tmp/qbfac-run/candidates.jsonl --output /tmp/qbfac-run/decisions.jsonl
+```
+
+An enrichment job or review tool fills each decision's `item` with a complete
+canonical item and sets `status` to `approved`. The supplied
+`candidate_sha256` must stay unchanged. Approval requires an identified
+reviewer or service, explicit structure/answer/solution/taxonomy/visual checks,
+and separate question, answer and solution source spans. The item must pass
+the canonical response and scoring contract. A `pending` decision cannot be
+released.
+
+```bash
+PYTHONPATH=src python3 -m qbfac.cli promote \
+  /tmp/qbfac-run/candidates.jsonl /tmp/qbfac-run/decisions.jsonl \
+  --release-id maths-reviewed-2026-1 --title "Reviewed JEE Maths" \
+  --assets /tmp/qbfac-run/assets \
+  --report /tmp/qbfac-run/promotion-report.json \
+  --output /tmp/qbfac-run/release.zip
+```
+
+The report lists approved, rejected and pending candidates. The release ZIP is
+created only if at least one item satisfies every gate. This command does not
+infer missing answers, repair broken formulae, or approve diagrams by itself.
+
 ## Release contract
 
 Each package contains:
@@ -75,6 +105,6 @@ must make every published item traceable to evidence.
 ## Deliberately not included yet
 
 The next project increments are source-family registration, PDF/DOCX/OCR
-adapter interfaces, deterministic answer/solution mappers, candidate storage,
-and batch validation metrics. Those components create candidates; they do not
-weaken this release contract.
+adapter interfaces, deterministic answer/solution mappers, diagram ownership,
+candidate storage, and batch validation metrics. Those components create
+candidates; they do not weaken this release contract.
