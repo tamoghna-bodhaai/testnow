@@ -88,6 +88,35 @@ The report lists approved, rejected and pending candidates. The release ZIP is
 created only if at least one item satisfies every gate. This command does not
 infer missing answers, repair broken formulae, or approve diagrams by itself.
 
+## Arihant JEE Mathematics book recipe
+
+For the two-column `Arihant_41_Years_Maths.pdf` source, qbFac can now build
+visual CBT items directly. It reads chapter/topic headings, printed MCQ/MSQ
+answer keys, and worked solutions. It separates the question stem and each
+printed option into its own high-resolution image, then binds all six images
+to one canonical CBT item. This preserves equations and diagrams without a
+text-to-LaTeX conversion.
+
+```bash
+PYTHONPATH=src python3 -m qbfac.cli build-arihant \
+  /path/to/Arihant_41_Years_Maths.pdf \
+  --output /tmp/arihant-usable-v1.zip \
+  --report /tmp/arihant-usable-v1-report.json
+```
+
+The ZIP is accepted by TestNow's qbFac release importer. Questions carry
+subject, chapter, topic, printed number, answer, source pages and image
+coordinates. The importer shows the four visual choices as separate response
+buttons and the visual solution after the exam. The command also writes a
+filterable HTML preview beside the JSON report so the batch can be checked by
+chapter and topic before upload.
+
+The recipe is intentionally conservative. It excludes questions with missing
+or repeated keys, uncertain option or solution boundaries, and crops that touch
+an image edge. Its `quality.approval_mode` is `deterministic`; bulk results
+should still be sampled before a bank is published. Scoring is a practice
+default of +4/-1/0 and should be adjusted for a specific exam blueprint.
+
 ## Release contract
 
 Each package contains:

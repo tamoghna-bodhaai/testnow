@@ -10,6 +10,7 @@ from .release import build_release
 from .intake import inspect_source_archive
 from .extraction import extract_jee_pdf
 from .approval import prepare_decisions, promote_candidates
+from .arihant import build_arihant_release
 
 
 def main() -> None:
@@ -37,6 +38,12 @@ def main() -> None:
     promote.add_argument("--assets", type=Path)
     promote.add_argument("--output", required=True, type=Path)
     promote.add_argument("--report", required=True, type=Path)
+    arihant = subcommands.add_parser("build-arihant", help="build visual CBT items from the Arihant JEE mathematics PDF")
+    arihant.add_argument("source", type=Path)
+    arihant.add_argument("--chapter")
+    arihant.add_argument("--max-items", type=int)
+    arihant.add_argument("--output", required=True, type=Path)
+    arihant.add_argument("--report", required=True, type=Path)
     args = parser.parse_args()
 
     if args.command == "inspect":
@@ -54,6 +61,10 @@ def main() -> None:
             output=args.output, report_path=args.report, release_id=args.release_id,
             title=args.title, assets_dir=args.assets,
         ), indent=2))
+        return
+    if args.command == "build-arihant":
+        report = build_arihant_release(args.source, args.output, args.report, chapter_filter=args.chapter, max_items=args.max_items)
+        print(json.dumps({key: value for key, value in report.items() if key != "examples"}, indent=2))
         return
 
     records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(args.items.glob("*.json"))]
