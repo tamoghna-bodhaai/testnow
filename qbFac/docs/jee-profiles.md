@@ -32,6 +32,11 @@ official Joint Implementation Committee report demonstrates all four types and
 partial-credit MSQ scoring; the official 2026 brochure confirms CBT delivery
 with option and numeric response modes.
 
+For a partially scored MSQ, qbFac requires explicit `scoring.rules`, for
+example `[{"selected":["A", "C"], "score":4}, {"selected":["A"], "score":1}]`.
+The release validator checks that each rule refers to declared, unique option
+IDs. The consuming test builder decides which year/paper blueprint uses it.
+
 ## Source links
 
 - JEE Main, [2026 Information Bulletin](https://jeemain.nta.nic.in/information-bulletin/)

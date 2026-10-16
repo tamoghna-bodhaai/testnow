@@ -15,13 +15,14 @@ sources → source-family extraction recipes → candidate items → validation/
 ## What is implemented
 
 - Canonical, versioned item schema (`1.0`), including content, interaction,
-  answer, scoring, taxonomy, provenance and quality status.
+  answer, solution, scoring, taxonomy, provenance and quality status.
 - JEE-oriented first-class response kinds: single choice, multiple select,
   numerical, integer, matching list, assertion-reason, and parent passages.
 - Portable ZIP release builder with canonical JSON, SHA-256 content manifest,
   stable item IDs, and verified binary assets.
-- Release guardrails: only approved items, valid response contracts, audit
-  provenance, and complete media may leave qbFac.
+- Release guardrails: only approved items, valid response contracts, official
+  JEE profile compatibility, mapped solutions, audit provenance, complete media,
+  and package-wide integrity hashing may leave qbFac.
 - A dependency-free CLI for building a release from reviewed JSON items.
 
 See [JEE profiles](docs/jee-profiles.md) and the [example item](examples/jee-main-single-choice.json).

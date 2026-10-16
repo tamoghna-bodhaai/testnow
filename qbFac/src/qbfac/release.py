@@ -49,7 +49,21 @@ def build_release(*, release_id: str, title: str, items: Iterable[dict[str, Any]
     if invalid_assets:
         raise ValueError(f"assets must be byte payloads below assets/: {', '.join(invalid_assets)}")
 
-    content_hash = hashlib.sha256(b"".join(payload for _, payload in entries)).hexdigest()
+    passage_children = {
+        item["id"]: item["interaction"].get("children", [])
+        for item in materialized
+        if item["interaction"].get("kind") == "passage"
+    }
+    absent_children = sorted({child for children in passage_children.values() for child in children if child not in ids})
+    if absent_children:
+        raise ValueError(f"missing passage children in release: {', '.join(absent_children)}")
+
+    digest = hashlib.sha256()
+    for name, payload in sorted([*entries, *assets.items()]):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(payload)
+    content_hash = digest.hexdigest()
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "release_id": release_id,
