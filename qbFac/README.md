@@ -41,6 +41,19 @@ PYTHONPATH=src python3 -m qbfac.cli release examples \
   --output /tmp/jee-main-demo-2026.1.zip
 ```
 
+Build a coverage ledger before attempting any CBT release:
+
+```bash
+PYTHONPATH=src python3 -m qbfac.cli inventory /imports/source-bundle.zip \
+  --output /tmp/qbfac-inventory
+```
+
+The directory contains compact JSONL ledgers plus `summary.json`. It preserves
+observed pages, question/answer/solution anchors,
+unresolved links, unparsed numbered lines, and OCR gaps. A `linked` anchor is
+not an approved or fully rendered question. See the
+[coverage-first contract](docs/coverage-ledger.md) and its benchmark gates.
+
 Inspect a raw corpus before any extraction or LLM work:
 
 ```bash

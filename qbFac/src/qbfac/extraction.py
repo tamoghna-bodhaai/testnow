@@ -31,9 +31,9 @@ def classify_question_kind(heading: str) -> str | None:
     value = re.sub(r"\s+", " ", heading.lower()).strip()
     if not (value.startswith("objective question") or value.startswith("true") or value.startswith("passage") or value.startswith("assertion") or value.startswith("matrix") or value.startswith("integer") or value.startswith("numerical") or value.startswith("fill in") or value.startswith("analytical")):
         return None
-    if "objective question ii" in value or "one or more" in value or "multiple correct" in value:
+    if re.search(r"objective questions? ii\b", value) or "one or more" in value or "multiple correct" in value:
         return "multiple_select"
-    if "objective question i" in value or "only one correct" in value or "single correct" in value:
+    if re.search(r"objective questions? i\b", value) or "only one correct" in value or "single correct" in value:
         return "single_choice"
     if "true/false" in value or "true false" in value:
         return "true_false"

@@ -25,7 +25,7 @@ def _role(name: str) -> str:
     normalized = name.lower().replace("_", " ").replace("-", " ")
     if re.search(r"\b(answer\s*(key|sheet)|keys?)\b", normalized):
         return "answer_key"
-    if re.search(r"\b(solution|solved)\b", normalized):
+    if re.search(r"\b(solutions?|solved)\b", normalized):
         return "solutions"
     return "questions"
 

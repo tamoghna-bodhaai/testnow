@@ -11,6 +11,7 @@ from .intake import inspect_source_archive
 from .extraction import extract_jee_pdf
 from .approval import prepare_decisions, promote_candidates
 from .arihant import build_arihant_release
+from .inventory import write_inventory
 
 
 def main() -> None:
@@ -27,6 +28,9 @@ def main() -> None:
     extract = subcommands.add_parser("extract-jee-pdf", help="extract chapter/topic/type candidates from a structured JEE PDF")
     extract.add_argument("source", type=Path)
     extract.add_argument("--output", required=True, type=Path)
+    inventory = subcommands.add_parser("inventory", help="account for question, answer, solution, and OCR gaps without publishing")
+    inventory.add_argument("source", type=Path, help="PDF, DOCX, or source ZIP")
+    inventory.add_argument("--output", required=True, type=Path, help="coverage ledger directory")
     prepare = subcommands.add_parser("prepare-decisions", help="create an evidence-bound review queue from extracted candidates")
     prepare.add_argument("candidates", type=Path)
     prepare.add_argument("--output", required=True, type=Path)
@@ -51,6 +55,9 @@ def main() -> None:
         return
     if args.command == "extract-jee-pdf":
         print(json.dumps(extract_jee_pdf(args.source, args.output), indent=2))
+        return
+    if args.command == "inventory":
+        print(json.dumps(write_inventory(args.source, args.output), indent=2))
         return
     if args.command == "prepare-decisions":
         print(json.dumps({"queued": prepare_decisions(args.candidates, args.output), "output": str(args.output)}, indent=2))
