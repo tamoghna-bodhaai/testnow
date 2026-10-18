@@ -127,6 +127,10 @@ class TestClassAssignment(Timestamped, Base):
 class Attempt(Timestamped, Base):
     __tablename__="attempts"; id: Mapped[str] = mapped_column(String(36),primary_key=True); test_id: Mapped[str] = mapped_column(ForeignKey("tests.id"),index=True); version_id: Mapped[str] = mapped_column(ForeignKey("test_versions.id")); student_id: Mapped[str] = mapped_column(ForeignKey("users.id"),index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); score: Mapped[float | None] = mapped_column(); revision: Mapped[int] = mapped_column(Integer,default=0)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancellation_reason: Mapped[str | None] = mapped_column(String(64))
+    integrity_flagged: Mapped[bool] = mapped_column(Boolean,default=False,nullable=False,index=True)
+    cohort_classes: Mapped[list] = mapped_column(JSON,default=list,nullable=False)
 class Response(Timestamped, Base):
     __tablename__="responses"; attempt_id: Mapped[str] = mapped_column(ForeignKey("attempts.id",ondelete="CASCADE"),primary_key=True); question_id: Mapped[str] = mapped_column(String(36),primary_key=True); answer: Mapped[dict | None] = mapped_column(JSON); marked_for_review: Mapped[bool] = mapped_column(Boolean,default=False)
     # Nullable for records created before CBT palette state was tracked.

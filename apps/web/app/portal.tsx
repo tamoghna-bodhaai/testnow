@@ -85,6 +85,7 @@ type Classroom = {
   students?: User[];
 };
 type StudentClass = { id: string; name: string; description?: string };
+type IntegrityEventType = "tab_hidden" | "window_blur" | "fullscreen_exit" | "page_hidden";
 type Test = {
   id: string;
   title: string;
@@ -104,26 +105,70 @@ type Test = {
   attempts_remaining?: number;
   latest_attempt?: {
     id: string;
-    status: "submitted" | "in_progress" | "expired";
+    status: "submitted" | "in_progress" | "expired" | "cancelled";
     started_at?: string;
     submitted_at?: string;
     score?: number;
+    integrity_flagged?: boolean;
+    cancellation_reason?: string;
   } | null;
 };
 type Analytics = {
   summary: {
     assigned: number;
+    currently_assigned: number;
     started: number;
     submitted: number;
     pending: number;
+    cancelled: number;
+    flagged: number;
+    average_score?: number;
+    average_percentage?: number;
+    highest_score?: number;
+    completion_rate: number;
+    flag_rate: number;
   };
+  batches: {
+    classroom: { id: string; name: string };
+    assigned: number;
+    started: number;
+    submitted: number;
+    pending: number;
+    cancelled: number;
+    flagged: number;
+    average_score?: number;
+    average_percentage?: number;
+    completion_rate: number;
+    flag_rate: number;
+  }[];
   students: {
     student: User;
+    classes: { id: string; name: string }[];
     status: string;
     score?: number;
+    percentage?: number;
     started_at?: string;
     submitted_at?: string;
     attempt_count: number;
+    integrity_flagged: boolean;
+    best_score?: number;
+    average_score?: number;
+    attempts: {
+      id: string;
+      status: string;
+      score?: number;
+      max_score: number;
+      percentage?: number;
+      correct: number;
+      incorrect: number;
+      unanswered: number;
+      started_at: string;
+      submitted_at?: string;
+      duration_seconds?: number;
+      integrity_flagged: boolean;
+      cancellation_reason?: string;
+      incidents: { event_type: string; detected_at: string }[];
+    }[];
   }[];
 };
 type Bank = {
@@ -598,6 +643,25 @@ export function Portal() {
           attempt={attempt}
           index={index}
           setIndex={setIndex}
+          cancelForIntegrity={async (eventType, clientTime) => {
+            const cancelled = await api(
+              `/attempts/${attempt.id}/integrity-violation`,
+              {
+                method: "POST",
+                keepalive: true,
+                body: JSON.stringify({
+                  event_type: eventType,
+                  client_time: clientTime,
+                }),
+              },
+            );
+            setAttempt(cancelled);
+            return cancelled;
+          }}
+          returnHome={async () => {
+            setView("home");
+            await load(user);
+          }}
           finish={async () => {
             if (finishingAttempt.current === attempt.id) return false;
             finishingAttempt.current = attempt.id;
@@ -1386,7 +1450,8 @@ function AnalyticsPanel({ analytics }: { analytics: Analytics | null }) {
       <div className="stats analytics-stats">
         <Card>
           <b>{analytics.summary.assigned}</b>
-          <span>Assigned</span>
+          <span>Candidates</span>
+          <small>{analytics.summary.currently_assigned} currently assigned</small>
         </Card>
         <Card>
           <b>{analytics.summary.started}</b>
@@ -1398,42 +1463,77 @@ function AnalyticsPanel({ analytics }: { analytics: Analytics | null }) {
         </Card>
         <Card>
           <b>{analytics.summary.pending}</b>
-          <span>Pending</span>
+          <span>Not started</span>
+        </Card>
+        <Card>
+          <b>{analytics.summary.average_percentage ?? "—"}{analytics.summary.average_percentage !== undefined && analytics.summary.average_percentage !== null ? "%" : ""}</b>
+          <span>Average score</span>
+        </Card>
+        <Card className={analytics.summary.flagged ? "integrity-stat" : ""}>
+          <b>{analytics.summary.flagged}</b>
+          <span>Integrity flags</span>
         </Card>
       </div>
       <Card>
-        <h2>Student participation</h2>
-        {analytics.students.length ? (
+        <div className="section-heading">
+          <div>
+            <h2>Batch analytics</h2>
+            <p>Compare participation, performance, and integrity by assigned batch.</p>
+          </div>
+        </div>
+        {analytics.batches.length ? (
           <div className="table-wrap">
             <table>
-              <thead>
-                <tr>
-                  <th>Student</th>
-                  <th>Status</th>
-                  <th>Score</th>
-                  <th>Started</th>
-                  <th>Submitted</th>
+              <thead><tr><th>Batch</th><th>Assigned</th><th>Completed</th><th>Average</th><th>Cancelled</th><th>Flagged</th></tr></thead>
+              <tbody>{analytics.batches.map((batch) => (
+                <tr key={batch.classroom.id}>
+                  <td><b>{batch.classroom.name}</b></td>
+                  <td>{batch.assigned}</td>
+                  <td>{batch.submitted} <small>{batch.completion_rate}% completion</small></td>
+                  <td>{batch.average_percentage !== undefined && batch.average_percentage !== null ? `${batch.average_percentage}%` : "—"}</td>
+                  <td>{batch.cancelled}</td>
+                  <td><span className={`integrity-count ${batch.flagged ? "flagged" : ""}`}>{batch.flagged}</span></td>
                 </tr>
-              </thead>
-              <tbody>
-                {analytics.students.map((row) => (
-                  <tr key={row.student.id}>
-                    <td>
-                      <b>{row.student.name}</b>
-                      <small>{row.student.email}</small>
-                    </td>
-                    <td>
-                      <span className={`badge ${row.status}`}>
-                        {row.status.replace("_", " ")}
-                      </span>
-                    </td>
-                    <td>{row.score ?? "—"}</td>
-                    <td>{fmtDate(row.started_at)}</td>
-                    <td>{fmtDate(row.submitted_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
+              ))}</tbody>
             </table>
+          </div>
+        ) : <p>No batches are assigned to this exam.</p>}
+      </Card>
+      <Card>
+        <div className="section-heading">
+          <div>
+            <h2>Student analytics</h2>
+            <p>Open a student to inspect every attempt, response outcome, duration, and integrity incident.</p>
+          </div>
+        </div>
+        {analytics.students.length ? (
+          <div className="student-analytics-list">
+            {analytics.students.map((row) => (
+              <details key={row.student.id} className={row.integrity_flagged ? "student-analytics flagged" : "student-analytics"}>
+                <summary>
+                  <span><b>{row.student.name}</b><small>{row.student.email} · {row.classes.map((item) => item.name).join(", ") || "Individually assigned"}</small></span>
+                  <span className={`badge ${row.status}`}>{row.status.replace("_", " ")}</span>
+                  <span><b>{row.percentage !== undefined && row.percentage !== null ? `${row.percentage}%` : "—"}</b><small>Latest score</small></span>
+                  <span><b>{row.attempt_count}</b><small>Attempts</small></span>
+                  <span className={row.integrity_flagged ? "integrity-label" : "integrity-clear"}>{row.integrity_flagged ? "⚑ Flagged" : "Clear"}</span>
+                </summary>
+                <div className="attempt-breakdown table-wrap">
+                  {row.attempts.length ? <table>
+                    <thead><tr><th>Attempt</th><th>Outcome</th><th>Score</th><th>Correct / wrong / blank</th><th>Duration</th><th>Integrity</th></tr></thead>
+                    <tbody>{row.attempts.map((attempt, index) => (
+                      <tr key={attempt.id}>
+                        <td>#{row.attempts.length - index}<small>{fmtDate(attempt.started_at)}</small></td>
+                        <td><span className={`badge ${attempt.status}`}>{attempt.status}</span></td>
+                        <td>{attempt.score ?? "—"} / {attempt.max_score}<small>{attempt.percentage !== undefined && attempt.percentage !== null ? `${attempt.percentage}%` : "—"}</small></td>
+                        <td>{attempt.correct} / {attempt.incorrect} / {attempt.unanswered}</td>
+                        <td>{attempt.duration_seconds !== undefined && attempt.duration_seconds !== null ? `${Math.floor(attempt.duration_seconds / 60)}m ${attempt.duration_seconds % 60}s` : "In progress"}</td>
+                        <td>{attempt.integrity_flagged ? <span className="integrity-label">{(attempt.cancellation_reason || "violation").replaceAll("_", " ")}<small>{fmtDate(attempt.incidents[0]?.detected_at)}</small></span> : <span className="integrity-clear">No incidents</span>}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table> : <p>This student has not started the exam.</p>}
+                </div>
+              </details>
+            ))}
           </div>
         ) : (
           <p>No students are assigned yet.</p>
@@ -2494,6 +2594,7 @@ function StudentHome({
           tests.map((t) => {
             const latest = t.latest_attempt;
             const submitted = latest?.status === "submitted";
+            const cancelled = latest?.status === "cancelled";
             const inProgress = latest?.status === "in_progress";
             const canStart =
               t.availability === "available" &&
@@ -2502,9 +2603,11 @@ function StudentHome({
               <Card key={t.id}>
                 <div className="test-card-top">
                   <span
-                    className={`badge ${submitted ? "submitted" : inProgress ? "in_progress" : t.availability}`}
+                    className={`badge ${cancelled ? "cancelled" : submitted ? "submitted" : inProgress ? "in_progress" : t.availability}`}
                   >
-                    {submitted
+                    {cancelled
+                      ? "cancelled · flagged"
+                      : submitted
                       ? "completed"
                       : inProgress
                         ? "in progress"
@@ -2524,6 +2627,11 @@ function StudentHome({
                     {latest.score ?? "—"}
                   </small>
                 )}
+                {cancelled && (
+                  <small className="integrity-label">
+                    Integrity incident: {(latest.cancellation_reason || "secure exam violation").replaceAll("_", " ")} · {fmtDate(latest.submitted_at)}
+                  </small>
+                )}
                 <div className="student-actions">
                   {submitted && (
                     <button
@@ -2537,12 +2645,12 @@ function StudentHome({
                     <button onClick={() => start(t.id)}>
                       {inProgress
                         ? "Resume assessment"
-                        : submitted
+                        : submitted || cancelled
                           ? "Start another attempt"
                           : "Start assessment"}
                     </button>
                   )}
-                  {!canStart && !submitted && (
+                  {!canStart && !submitted && !cancelled && (
                     <button disabled>
                       {inProgress
                         ? "Assessment closed"
@@ -2553,6 +2661,7 @@ function StudentHome({
                             : "Attempt limit reached"}
                     </button>
                   )}
+                  {cancelled && !canStart && <button disabled>Attempt cancelled</button>}
                 </div>
               </Card>
             );
@@ -3837,12 +3946,16 @@ function Exam({
   setIndex,
   update,
   finish,
+  cancelForIntegrity,
+  returnHome,
 }: {
   attempt: any;
   index: number;
   setIndex: (n: number) => void;
   update: (q: string, a: any, m: boolean) => Promise<boolean>;
   finish: () => Promise<boolean>;
+  cancelForIntegrity: (eventType: IntegrityEventType, clientTime: string) => Promise<any>;
+  returnHome: () => Promise<void>;
 }) {
   const blueprint = attempt.delivery_blueprint || { instructions: "Read every question carefully. Use Save & Next to record an answer.", sections: [{ id: "general", title: "General", question_ids: attempt.questions.map((question: any) => question.id) }] },
     [started, setStarted] = useState(false),
@@ -3853,11 +3966,16 @@ function Exam({
     [draftReview, setDraftReview] = useState(false),
     [saving, setSaving] = useState(false),
     [saveError, setSaveError] = useState(""),
+    [startError, setStartError] = useState(""),
+    [integrityIncident, setIntegrityIncident] = useState<{ eventType: IntegrityEventType; clientTime: string; saved: boolean; cancelled?: boolean; error?: string } | null>(null),
     q = attempt.questions[index],
     r = attempt.responses[q.id] || {},
     [now, setNow] = useState(Date.now()),
     [expiryRetry, setExpiryRetry] = useState(0),
     expirySubmissionStarted = useRef(false),
+    integrityTriggered = useRef(false),
+    fullscreenEngaged = useRef(false),
+    fullscreenRequestPending = useRef(false),
     mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -3876,10 +3994,43 @@ function Exam({
     return () => window.removeEventListener("keydown",closeOnEscape);
   }, []);
   useEffect(() => {
+    const storageKey = `testnow:integrity:${attempt.id}`;
+    const clearPending = () => { try { window.localStorage.removeItem(storageKey); } catch {} };
+    const report = (eventType: IntegrityEventType, clientTime = new Date().toISOString()) => {
+      if (integrityTriggered.current || fullscreenRequestPending.current) return;
+      integrityTriggered.current = true;
+      try { window.localStorage.setItem(storageKey, JSON.stringify({ eventType, clientTime })); } catch {}
+      setIntegrityIncident({ eventType, clientTime, saved: false });
+      void cancelForIntegrity(eventType, clientTime)
+        .then((result) => { clearPending(); if (mounted.current) setIntegrityIncident({ eventType, clientTime, saved: true, cancelled: Boolean(result.cancelled_at) }); })
+        .catch((error: Error) => mounted.current && setIntegrityIncident({ eventType, clientTime, saved: false, error: error.message }));
+    };
+    try {
+      const pending = JSON.parse(window.localStorage.getItem(storageKey) || "null");
+      if (pending?.eventType && pending?.clientTime) report(pending.eventType as IntegrityEventType,pending.clientTime);
+    } catch {}
+    const onVisibility = () => { if (document.visibilityState === "hidden") report("tab_hidden"); };
+    const onBlur = () => { if (!fullscreenRequestPending.current) report("window_blur"); };
+    const onFullscreen = () => { if (fullscreenEngaged.current && !document.fullscreenElement) report("fullscreen_exit"); };
+    const onPageHide = () => report("page_hidden");
+    document.addEventListener("visibilitychange", onVisibility);
+    document.addEventListener("fullscreenchange", onFullscreen);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("fullscreenchange", onFullscreen);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+  }, [attempt.id, cancelForIntegrity]);
+  useEffect(() => {
     if (!left && !attempt.submitted_at && !expirySubmissionStarted.current) {
       expirySubmissionStarted.current = true;
+      integrityTriggered.current = true;
       void finish().then((submitted) => {
         if (!submitted && mounted.current) {
+          integrityTriggered.current = false;
           expirySubmissionStarted.current = false;
           window.setTimeout(() => mounted.current && setExpiryRetry((value) => value + 1), 5000);
         }
@@ -3892,6 +4043,28 @@ function Exam({
   const draftChanged = JSON.stringify(draft) !== JSON.stringify(r.answer ?? null) || draftReview !== !!r.marked_for_review;
   const status = (question: any) => { const response = attempt.responses[question.id]; if (!response?.visited_at && !response?.answer && !response?.marked_for_review) return "unvisited"; if (response?.answer && response?.marked_for_review) return "answered-review"; if (response?.answer) return "answered"; if (response?.marked_for_review) return "review"; return "unanswered"; };
   const goto = (next: number) => { if (draftChanged) { setSaveError("Save or clear this response before moving to another question."); return; } setIndex(next); };
+  const startExam = async () => {
+    setStartError("");
+    if (document.documentElement.requestFullscreen) {
+      fullscreenRequestPending.current = true;
+      try {
+        await document.documentElement.requestFullscreen();
+        fullscreenEngaged.current = Boolean(document.fullscreenElement);
+      } catch {
+        setStartError("Fullscreen access is required on this device. Allow fullscreen and try again.");
+        return;
+      } finally {
+        fullscreenRequestPending.current = false;
+      }
+    }
+    setStarted(true);
+  };
+  const finishNormally = async () => {
+    integrityTriggered.current = true;
+    const submitted = await finish();
+    if (!submitted) integrityTriggered.current = false;
+    return submitted;
+  };
   const save = async (review = draftReview, advance = false) => { setSaving(true); setSaveError(""); const ok = await update(q.id, draft, review); setSaving(false); if (!ok) { setSaveError("Could not save. Check your connection and try again."); return; } if (advance) { const pos = attempt.questions.findIndex((question: any) => question.id === q.id); setIndex(Math.min(pos + 1, attempt.questions.length - 1)); } };
   const multiple = q.kind === "multiple_choice";
   const matrix = q.kind === "matrix_match";
@@ -3913,7 +4086,7 @@ function Exam({
       : [...selected, choice].sort();
     setDraft({ matches });
   };
-  if (!started) return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">CBT PRACTICE</p><h1>Ready to begin?</h1><p>{blueprint.instructions}</p><ul><li>The timer starts now and is controlled by the server.</li><li>Use Save & Next or Mark for Review & Next to record answers.</li><li>Review your responses before final submission.</li></ul><button onClick={() => setStarted(true)}>I am ready to begin</button></div></main>;
+  if (!started) return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">SECURE CBT</p><h1>Your secure attempt has started</h1><p>{blueprint.instructions}</p><ul><li>The server timer is already running and integrity monitoring is active.</li><li>Keep this exam visible and in fullscreen until you submit.</li><li>Changing tabs, switching apps, hiding the page, or leaving fullscreen immediately cancels and flags the attempt.</li><li>On iPhone and iPad, app and tab switching is monitored even when browser fullscreen is unavailable.</li></ul>{startError && <Notice kind="error">{startError}</Notice>}<button onClick={startExam}>Continue in secure fullscreen</button></div></main>;
   return (
     <div className="exam">
       <header>
@@ -4030,7 +4203,8 @@ function Exam({
           </button>
         </footer>
       </section>
-      {submitReview && <div className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response is not saved and will not be submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finish}>Submit test</button></div></div></div>}
+      {submitReview && <div className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response is not saved and will not be submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finishNormally}>Submit test</button></div></div></div>}
+      {integrityIncident && <div className="exam-dialog integrity-dialog" role="alertdialog" aria-modal="true"><div><p className="eyebrow">INTEGRITY WARNING</p><h2>{integrityIncident.saved && integrityIncident.cancelled === false ? "Integrity incident flagged" : "Assessment cancelled"}</h2><p>The secure exam detected <b>{integrityIncident.eventType.replaceAll("_", " ")}</b>. {integrityIncident.saved && integrityIncident.cancelled === false ? "The server had already closed your attempt, so its completed status was preserved and the incident was flagged for your teacher." : "Your saved responses were submitted, this attempt was cancelled immediately, and your teacher can see the incident."}</p>{!integrityIncident.saved && !integrityIncident.error && <Notice>Recording the incident securely…</Notice>}{integrityIncident.error && <Notice kind="error">The exam remains locked. Reconnect before closing this page so the incident can be recorded: {integrityIncident.error}</Notice>}<div className="dialog-actions">{integrityIncident.error && <button onClick={() => { const {eventType,clientTime}=integrityIncident; setIntegrityIncident({ eventType, clientTime, saved:false }); void cancelForIntegrity(eventType,clientTime).then((result) => { try { window.localStorage.removeItem(`testnow:integrity:${attempt.id}`); } catch {} setIntegrityIncident({ eventType, clientTime, saved:true, cancelled:Boolean(result.cancelled_at) }); }).catch((error:Error) => setIntegrityIncident({ eventType, clientTime, saved:false, error:error.message })); }}>Retry secure report</button>}<button disabled={!integrityIncident.saved} onClick={async () => { if (document.fullscreenElement) await document.exitFullscreen().catch(() => {}); await returnHome(); }}>Return to dashboard</button></div></div></div>}
     </div>
   );
 }

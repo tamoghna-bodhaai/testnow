@@ -7,10 +7,10 @@ from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
-from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
+from .models import AccountStatus, Attempt, AttemptEvent, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, IntegrityViolationIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
-from .services import attempt_event, audit, delivery_blueprint, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions, source_number_key, validate_blueprint
+from .services import attempt_event, audit, cancel_for_integrity, delivery_blueprint, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions, source_number_key, validate_blueprint
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
 from .tasks import extract_import, extract_bank_import
 from .figure_repairs import revalidate_bank_figures
@@ -1009,19 +1009,74 @@ def replace_test_classes(test_id:str,data:TestClassAssignmentsIn,user:User=Depen
     audit(db,user.id,"test.classes_updated","test",test.id,{"class_ids":class_ids});db.commit();return test_view(test,db,True)
 @app.get("/tests/{test_id}/analytics")
 def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
-    test=test_for_owner(test_id,user,db); student_ids=assigned_student_ids(test,db); rows=[];started=submitted=0
+    test=test_for_owner(test_id,user,db); assigned_ids=assigned_student_ids(test,db); rows=[]
+    all_attempts=db.query(Attempt).filter_by(test_id=test.id).order_by(Attempt.started_at.desc()).all()
+    appeared_ids={attempt.student_id for attempt in all_attempts}; student_ids=assigned_ids|appeared_ids
     students=db.query(User).filter(User.id.in_(student_ids)).order_by(User.name).all() if student_ids else []
+    attempts_by_student={student.id:[] for student in students}
+    for attempt in all_attempts:attempts_by_student.setdefault(attempt.student_id,[]).append(attempt)
+    now=datetime.now(timezone.utc)
+    for attempt in all_attempts:finalize_if_expired(db,attempt,now)
+    attempt_ids=[attempt.id for attempt in all_attempts]
+    responses_by_attempt={attempt_id:{} for attempt_id in attempt_ids}
+    responses=db.query(AnswerResponse).filter(AnswerResponse.attempt_id.in_(attempt_ids)).all() if attempt_ids else []
+    for response in responses:responses_by_attempt[response.attempt_id][response.question_id]=response.answer
+    incidents_by_attempt={attempt_id:[] for attempt_id in attempt_ids}
+    incidents=(db.query(AttemptEvent).filter(AttemptEvent.attempt_id.in_(attempt_ids),AttemptEvent.event_type=="integrity_violation").order_by(AttemptEvent.created_at).all() if attempt_ids else [])
+    for event in incidents:incidents_by_attempt[event.attempt_id].append(event)
+    version_ids={attempt.version_id for attempt in all_attempts}
+    versions={version.id:version for version in db.query(TestVersion).filter(TestVersion.id.in_(version_ids)).all()} if version_ids else {}
+    current_classes=assigned_classrooms(test,db); class_names={classroom.id:classroom.name for classroom in current_classes}
+    class_memberships={classroom.id:set() for classroom in current_classes}
+    current_class_ids=list(class_memberships)
+    memberships=db.query(ClassMembership).filter(ClassMembership.class_id.in_(current_class_ids)).all() if current_class_ids else []
+    for membership in memberships:
+        historic=attempts_by_student.get(membership.student_id,[])
+        if not historic or not any(attempt.cohort_classes for attempt in historic):class_memberships[membership.class_id].add(membership.student_id)
+    for attempt in all_attempts:
+        for classroom in attempt.cohort_classes or []:
+            class_id=str(classroom.get("id") or ""); name=str(classroom.get("name") or "")
+            if class_id and name:
+                class_names.setdefault(class_id,name);class_memberships.setdefault(class_id,set()).add(attempt.student_id)
+
+    def attempt_metrics(attempt:Attempt)->dict:
+        version=versions[attempt.version_id]
+        total,review=score(version.content,responses_by_attempt.get(attempt.id,{}))
+        maximum=sum(float((question.get("scoring") or {}).get("correct",4)) for question in version.content.get("questions",[]))
+        attempt_incidents=incidents_by_attempt.get(attempt.id,[])
+        submitted_at=as_utc(attempt.submitted_at) if attempt.submitted_at else None
+        started_at=as_utc(attempt.started_at)
+        return {"id":attempt.id,"status":"cancelled" if attempt.cancelled_at else "submitted" if attempt.submitted_at else "in_progress","score":attempt.score if attempt.score is not None else total if attempt.submitted_at else None,"max_score":maximum,"percentage":round((float(attempt.score if attempt.score is not None else total)/maximum)*100,1) if attempt.submitted_at and maximum else None,"correct":sum(1 for item in review if item["response"] is not None and item["correct"]),"incorrect":sum(1 for item in review if item["response"] is not None and not item["correct"]),"unanswered":sum(1 for item in review if item["response"] is None),"started_at":attempt.started_at,"submitted_at":attempt.submitted_at,"duration_seconds":max(0,int((submitted_at-started_at).total_seconds())) if submitted_at else None,"integrity_flagged":attempt.integrity_flagged,"cancellation_reason":attempt.cancellation_reason,"incidents":[{"event_type":event.data.get("event_type",attempt.cancellation_reason),"detected_at":event.data.get("detected_at") or event.created_at,"client_time":event.data.get("client_time")} for event in attempt_incidents]}
+
     for student in students:
-        attempts=db.query(Attempt).filter_by(test_id=test.id,student_id=student.id).order_by(Attempt.started_at.desc()).all()
-        for attempt in attempts:
-            finalize_if_expired(db,attempt)
+        attempts=attempts_by_student[student.id]
         latest=attempts[0] if attempts else None
-        if attempts:started+=1
-        if any(a.submitted_at for a in attempts):submitted+=1
-        status="not_started" if not latest else "submitted" if latest.submitted_at else "in_progress"
-        rows.append({"student":user_public(student),"status":status,"score":latest.score if latest else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"attempt_count":len(attempts)})
+        details=[attempt_metrics(attempt) for attempt in attempts]
+        status="not_started" if not latest else "cancelled" if latest.cancelled_at else "submitted" if latest.submitted_at else "in_progress"
+        valid_scores=[float(a.score) for a in attempts if a.submitted_at and not a.cancelled_at and a.score is not None]
+        rows.append({"student":user_public(student),"classes":[{"id":class_id,"name":class_names[class_id]} for class_id,members in class_memberships.items() if student.id in members],"status":status,"score":latest.score if latest else None,"percentage":details[0]["percentage"] if details else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"attempt_count":len(attempts),"integrity_flagged":any(a.integrity_flagged for a in attempts),"best_score":max(valid_scores) if valid_scores else None,"average_score":round(sum(valid_scores)/len(valid_scores),2) if valid_scores else None,"attempts":details})
+    def aggregate(ids:set[str],class_id:str|None=None)->dict:
+        selected=[]
+        for student_id in ids:
+            attempts=attempts_by_student.get(student_id,[])
+            if class_id:
+                attempts=[attempt for attempt in attempts if any(str(item.get("id"))==class_id for item in (attempt.cohort_classes or [])) or (not attempt.cohort_classes and student_id in class_memberships.get(class_id,set()))]
+            selected.append(attempts)
+        latest=[attempts[0] for attempts in selected if attempts]
+        completed=[next((attempt for attempt in attempts if attempt.submitted_at and not attempt.cancelled_at),None) for attempts in selected]
+        completed=[attempt for attempt in completed if attempt]
+        scores=[float(attempt.score) for attempt in completed if attempt.score is not None]
+        percentages=[]
+        for attempt in completed:
+            version=versions[attempt.version_id]; maximum=sum(float((q.get("scoring") or {}).get("correct",4)) for q in version.content.get("questions",[]))
+            if maximum and attempt.score is not None:percentages.append(float(attempt.score)/maximum*100)
+        cancelled=sum(1 for attempts in selected if any(attempt.cancelled_at for attempt in attempts));flagged=sum(1 for attempts in selected if any(attempt.integrity_flagged for attempt in attempts))
+        return {"assigned":len(ids),"started":len(latest),"submitted":len(completed),"pending":len(ids)-len(latest),"cancelled":cancelled,"flagged":flagged,"average_score":round(sum(scores)/len(scores),2) if scores else None,"average_percentage":round(sum(percentages)/len(percentages),1) if percentages else None,"highest_score":max(scores) if scores else None,"completion_rate":round(len(completed)/len(ids)*100,1) if ids else 0,"flag_rate":round(flagged/len(ids)*100,1) if ids else 0}
+    summary=aggregate(student_ids)
+    summary["currently_assigned"]=len(assigned_ids)
+    batches=[{"classroom":{"id":class_id,"name":class_names[class_id]},**aggregate(members,class_id)} for class_id,members in class_memberships.items()]
     db.commit()
-    return {"test_id":test.id,"summary":{"assigned":len(student_ids),"started":started,"submitted":submitted,"pending":len(student_ids)-started},"students":rows}
+    return {"test_id":test.id,"summary":summary,"batches":batches,"students":rows}
 def test_view(t:Test,db:Session,include=False):
     v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids),"assigned_class_names":[c.name for c in classes]}
     if include:
@@ -1043,10 +1098,12 @@ def student_tests(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(ge
         if latest:
             latest_attempt={
                 "id":latest.id,
-                "status":"submitted" if latest.submitted_at else "in_progress",
+                "status":"cancelled" if latest.cancelled_at else "submitted" if latest.submitted_at else "in_progress",
                 "started_at":latest.started_at,
                 "submitted_at":latest.submitted_at,
                 "score":latest.score,
+                "integrity_flagged":latest.integrity_flagged,
+                "cancellation_reason":latest.cancellation_reason,
             }
         rows.append({**test_view(test,db),"availability":availability,"attempts_remaining":max(test.max_attempts-len(attempts),0),"latest_attempt":latest_attempt})
     db.commit()
@@ -1073,7 +1130,8 @@ def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessio
     prior=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id).count()
     if prior>=test.max_attempts:raise HTTPException(409,"Attempt limit reached")
     now=datetime.now(timezone.utc); ends=min(now+timedelta(seconds=test.duration_seconds),test.closes_at) if test.closes_at else now+timedelta(seconds=test.duration_seconds)
-    a=Attempt(id=uid(),test_id=test.id,version_id=test.published_version_id,student_id=user.id,started_at=now,ends_at=ends);db.add(a);audit(db,user.id,"attempt.started","attempt",a.id);attempt_event(db,a.id,"started",{"ends_at":ends.isoformat()});db.commit();return attempt_view(a,db)
+    cohorts=[{"id":classroom.id,"name":classroom.name} for classroom in assigned_classrooms(test,db) if db.get(ClassMembership,{"class_id":classroom.id,"student_id":user.id})]
+    a=Attempt(id=uid(),test_id=test.id,version_id=test.published_version_id,student_id=user.id,started_at=now,ends_at=ends,cohort_classes=cohorts);db.add(a);audit(db,user.id,"attempt.started","attempt",a.id);attempt_event(db,a.id,"started",{"ends_at":ends.isoformat(),"cohort_classes":cohorts});db.commit();return attempt_view(a,db)
 @app.get("/attempts/{attempt_id}")
 def get_attempt(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
@@ -1084,7 +1142,7 @@ def get_attempt(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessi
     return attempt_view(a,db)
 @app.put("/attempts/{attempt_id}/responses/{question_id}")
 def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
-    a=db.get(Attempt,attempt_id)
+    a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
     if not a or a.student_id!=user.id or a.submitted_at:raise HTTPException(409,"Attempt cannot be changed")
     if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired")
     content=db.get(TestVersion,a.version_id).content
@@ -1096,7 +1154,7 @@ def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depen
     a.revision+=1;attempt_event(db,a.id,"response_saved",{"question_id":question_id,"marked_for_review":data.marked_for_review});db.commit();return {"revision":a.revision,"server_time":datetime.now(timezone.utc)}
 @app.post("/attempts/{attempt_id}/questions/{question_id}/visit")
 def visit_question(attempt_id:str,question_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
-    a=db.get(Attempt,attempt_id)
+    a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
     if not a or a.student_id!=user.id or a.submitted_at:raise HTTPException(404,"Attempt not found")
     if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired")
     content=db.get(TestVersion,a.version_id).content
@@ -1114,10 +1172,21 @@ def submit(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=De
     if not finalize_if_expired(db,a,now):
         finalize_attempt(db,a,submitted_at=now,actor_id=user.id,action="attempt.submitted")
     db.commit();return attempt_view(a,db)
+
+@app.post("/attempts/{attempt_id}/integrity-violation")
+def integrity_violation(attempt_id:str,data:IntegrityViolationIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
+    a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
+    if not a or a.student_id!=user.id:raise HTTPException(404,"Attempt not found")
+    detected_at=datetime.now(timezone.utc)
+    finalize_if_expired(db,a,detected_at)
+    cancel_for_integrity(db,a,event_type=data.event_type,detected_at=detected_at,actor_id=user.id,client_time=data.client_time)
+    db.commit()
+    return attempt_view(a,db)
 @app.get("/results/{attempt_id}")
 def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
     if not a or a.student_id!=user.id or not a.submitted_at:raise HTTPException(404,"Result not found")
+    if a.cancelled_at:raise HTTPException(403,"Cancelled attempts do not have a student result")
     test=db.get(Test,a.test_id); policy=test.results_policy; release=policy.get("release_at")
     if policy.get("mode")!="immediate" and (not release or datetime.now(timezone.utc)<datetime.fromisoformat(release.replace("Z","+00:00"))):raise HTTPException(403,"Results have not been released")
     responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};_,items=score(db.get(TestVersion,a.version_id).content,responses);return {"attempt":attempt_view(a,db),"questions":items}
@@ -1125,4 +1194,4 @@ def attempt_view(a:Attempt,db:Session):
     v=db.get(TestVersion,a.version_id)
     resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review,"visited_at":r.visited_at} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)}
     questions=[{k:snapshot[k] for k in ("id","source_number","kind","stem_markdown","options","diagrams","scoring","interaction") if k in snapshot} for snapshot in v.content["questions"]]
-    return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"delivery_blueprint":delivery_blueprint(v.content),"questions":questions,"responses":resp}
+    return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"cancelled_at":a.cancelled_at,"cancellation_reason":a.cancellation_reason,"integrity_flagged":a.integrity_flagged,"delivery_blueprint":delivery_blueprint(v.content),"questions":questions,"responses":resp}

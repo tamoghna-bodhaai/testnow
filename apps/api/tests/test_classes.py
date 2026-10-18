@@ -4,10 +4,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, create_import_test, create_student, delete_import, delete_test, get_attempt, question_media, questions, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
-from app.models import AccountStatus, Attempt, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.main import assigned_student_ids, create_import_test, create_student, delete_import, delete_test, get_attempt, integrity_violation, question_media, questions, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
+from app.models import AccountStatus, Attempt, AttemptEvent, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.tasks import finalize_expired_attempts
-from app.schemas import ImportTestCreate, LoginIn, RosterUpdate, StudentCreate
+from app.schemas import ImportTestCreate, IntegrityViolationIn, LoginIn, RosterUpdate, StudentCreate
 from fastapi import HTTPException
 
 def make_db():
@@ -32,8 +32,10 @@ def test_class_assignment_controls_visibility_and_analytics():
     db.add(Attempt(id="attempt",test_id="test",version_id="version",student_id="student-1",started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc),submitted_at=datetime.now(timezone.utc),score=4))
     db.commit()
     analytics=assessment_analytics("test",teacher,db)
-    assert analytics["summary"]=={"assigned":2,"started":1,"submitted":1,"pending":1}
+    assert {key:analytics["summary"][key] for key in ("assigned","started","submitted","pending","cancelled","flagged")}=={"assigned":2,"started":1,"submitted":1,"pending":1,"cancelled":0,"flagged":0}
     assert {row["status"] for row in analytics["students"]}=={"submitted","not_started"}
+    assert analytics["batches"][0]["classroom"]["name"]=="12A"
+    assert analytics["students"][0]["attempts"][0]["status"]=="submitted"
     assessments=student_tests(first,db)
     assert assessments[0]["attempts_remaining"]==0
     assert assessments[0]["latest_attempt"]["id"]=="attempt"
@@ -191,6 +193,77 @@ def test_expired_attempt_is_auto_submitted_with_saved_responses():
     assert completed["submitted_at"] is not None
     assert completed["score"]==4
     assert db.get(Attempt,attempt.id).submitted_at is not None
+
+def test_integrity_violation_cancels_once_and_is_visible_in_teacher_analytics():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    classroom=Classroom(id="class",owner_id=teacher.id,name="12A")
+    test=Assessment(id="test",owner_id=teacher.id,title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=3600,max_attempts=1)
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[{"id":"question","kind":"single_choice","answer":{"option":0},"scoring":{"correct":4,"incorrect":-1,"unanswered":0}}]},published_at=datetime.now(timezone.utc))
+    test.published_version_id=version.id
+    prior=Attempt(id="prior-attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime(2025,1,1,tzinfo=timezone.utc),ends_at=datetime(2025,1,1,1,tzinfo=timezone.utc),submitted_at=datetime(2025,1,1,0,30,tzinfo=timezone.utc),score=4,cohort_classes=[{"id":"class","name":"12A"}])
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc).replace(year=2030),cohort_classes=[{"id":"class","name":"12A"}])
+    response=AnswerResponse(attempt_id=attempt.id,question_id="question",answer={"option":0})
+    db.add_all([teacher,student,classroom,test,version,prior,attempt,response,ClassMembership(class_id=classroom.id,student_id=student.id),ClassAssignment(test_id=test.id,class_id=classroom.id)]);db.commit()
+
+    first=integrity_violation(attempt.id,IntegrityViolationIn(event_type="tab_hidden"),student,db)
+    second=integrity_violation(attempt.id,IntegrityViolationIn(event_type="window_blur"),student,db)
+
+    assert first["integrity_flagged"] is True
+    assert first["cancellation_reason"]=="tab_hidden"
+    assert first["score"]==4
+    assert second["cancellation_reason"]=="tab_hidden"
+    assert db.query(AttemptEvent).filter_by(attempt_id=attempt.id,event_type="integrity_violation").count()==1
+    db.query(ClassMembership).delete();db.query(ClassAssignment).delete();db.commit()
+    analytics=assessment_analytics(test.id,teacher,db)
+    assert analytics["summary"]["cancelled"]==1
+    assert analytics["summary"]["flagged"]==1
+    assert analytics["summary"]["submitted"]==1
+    assert analytics["summary"]["currently_assigned"]==0
+    assert analytics["batches"][0]["flagged"]==1
+    row=analytics["students"][0]
+    assert row["status"]=="cancelled"
+    assert row["integrity_flagged"] is True
+    assert row["attempts"][0]["incidents"][0]["event_type"]=="tab_hidden"
+
+def test_integrity_report_after_deadline_flags_without_replacing_expiry_submission():
+    db=make_db()
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=1)
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc))
+    test.published_version_id=version.id
+    deadline=datetime(2025,1,1,tzinfo=timezone.utc)
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=deadline.replace(year=2024),ends_at=deadline)
+    db.add_all([student,test,version,attempt]);db.commit()
+
+    result=integrity_violation(attempt.id,IntegrityViolationIn(event_type="page_hidden",client_time=deadline),student,db)
+
+    assert result["submitted_at"]==deadline
+    assert result["cancelled_at"] is None
+    assert result["integrity_flagged"] is True
+    assert db.query(AttemptEvent).filter_by(attempt_id=attempt.id,event_type="integrity_violation").count()==1
+
+def test_batch_analytics_use_the_batch_snapshot_for_each_attempt():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT)
+    first_class=Classroom(id="first",owner_id=teacher.id,name="Batch A")
+    second_class=Classroom(id="second",owner_id=teacher.id,name="Batch B")
+    test=Assessment(id="test",owner_id=teacher.id,title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=2)
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc));test.published_version_id=version.id
+    first=Attempt(id="first-attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime(2025,1,1,tzinfo=timezone.utc),ends_at=datetime(2025,1,1,1,tzinfo=timezone.utc),submitted_at=datetime(2025,1,1,0,30,tzinfo=timezone.utc),score=4,cohort_classes=[{"id":"first","name":"Batch A"}])
+    second=Attempt(id="second-attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime(2025,2,1,tzinfo=timezone.utc),ends_at=datetime(2025,2,1,1,tzinfo=timezone.utc),submitted_at=datetime(2025,2,1,0,10,tzinfo=timezone.utc),cancelled_at=datetime(2025,2,1,0,10,tzinfo=timezone.utc),cancellation_reason="window_blur",integrity_flagged=True,score=0,cohort_classes=[{"id":"second","name":"Batch B"}])
+    db.add_all([teacher,student,first_class,second_class,test,version,first,second,ClassAssignment(test_id=test.id,class_id=first_class.id),ClassAssignment(test_id=test.id,class_id=second_class.id)]);db.commit()
+
+    analytics=assessment_analytics(test.id,teacher,db)
+    batches={row["classroom"]["name"]:row for row in analytics["batches"]}
+
+    assert batches["Batch A"]["submitted"]==1
+    assert batches["Batch A"]["flagged"]==0
+    assert batches["Batch B"]["submitted"]==0
+    assert batches["Batch B"]["cancelled"]==1
+    assert batches["Batch B"]["flagged"]==1
 
 def test_expiry_worker_finalizes_attempt_without_a_browser(monkeypatch):
     db=make_db()

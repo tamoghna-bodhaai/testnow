@@ -1,5 +1,6 @@
 from datetime import datetime
 import re
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .models import AccountStatus, QuestionKind, Role
 
@@ -52,6 +53,9 @@ class TestCreate(TestSettings):
 class ImportTestCreate(TestSettings):
     pass
 class ResponseIn(BaseModel): answer:dict|None=None; marked_for_review:bool=False; revision:int=Field(ge=0)
+class IntegrityViolationIn(BaseModel):
+    event_type:Literal["tab_hidden","window_blur","fullscreen_exit","page_hidden"]
+    client_time:datetime|None=None
 class EnrolIn(BaseModel):
     email:str
 

@@ -109,7 +109,25 @@ def finalize_attempt(db:Session, attempt:Attempt, *, submitted_at:datetime, acto
     attempt.score,_=score(version.content,responses)
     attempt.submitted_at=submitted_at
     audit(db,actor_id,action,"attempt",attempt.id)
-    attempt_event(db,attempt.id,"submitted" if action=="attempt.submitted" else "auto_submitted",{"at":submitted_at.isoformat()})
+    submission_event={"attempt.submitted":"submitted","attempt.auto_submitted":"auto_submitted","attempt.integrity_cancelled":"integrity_cancelled"}.get(action,"submitted")
+    attempt_event(db,attempt.id,submission_event,{"at":submitted_at.isoformat()})
+    return True
+
+def cancel_for_integrity(db:Session, attempt:Attempt, *, event_type:str, detected_at:datetime, actor_id:str, client_time:datetime|None=None)->bool:
+    """Cancel an active attempt once and preserve the first integrity incident."""
+    if attempt.submitted_at:
+        if attempt.integrity_flagged:
+            return False
+        attempt.integrity_flagged=True
+        attempt.cancellation_reason=event_type
+        audit(db,actor_id,"attempt.integrity_reported_after_close","attempt",attempt.id,{"event_type":event_type})
+        attempt_event(db,attempt.id,"integrity_violation",{"event_type":event_type,"detected_at":detected_at.isoformat(),"client_time":client_time.isoformat() if client_time else None,"after_close":True})
+        return False
+    attempt.integrity_flagged=True
+    attempt.cancelled_at=detected_at
+    attempt.cancellation_reason=event_type
+    finalize_attempt(db,attempt,submitted_at=detected_at,actor_id=actor_id,action="attempt.integrity_cancelled")
+    attempt_event(db,attempt.id,"integrity_violation",{"event_type":event_type,"detected_at":detected_at.isoformat(),"client_time":client_time.isoformat() if client_time else None})
     return True
 
 def finalize_if_expired(db:Session, attempt:Attempt, now:datetime|None=None)->bool:
