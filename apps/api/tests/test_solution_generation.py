@@ -183,6 +183,7 @@ def test_only_one_generation_run_can_be_active_per_source_document():
 
 def test_published_source_requires_a_bank_revision_before_generation():
     db, _, bank, job = setup_db()
+    question_record(db)
     job.published_at = bank.created_at
     db.commit()
 
@@ -191,6 +192,8 @@ def test_published_source_requires_a_bank_revision_before_generation():
 
     assert caught.value.status_code == 409
     assert "revision" in caught.value.detail.lower()
+    with pytest.raises(ValueError, match="revision"):
+        queue_generation(db, job, "admin")
 
 
 def test_document_generation_checkpoints_success_and_continues_after_failure(monkeypatch):
@@ -234,6 +237,9 @@ def test_document_generation_checkpoints_success_and_continues_after_failure(mon
     rows = db.query(Question).filter_by(import_job_id=job_id).all()
     assert sum(bool(row.solution_markdown) for row in rows) == 1
     assert sum((row.interaction or {}).get("solution_generation", {}).get("status") == "failed" for row in rows) == 1
+    retry = queue_generation(db, db.get(ImportJob, job_id), admin.id)
+    assert retry["total"] == 1
+    assert db.get(ImportJob, job_id).extraction_meta["solution_generation_history"][0]["run_id"] == run_id
 
 
 def test_solver_receives_taxonomy_and_records_the_actual_fallback_model():
@@ -308,4 +314,51 @@ def test_generation_aborts_if_source_becomes_published_before_write():
             "confidence": 0.99, "notes": "Solved.",
         })
     assert question.solution_markdown is None
+
+
+def test_numerical_solution_accepts_equivalent_string_and_number_answers():
+    db, admin, _, job = setup_db()
+    question = question_record(db, kind=QuestionKind.NUMERICAL, answer={"value": "4"})
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+
+    generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True, "answer": {"value": 4},
+        "solution_markdown": "1. Evaluate the supplied expression.\n\n2. Its numerical value is $4$, matching the existing key.",
+        "confidence": 0.99, "notes": "Equivalent value.",
+    })
+    assert question.answer == {"value": "4"}
+    assert question.solution_markdown
+
+
+def test_subjective_generation_writes_a_model_solution_without_an_answer():
+    db, admin, _, job = setup_db()
+    question = question_record(db, kind=QuestionKind.SUBJECTIVE)
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+
+    generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True, "answer": None,
+        "solution_markdown": "1. State the governing principle clearly.\n\n2. Apply it to the facts and explain the conclusion.",
+        "confidence": 0.9, "notes": "Model response.",
+    })
+    assert question.answer is None
+    assert question.solution_markdown.startswith("1.")
+
+
+def test_matrix_generation_requires_a_known_contract_and_rejects_duplicates():
+    db, admin, _, job = setup_db()
+    question = question_record(db, kind=QuestionKind.MATRIX)
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+    result = {
+        "can_solve": True, "answer": {"matches": {"A": ["P", "P"]}},
+        "solution_markdown": "1. Compare row A with every column.\n\n2. The proposed mapping repeats column P.",
+        "confidence": 0.7, "notes": "Duplicate.",
+    }
+    with pytest.raises(ValueError, match="valid answer"):
+        generate_question(db, question, job, provider=lambda _: result)
+    question.interaction = {**question.interaction, "matrix_items": ["A"], "matrix_choices": ["P", "Q"]}
+    with pytest.raises(ValueError, match="valid answer"):
+        generate_question(db, question, job, provider=lambda _: result)
 

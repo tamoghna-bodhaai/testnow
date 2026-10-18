@@ -12,6 +12,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import fitz
 import httpx
@@ -95,18 +96,12 @@ def queue_generation(db: Session, job: ImportJob, actor_id: str, question: Quest
     """Create one durable document or per-question run and return its status."""
     # Serialize starts at the source-document seam. Without this lock, two
     # concurrent admin requests can both observe an idle JSON state.
-    job = db.query(ImportJob).filter_by(id=job.id).with_for_update().one()
+    job = db.query(ImportJob).filter_by(id=job.id).populate_existing().with_for_update().one()
+    if job.published_at:
+        raise ValueError("This source document is live. Create a bank revision before generating answers or solutions")
     current = _run(job)
     if current.get("status") in ACTIVE_RUN_STATUSES:
         raise ValueError("A solution-generation run is already active for this source document")
-    pending_success = any(
-        (row.interaction or {}).get("solution_generation", {}).get("run_id") == current.get("run_id")
-        and (row.interaction or {}).get("solution_generation", {}).get("status") == "completed"
-        and row.approved_at is None
-        for row in db.query(Question).filter_by(import_job_id=job.id)
-    )
-    if pending_success:
-        raise ValueError("Approve the successful generated questions before retrying this source document")
     rows = [question] if question is not None else db.query(Question).filter_by(import_job_id=job.id).order_by(Question.created_at, Question.id).all()
     rows = [row for row in rows if row is not None and missing_generation_fields(row)]
     if not rows:
@@ -126,7 +121,11 @@ def queue_generation(db: Session, job: ImportJob, actor_id: str, question: Quest
         "requested_by": actor_id,
         "queued_at": _now(),
     }
-    job.extraction_meta = {**(job.extraction_meta or {}), "solution_generation": state}
+    meta=dict(job.extraction_meta or {})
+    history=list(meta.get("solution_generation_history") or [])
+    if current.get("run_id") and not any(entry.get("run_id")==current["run_id"] for entry in history):
+        history=(history+[current])[-20:]
+    job.extraction_meta = {**meta, "solution_generation_history": history, "solution_generation": state}
     for row in rows:
         fields = missing_generation_fields(row)
         row.interaction = {**(row.interaction or {}), "solution_generation": {
@@ -163,13 +162,21 @@ def _answer_valid(kind: QuestionKind, raw: object, answer: dict | None, options:
     if kind == QuestionKind.MATRIX:
         matches=raw.get("matches")
         if not isinstance(matches,dict) or not matches:return False
-        if not all(str(row).strip() and isinstance(choices,list) and bool(choices) and all(str(choice).strip() for choice in choices) for row,choices in matches.items()):return False
+        if not all(str(row).strip() and isinstance(choices,list) and bool(choices) and len(choices)==len(set(map(str,choices))) and all(str(choice).strip() for choice in choices) for row,choices in matches.items()):return False
         allowed_rows={str(value) for value in interaction.get("matrix_items") or []}
         allowed_choices={str(value) for value in interaction.get("matrix_choices") or []}
+        if not allowed_rows or not allowed_choices:return False
         if allowed_rows and not set(map(str,matches)).issubset(allowed_rows):return False
         if allowed_choices and any(not set(map(str,choices)).issubset(allowed_choices) for choices in matches.values()):return False
         return answer==normalize_answer(raw,options)
     return False
+
+
+def _answers_equivalent(kind:QuestionKind,generated:dict|None,existing:dict|None)->bool:
+    if kind in {QuestionKind.NUMERICAL,QuestionKind.INTEGER} and isinstance(generated,dict) and isinstance(existing,dict):
+        try:return Decimal(str(generated.get("value")))==Decimal(str(existing.get("value")))
+        except (InvalidOperation,TypeError,ValueError):return False
+    return generated==existing
 
 
 def _step_by_step(value: object) -> bool:
@@ -299,7 +306,7 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
         generated_answer = None
     elif not _answer_valid(question.kind,raw_answer,generated_answer,question.options or [],interaction):
         raise ValueError("The model did not return a valid answer for this question type")
-    if question.kind != QuestionKind.SUBJECTIVE and question.answer is not None and generated_answer != question.answer:
+    if question.kind != QuestionKind.SUBJECTIVE and question.answer is not None and not _answers_equivalent(question.kind,generated_answer,question.answer):
         raise ValueError("The generated solution conflicts with the existing answer key")
     locked_job=db.query(ImportJob).filter_by(id=job.id).with_for_update().one()
     if locked_job.published_at:
@@ -402,8 +409,10 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
 
 
 def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) -> int:
-    state = _run(job)
-    if state.get("run_id") != run_id or state.get("status") not in {"completed", "completed_with_errors"}:
+    current=_run(job);history=list((job.extraction_meta or {}).get("solution_generation_history") or [])
+    history_index=next((index for index,entry in enumerate(history) if entry.get("run_id")==run_id),None)
+    state=current if current.get("run_id")==run_id else (history[history_index] if history_index is not None else {})
+    if state.get("status") not in {"completed", "completed_with_errors", "failed"}:
         raise ValueError("This solution-generation run is not ready for approval")
     now = datetime.now(timezone.utc)
     approved = 0
@@ -427,7 +436,9 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
         approved += 1
         overrides.append({"question_id":question.id,"warnings":warnings})
     state = {**state, "approved": approved, "approved_at": now.isoformat(), "approved_by": actor_id}
-    job.extraction_meta = {**(job.extraction_meta or {}), "solution_generation": state}
+    if current.get("run_id")==run_id:current=state
+    elif history_index is not None:history[history_index]=state
+    job.extraction_meta = {**(job.extraction_meta or {}), "solution_generation": current, "solution_generation_history": history}
     remaining = db.query(Question).filter_by(import_job_id=job.id, approved_at=None).first()
     failed_pages = bool((job.extraction_meta or {}).get("failed_pages"))
     if not remaining and not failed_pages:
