@@ -22,7 +22,7 @@ from app.models import (
     TaxonomyNode,
     User,
 )
-from app.solution_generation import approve_generation, generate_question, queue_generation, run_generation
+from app.solution_generation import approve_generation, generate_question, missing_generation_fields, queue_generation, run_generation
 
 
 def setup_db():
@@ -92,6 +92,73 @@ def test_subjective_questions_generate_only_a_solution():
     view = question_view(question, db)
 
     assert view["generation_missing_fields"] == ["solution"]
+
+
+@pytest.mark.parametrize("kind", [
+    QuestionKind.SINGLE,
+    QuestionKind.MULTIPLE,
+    QuestionKind.NUMERICAL,
+    QuestionKind.INTEGER,
+    QuestionKind.MATRIX,
+    QuestionKind.ASSERTION,
+])
+def test_legacy_objective_questions_are_eligible_without_issue_flags(kind):
+    db, _, _, _ = setup_db()
+    question = question_record(db, kind=kind, solution="   \n")
+    question.interaction = {}
+
+    assert missing_generation_fields(question) == ["answer", "solution"]
+
+
+def test_populated_fields_are_not_generation_eligible():
+    db, _, _, _ = setup_db()
+    question = question_record(db, answer={"option": 0}, solution="Already solved")
+
+    assert missing_generation_fields(question) == []
+
+
+@pytest.mark.parametrize(("kind", "answer"), [
+    (QuestionKind.SINGLE, {"option": None}),
+    (QuestionKind.MULTIPLE, {"options": []}),
+    (QuestionKind.MULTIPLE, {"options": [{}]}),
+    (QuestionKind.NUMERICAL, {"value": "  \n"}),
+    (QuestionKind.NUMERICAL, {"value": "not-a-number"}),
+    (QuestionKind.NUMERICAL, {"value": "NaN"}),
+    (QuestionKind.INTEGER, {"value": "2.5"}),
+    (QuestionKind.MATRIX, {"matches": {}}),
+    (QuestionKind.ASSERTION, {"option": " "}),
+])
+def test_malformed_legacy_answer_shapes_are_generation_eligible(kind, answer):
+    db, _, _, _ = setup_db()
+    question = question_record(db, kind=kind, answer=answer, solution="Existing solution")
+    question.interaction = {}
+
+    assert missing_generation_fields(question) == ["answer"]
+
+
+def test_generation_replaces_a_semantically_blank_legacy_answer():
+    db, admin, _, job = setup_db()
+    question = question_record(
+        db,
+        kind=QuestionKind.NUMERICAL,
+        answer={"value": "   "},
+        solution="1. Evaluate the expression.\n\n2. The resulting value is $4$.",
+    )
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+
+    generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True,
+        "answer": {"value": 4},
+        "matrix_items": [],
+        "matrix_choices": [],
+        "solution_markdown": "1. Evaluate the expression.\n\n2. The resulting value is $4$.",
+        "confidence": 0.95,
+        "notes": "Recovered a blank legacy key.",
+    })
+
+    assert question.answer == {"value": 4}
+    assert question.solution_markdown.startswith("1.")
 
 
 def test_import_view_reports_generation_eligible_count():
@@ -179,6 +246,19 @@ def test_only_one_generation_run_can_be_active_per_source_document():
 
     with pytest.raises(ValueError, match="already active"):
         queue_generation(db, job, admin.id)
+
+
+def test_historical_run_cannot_be_approved_while_a_retry_is_active():
+    db, admin, _, job = setup_db()
+    question = question_record(db)
+    first = queue_generation(db, job, admin.id, question)
+    current = {**job.extraction_meta["solution_generation"], "status": "failed"}
+    job.extraction_meta = {**job.extraction_meta, "solution_generation": current}
+    db.flush()
+    queue_generation(db, job, admin.id, question)
+
+    with pytest.raises(ValueError, match="active solution-generation run"):
+        approve_generation(db, job, first["run_id"], admin.id)
 
 
 def test_published_source_requires_a_bank_revision_before_generation():
@@ -281,6 +361,30 @@ def test_solver_rejects_out_of_range_multiple_choice_output():
     assert question.answer is None and question.solution_markdown is None
 
 
+@pytest.mark.parametrize(("kind", "value"), [
+    (QuestionKind.NUMERICAL, "not-a-number"),
+    (QuestionKind.NUMERICAL, "NaN"),
+    (QuestionKind.NUMERICAL, "Infinity"),
+    (QuestionKind.INTEGER, "2.5"),
+])
+def test_solver_rejects_unscorable_generated_numeric_answers(kind, value):
+    db, admin, _, job = setup_db()
+    question = question_record(db, kind=kind)
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+
+    with pytest.raises(ValueError, match="valid answer"):
+        generate_question(db, question, job, provider=lambda _: {
+            "can_solve": True,
+            "answer": {"value": value},
+            "matrix_items": [],
+            "matrix_choices": [],
+            "solution_markdown": "1. Evaluate the supplied expression.\n\n2. Report the resulting value after checking it.",
+            "confidence": 0.5,
+            "notes": "Invalid numeric result.",
+        })
+
+
 def test_solver_includes_saved_question_images(monkeypatch):
     db, admin, _, job = setup_db()
     question = question_record(db, answer={"option": 0})
@@ -346,19 +450,69 @@ def test_subjective_generation_writes_a_model_solution_without_an_answer():
     assert question.solution_markdown.startswith("1.")
 
 
-def test_matrix_generation_requires_a_known_contract_and_rejects_duplicates():
+def test_matrix_generation_can_recover_a_legacy_contract_and_rejects_duplicates():
     db, admin, _, job = setup_db()
     question = question_record(db, kind=QuestionKind.MATRIX)
     question.options = []
     queue_generation(db, job, admin.id, question)
     result = {
         "can_solve": True, "answer": {"matches": {"A": ["P", "P"]}},
+        "matrix_items": ["A"], "matrix_choices": ["P", "Q"],
         "solution_markdown": "1. Compare row A with every column.\n\n2. The proposed mapping repeats column P.",
         "confidence": 0.7, "notes": "Duplicate.",
     }
     with pytest.raises(ValueError, match="valid answer"):
         generate_question(db, question, job, provider=lambda _: result)
-    question.interaction = {**question.interaction, "matrix_items": ["A"], "matrix_choices": ["P", "Q"]}
     with pytest.raises(ValueError, match="valid answer"):
         generate_question(db, question, job, provider=lambda _: result)
+
+    valid = {
+        **result,
+        "answer": {"matches": {"A": ["P"]}},
+        "solution_markdown": "1. Compare row A with columns P and Q.\n\n2. The stated relation matches A only with P.",
+    }
+    generate_question(db, question, job, provider=lambda _: valid)
+    assert question.answer == {"matches": {"A": ["P"]}}
+    assert question.interaction["matrix_items"] == ["A"]
+    assert question.interaction["matrix_choices"] == ["P", "Q"]
+
+
+def test_matrix_generation_requires_a_mapping_for_every_row():
+    db, admin, _, job = setup_db()
+    question = question_record(db, kind=QuestionKind.MATRIX)
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+
+    with pytest.raises(ValueError, match="valid answer"):
+        generate_question(db, question, job, provider=lambda _: {
+            "can_solve": True,
+            "answer": {"matches": {"A": ["P"]}},
+            "matrix_items": ["A", "B"],
+            "matrix_choices": ["P", "Q"],
+            "solution_markdown": "1. Compare both rows with the columns.\n\n2. Only row A was included, so the mapping is incomplete.",
+            "confidence": 0.6,
+            "notes": "Incomplete mapping.",
+        })
+
+
+def test_legacy_matrix_contract_allows_a_column_shared_by_multiple_rows():
+    db, admin, _, job = setup_db()
+    answer = {"matches": {"A": ["P"], "B": ["P", "Q"]}}
+    question = question_record(db, kind=QuestionKind.MATRIX, answer=answer)
+    question.options = []
+    queue_generation(db, job, admin.id, question)
+
+    generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True,
+        "answer": answer,
+        "matrix_items": [],
+        "matrix_choices": [],
+        "solution_markdown": "1. Compare rows A and B with both columns.\n\n2. A matches P, while B matches P and Q.",
+        "confidence": 0.9,
+        "notes": "Matches the stored key.",
+    })
+
+    assert question.answer == answer
+    assert question.interaction["matrix_items"] == ["A", "B"]
+    assert question.interaction["matrix_choices"] == ["P", "Q"]
 

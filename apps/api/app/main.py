@@ -16,7 +16,7 @@ from .tasks import extract_import, extract_bank_import, generate_bank_solutions
 from .figure_repairs import revalidate_bank_figures
 from .seed import ensure_demo_data
 from .figures import is_visual_issue, option_media_issues
-from .solution_generation import ANSWER_KINDS as ANSWER_GENERATION_KINDS, approve_generation, missing_generation_fields, queue_generation
+from .solution_generation import ANSWER_KINDS as ANSWER_GENERATION_KINDS, approve_generation, has_usable_answer, missing_generation_fields, queue_generation
 
 app=FastAPI(title="TestNow API",version="1.0.0")
 def as_utc(value:datetime)->datetime:
@@ -657,7 +657,7 @@ def import_view(job:ImportJob,db:Session|None=None):
     meta=job.extraction_meta or {}
     errors=[{**entry,"message":entry.get("message") or entry.get("error") or "Extraction failed"}
             for entry in list(meta.get("error_log") or meta.get("failed_pages") or [])[-10:]]
-    eligible=sum(1 for kind,answer,solution in questions.with_entities(Question.kind,Question.answer,Question.solution_markdown) if ((kind in ANSWER_GENERATION_KINDS and not answer) or not str(solution or "").strip())) if questions is not None else 0
+    eligible=sum(1 for kind,answer,options,solution in questions.with_entities(Question.kind,Question.answer,Question.options,Question.solution_markdown) if ((kind in ANSWER_GENERATION_KINDS and not has_usable_answer(kind,answer,options or [])) or not str(solution or "").strip())) if questions is not None else 0
     return {"id":job.id,"status":job.status.value,"error":job.error,"meta":meta,"errors":errors,"created_at":job.created_at,"filename":source.filename if source else None,"source_id":source.id if source else None,"question_count":total,"approved_count":approved,"published":bool(job.published_at),"published_at":job.published_at,"generation_eligible_count":eligible}
 def normalized_options(options):
     output=[]

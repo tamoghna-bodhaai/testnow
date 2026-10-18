@@ -37,10 +37,53 @@ ANSWER_KINDS = {
 }
 
 
+def has_usable_answer(kind: QuestionKind, answer: object, options: list) -> bool:
+    """Recognize a real answer, including legacy records without issue flags."""
+    if kind == QuestionKind.SUBJECTIVE or not isinstance(answer, dict):
+        return False
+    if kind in {QuestionKind.SINGLE, QuestionKind.ASSERTION}:
+        value = answer.get("option")
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(options)
+    if kind == QuestionKind.MULTIPLE:
+        values = answer.get("options")
+        return (
+            isinstance(values, list)
+            and bool(values)
+            and all(isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(options) for value in values)
+            and len(values) == len(set(values))
+        )
+    if kind in {QuestionKind.NUMERICAL, QuestionKind.INTEGER}:
+        value = answer.get("value")
+        if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
+            return False
+        try:
+            number = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        if not number.is_finite():
+            return False
+        return kind != QuestionKind.INTEGER or number == number.to_integral_value()
+    if kind == QuestionKind.MATRIX:
+        matches = answer.get("matches")
+        return (
+            isinstance(matches, dict)
+            and bool(matches)
+            and all(
+                str(row).strip()
+                and isinstance(choices, list)
+                and bool(choices)
+                and len(choices) == len(set(map(str, choices)))
+                and all(str(choice).strip() for choice in choices)
+                for row, choices in matches.items()
+            )
+        )
+    return False
+
+
 def missing_generation_fields(question: Question) -> list[str]:
     """Return only fields that generation is allowed to fill."""
     missing: list[str] = []
-    if question.kind in ANSWER_KINDS and not question.answer:
+    if question.kind in ANSWER_KINDS and not has_usable_answer(question.kind, question.answer, question.options or []):
         missing.append("answer")
     if not str(question.solution_markdown or "").strip():
         missing.append("solution")
@@ -54,7 +97,7 @@ SOLUTION_SCHEMA = {
     "schema": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["can_solve", "answer", "solution_markdown", "confidence", "notes"],
+        "required": ["can_solve", "answer", "solution_markdown", "matrix_items", "matrix_choices", "confidence", "notes"],
         "properties": {
             "can_solve": {"type": "boolean"},
             "answer": {
@@ -71,6 +114,8 @@ SOLUTION_SCHEMA = {
                 },
             },
             "solution_markdown": {"type": ["string", "null"]},
+            "matrix_items": {"type": "array", "items": {"type": "string"}},
+            "matrix_choices": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "notes": {"type": "string"},
         },
@@ -79,7 +124,7 @@ SOLUTION_SCHEMA = {
 SOLUTION_SYSTEM = """You are a careful educational assessment solver. Solve exactly one supplied question.
 Return JSON matching the schema. Never invent missing question text or unreadable visual facts. If the question cannot be solved unambiguously, set can_solve=false, answer=null, solution_markdown=null, and explain why in notes.
 
-For a solvable question, derive the answer independently and write a pedagogical Markdown solution with at least two explicitly numbered steps. Preserve mathematical expressions as valid LaTeX. For single-choice and assertion-reason questions return {\"option\": zero_based_index}; for multiple-choice return {\"options\": [zero_based_indices]}; for numerical/integer return {\"value\": value}; for matrix match return {\"matches\": {row: [columns]}}. Subjective questions must return answer=null and a model solution.
+For a solvable question, derive the answer independently and write a pedagogical Markdown solution with at least two explicitly numbered steps. Preserve mathematical expressions as valid LaTeX. For single-choice and assertion-reason questions return {\"option\": zero_based_index}; for multiple-choice return {\"options\": [zero_based_indices]}; for numerical/integer return {\"value\": value}; for matrix match return {\"matches\": {row: [columns]}} and copy every row label into matrix_items and every selectable column label into matrix_choices. Return empty matrix arrays for other question types. Subjective questions must return answer=null and a model solution.
 
 An existing answer or solution is authoritative context. Do not propose changing it. When an existing answer is supplied, your derived answer must agree with it."""
 
@@ -150,15 +195,10 @@ def _answer_valid(kind: QuestionKind, raw: object, answer: dict | None, options:
         return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(options) and answer == {"option": value}
     if kind == QuestionKind.MULTIPLE:
         values=raw.get("options")
-        return isinstance(values,list) and bool(values) and len(values)==len(set(values)) and all(isinstance(value,int) and not isinstance(value,bool) and 0<=value<len(options) for value in values) and answer=={"options":sorted(values)}
+        return isinstance(values,list) and bool(values) and all(isinstance(value,int) and not isinstance(value,bool) and 0<=value<len(options) for value in values) and len(values)==len(set(values)) and answer=={"options":sorted(values)}
     if kind in {QuestionKind.NUMERICAL, QuestionKind.INTEGER}:
         value=raw.get("value")
-        if value is None or isinstance(value,bool) or (isinstance(value,str) and not value.strip()):return False
-        if kind==QuestionKind.INTEGER:
-            try:
-                if float(value)!=int(float(value)):return False
-            except (TypeError,ValueError):return False
-        return answer=={"value":value}
+        return has_usable_answer(kind, answer, options) and answer=={"value":value}
     if kind == QuestionKind.MATRIX:
         matches=raw.get("matches")
         if not isinstance(matches,dict) or not matches:return False
@@ -166,7 +206,7 @@ def _answer_valid(kind: QuestionKind, raw: object, answer: dict | None, options:
         allowed_rows={str(value) for value in interaction.get("matrix_items") or []}
         allowed_choices={str(value) for value in interaction.get("matrix_choices") or []}
         if not allowed_rows or not allowed_choices:return False
-        if allowed_rows and not set(map(str,matches)).issubset(allowed_rows):return False
+        if set(map(str,matches)) != allowed_rows:return False
         if allowed_choices and any(not set(map(str,choices)).issubset(allowed_choices) for choices in matches.values()):return False
         return answer==normalize_answer(raw,options)
     return False
@@ -281,6 +321,8 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
         "taxonomy": taxonomy,
         "existing_answer": question.answer,
         "existing_solution_markdown": question.solution_markdown,
+        "matrix_items": interaction.get("matrix_items") or [],
+        "matrix_choices": interaction.get("matrix_choices") or [],
         "fields_to_generate": requested,
     }, ensure_ascii=False)}]
     content.extend(_visual_context(db, question, job))
@@ -304,9 +346,29 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
         raise ValueError("The model did not return a valid multi-step solution")
     if question.kind == QuestionKind.SUBJECTIVE:
         generated_answer = None
-    elif not _answer_valid(question.kind,raw_answer,generated_answer,question.options or [],interaction):
+    validation_interaction = interaction
+    matrix_contract: tuple[list[str], list[str]] | None = None
+    if question.kind == QuestionKind.MATRIX:
+        existing_matches = (question.answer or {}).get("matches") if isinstance(question.answer, dict) else None
+        existing_choice_contract = list(dict.fromkeys(
+            str(choice).strip()
+            for choices in existing_matches.values()
+            for choice in choices
+            if str(choice).strip()
+        )) if isinstance(existing_matches, dict) else []
+        raw_items = interaction.get("matrix_items") or result.get("matrix_items") or (
+            list(existing_matches) if isinstance(existing_matches, dict) else []
+        )
+        raw_choices = interaction.get("matrix_choices") or result.get("matrix_choices") or existing_choice_contract
+        matrix_items = [str(value).strip() for value in raw_items if str(value).strip()]
+        matrix_choices = [str(value).strip() for value in raw_choices if str(value).strip()]
+        if len(matrix_items) != len(set(matrix_items)) or len(matrix_choices) != len(set(matrix_choices)):
+            raise ValueError("The model did not return a valid matrix contract")
+        matrix_contract = (matrix_items, matrix_choices)
+        validation_interaction = {**interaction, "matrix_items": matrix_items, "matrix_choices": matrix_choices}
+    if question.kind != QuestionKind.SUBJECTIVE and not _answer_valid(question.kind,raw_answer,generated_answer,question.options or [],validation_interaction):
         raise ValueError("The model did not return a valid answer for this question type")
-    if question.kind != QuestionKind.SUBJECTIVE and question.answer is not None and not _answers_equivalent(question.kind,generated_answer,question.answer):
+    if has_usable_answer(question.kind, question.answer, question.options or []) and not _answers_equivalent(question.kind,generated_answer,question.answer):
         raise ValueError("The generated solution conflicts with the existing answer key")
     locked_job=db.query(ImportJob).filter_by(id=job.id).with_for_update().one()
     if locked_job.published_at:
@@ -316,6 +378,8 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
         question.answer = generated_answer
     if "solution" in requested:
         question.solution_markdown = solution
+    if matrix_contract:
+        interaction = {**interaction, "matrix_items": matrix_contract[0], "matrix_choices": matrix_contract[1]}
     issues = [issue for issue in interaction.get("ingestion_issues", []) if issue not in {"missing_answer", "missing_solution", "solution_generation_failed"}]
     if "llm_generated_unreviewed" not in issues:
         issues.append("llm_generated_unreviewed")
@@ -335,7 +399,7 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
 
 def _checkpoint(db: Session, job_id: str, run_id: str, updates: dict) -> tuple[ImportJob, dict]:
     db.expire_all()
-    job = db.get(ImportJob, job_id)
+    job = db.query(ImportJob).filter_by(id=job_id).populate_existing().with_for_update().one_or_none()
     if not job:
         raise ValueError("Bank import job not found")
     state = _run(job)
@@ -409,7 +473,10 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
 
 
 def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) -> int:
+    job = db.query(ImportJob).filter_by(id=job.id).populate_existing().with_for_update().one()
     current=_run(job);history=list((job.extraction_meta or {}).get("solution_generation_history") or [])
+    if current.get("status") in ACTIVE_RUN_STATUSES and current.get("run_id") != run_id:
+        raise ValueError("Wait for the active solution-generation run before approving an earlier run")
     history_index=next((index for index,entry in enumerate(history) if entry.get("run_id")==run_id),None)
     state=current if current.get("run_id")==run_id else (history[history_index] if history_index is not None else {})
     if state.get("status") not in {"completed", "completed_with_errors", "failed"}:
