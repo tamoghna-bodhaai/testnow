@@ -12,10 +12,11 @@ from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, In
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import attempt_event, audit, cancel_for_integrity, delivery_blueprint, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions, source_number_key, validate_blueprint
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
-from .tasks import extract_import, extract_bank_import
+from .tasks import extract_import, extract_bank_import, generate_bank_solutions
 from .figure_repairs import revalidate_bank_figures
 from .seed import ensure_demo_data
 from .figures import is_visual_issue, option_media_issues
+from .solution_generation import approve_generation, missing_generation_fields, queue_generation
 
 app=FastAPI(title="TestNow API",version="1.0.0")
 def as_utc(value:datetime)->datetime:
@@ -318,6 +319,11 @@ def resolve_bank_question(bank_id:str,question_id:str,data:QuestionIn,user:User=
         interaction["warnings_ignored_by"]=user.id
         interaction["warnings_ignored_at"]=datetime.now(timezone.utc).isoformat()
         audit(db,user.id,"question.warnings_ignored","question",q.id,{"warnings":warnings})
+    generation=dict(interaction.get("solution_generation") or {})
+    if generation.get("status")=="completed":
+        generation.update({"approved_at":datetime.now(timezone.utc).isoformat(),"approved_by":user.id})
+        interaction["solution_generation"]=generation
+        audit(db,user.id,"question_solution_generation.approved","question",q.id,{"run_id":generation.get("run_id"),"mode":"individual"})
     interaction.update({"ingestion_issues":[],"reviewed_by":user.id})
     q.interaction=interaction;q.approved_at=datetime.now(timezone.utc)
     job=db.get(ImportJob,q.import_job_id)
@@ -378,6 +384,41 @@ def get_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)
     job=db.get(ImportJob,job_id)
     if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
     return {**import_view(job,db),"questions":[question_view(q,db) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.created_at.desc()).all()]}
+
+def _generation_job(bank_id:str,job_id:str,db:Session)->ImportJob:
+    job=db.get(ImportJob,job_id)
+    if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
+    if job.published_at:raise HTTPException(409,"This source document is live. Create a bank revision before generating answers or solutions")
+    if job.status in {ImportStatus.UPLOADED,ImportStatus.PROCESSING}:raise HTTPException(409,"Wait for source extraction to finish before generating answers or solutions")
+    return job
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/solution-generation",status_code=202)
+def start_import_solution_generation(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=_generation_job(bank_id,job_id,db)
+    try:state=queue_generation(db,job,user.id)
+    except ValueError as exc:raise HTTPException(409,str(exc))
+    except LookupError as exc:raise HTTPException(422,str(exc))
+    db.commit();generate_bank_solutions.delay(job.id,state["run_id"],user.id,None)
+    return state
+
+@app.post("/admin/question-banks/{bank_id}/questions/{question_id}/solution-generation",status_code=202)
+def start_question_solution_generation(bank_id:str,question_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    question=db.get(Question,question_id)
+    if not question or question.bank_id!=bank_id or not question.import_job_id:raise HTTPException(404,"Question not found")
+    job=_generation_job(bank_id,question.import_job_id,db)
+    try:state=queue_generation(db,job,user.id,question)
+    except ValueError as exc:raise HTTPException(409,str(exc))
+    except LookupError as exc:raise HTTPException(422,str(exc))
+    db.commit();generate_bank_solutions.delay(job.id,state["run_id"],user.id,question.id)
+    return state
+
+@app.post("/admin/question-banks/{bank_id}/imports/{job_id}/solution-generation/{run_id}/approve")
+def approve_import_solution_generation(bank_id:str,job_id:str,run_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    job=_generation_job(bank_id,job_id,db)
+    try:approved=approve_generation(db,job,run_id,user.id)
+    except ValueError as exc:raise HTTPException(409,str(exc))
+    db.commit()
+    return {"approved_count":approved,"import":import_view(job,db)}
 
 @app.post("/admin/question-banks/{bank_id}/imports/{job_id}/pause")
 def pause_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
@@ -614,7 +655,8 @@ def import_view(job:ImportJob,db:Session|None=None):
     meta=job.extraction_meta or {}
     errors=[{**entry,"message":entry.get("message") or entry.get("error") or "Extraction failed"}
             for entry in list(meta.get("error_log") or meta.get("failed_pages") or [])[-10:]]
-    return {"id":job.id,"status":job.status.value,"error":job.error,"meta":meta,"errors":errors,"created_at":job.created_at,"filename":source.filename if source else None,"source_id":source.id if source else None,"question_count":total,"approved_count":approved,"published":bool(job.published_at),"published_at":job.published_at}
+    eligible=sum(1 for question in questions.all() if missing_generation_fields(question)) if questions is not None else 0
+    return {"id":job.id,"status":job.status.value,"error":job.error,"meta":meta,"errors":errors,"created_at":job.created_at,"filename":source.filename if source else None,"source_id":source.id if source else None,"question_count":total,"approved_count":approved,"published":bool(job.published_at),"published_at":job.published_at,"generation_eligible_count":eligible}
 def normalized_options(options):
     output=[]
     for index,option in enumerate(options or []):
@@ -667,7 +709,8 @@ def question_view(q:Question, db:Session|None=None, taxonomy:list[dict]|None=Non
         job=db.get(ImportJob,q.import_job_id)
         source=db.get(SourceDocument,job.question_document_id) if job else None
         if source:interaction["source_filename"]=source.filename
-    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":interaction,"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"import_job_id":q.import_job_id,"scope":q.scope.value,"taxonomy":taxonomy}
+    missing=missing_generation_fields(q)
+    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":interaction,"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"import_job_id":q.import_job_id,"scope":q.scope.value,"taxonomy":taxonomy,"generation_eligible":bool(missing),"generation_missing_fields":missing}
 
 def question_views(rows:list[Question],db:Session)->list[dict]:
     """Serialize a page of questions without one taxonomy query per question."""

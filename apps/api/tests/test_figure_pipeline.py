@@ -178,9 +178,10 @@ def test_aes_encrypted_pdf_with_empty_user_password_imports(monkeypatch):
         "answer":None,"chapter":"Physics","topic":"Units","confidence":.99}]})
     run_bank_import(job.id)
     result=db.get(ImportJob,"job")
-    assert result.status==ImportStatus.APPROVED and result.error is None
+    assert result.status==ImportStatus.REVIEW and result.error is None
     assert result.extraction_meta["processed_pages"]==1
     assert db.query(Question).count()==1
+    assert "missing_solution" in db.query(Question).one().interaction["ingestion_issues"]
 
 
 def test_approving_present_questions_does_not_clear_skipped_source_pages():

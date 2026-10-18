@@ -427,6 +427,11 @@ def extract_bank_import(self, job_id: str):
     # exception made permanent validation failures look like live processing.
     return run_bank_import(job_id)
 
+@celery_app.task(bind=True)
+def generate_bank_solutions(self, job_id: str, run_id: str, actor_id: str, question_id: str | None = None):
+    from .solution_generation import run_generation
+    return run_generation(job_id, run_id, actor_id, question_id)
+
 @celery_app.task
 def finalize_expired_attempts():
     """Durably submit all attempts whose deadline has passed."""

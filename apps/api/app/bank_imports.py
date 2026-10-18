@@ -64,6 +64,7 @@ def _node(db, bank_id: str, parent_id: str | None, kind: str, name: str) -> Taxo
 def _issues(item: dict, answer: object, diagrams: list[dict]) -> list[str]:
     issues=list(item.get("_ingestion_issues") or [])
     if not answer and item.get("kind") != "subjective":issues.append("missing_answer")
+    if not str(item.get("solution_markdown") or "").strip():issues.append("missing_solution")
     if float(item.get("confidence") or 0)<.75:issues.append("low_confidence")
     if "$$$" in str(item.get("stem_markdown") or ""):issues.append("invalid_latex")
     # save_figures supplies concrete validation/storage failures. Raw model

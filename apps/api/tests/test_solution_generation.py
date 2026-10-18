@@ -1,0 +1,229 @@
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from fastapi import HTTPException
+import pytest
+
+from app.db import Base
+from app.main import _generation_job, import_view, question_view
+from app.models import (
+    ImportJob,
+    ImportStatus,
+    Question,
+    QuestionBank,
+    QuestionKind,
+    QuestionScope,
+    Role,
+    SourceDocument,
+    User,
+)
+from app.solution_generation import approve_generation, generate_question, queue_generation, run_generation
+
+
+def setup_db():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    admin = User(id="admin", name="Admin", email="admin@example.com", role=Role.ADMIN)
+    bank = QuestionBank(id="bank", name="Bank", slug="bank", exam_code="JEE")
+    source = SourceDocument(
+        id="source",
+        owner_id="admin",
+        filename="source.pdf",
+        object_key="source.pdf",
+        sha256="source-hash",
+        media_type="application/pdf",
+        size_bytes=100,
+    )
+    job = ImportJob(
+        id="job",
+        owner_id="admin",
+        bank_id="bank",
+        question_document_id="source",
+        status=ImportStatus.REVIEW,
+    )
+    db.add_all([admin, bank, source, job])
+    db.commit()
+    return db, admin, bank, job
+
+
+def question_record(db, *, kind=QuestionKind.SINGLE, answer=None, solution=None):
+    question = Question(
+        id="question",
+        owner_id="admin",
+        bank_id="bank",
+        scope=QuestionScope.GLOBAL,
+        import_job_id="job",
+        source_number="1",
+        kind=kind,
+        stem_markdown="What is two plus two?",
+        options=[
+            {"value": "a", "markdown": "4"},
+            {"value": "b", "markdown": "5"},
+        ],
+        answer=answer,
+        solution_markdown=solution,
+        interaction={"ingestion_issues": []},
+    )
+    db.add(question)
+    db.commit()
+    return question
+
+
+def test_question_view_reports_missing_fields_for_generation():
+    db, _, _, _ = setup_db()
+    question = question_record(db)
+
+    view = question_view(question, db)
+
+    assert view["generation_eligible"] is True
+    assert view["generation_missing_fields"] == ["answer", "solution"]
+
+
+def test_subjective_questions_generate_only_a_solution():
+    db, _, _, _ = setup_db()
+    question = question_record(db, kind=QuestionKind.SUBJECTIVE)
+
+    view = question_view(question, db)
+
+    assert view["generation_missing_fields"] == ["solution"]
+
+
+def test_import_view_reports_generation_eligible_count():
+    db, _, _, job = setup_db()
+    question_record(db)
+
+    view = import_view(job, db)
+
+    assert view["generation_eligible_count"] == 1
+
+
+def test_generation_fills_only_missing_fields_and_stages_review():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    queue_generation(db, job, admin.id, question)
+    db.commit()
+
+    result = generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True,
+        "answer": {"option": 0},
+        "solution_markdown": "1. Add the two quantities.\n\n2. Therefore, $2+2=4$, which is option A.",
+        "confidence": 0.99,
+        "notes": "Direct arithmetic.",
+    })
+
+    assert question.answer == {"option": 0}
+    assert question.solution_markdown.endswith("option A.")
+    assert result["generated_fields"] == ["solution"]
+    assert question.approved_at is None
+    assert "llm_generated_unreviewed" in question.interaction["ingestion_issues"]
+
+
+def test_generation_rejects_solution_that_conflicts_with_existing_answer():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    queue_generation(db, job, admin.id, question)
+
+    try:
+        generate_question(db, question, job, provider=lambda _: {
+            "can_solve": True,
+            "answer": {"option": 1},
+            "solution_markdown": "1. Evaluate the expression carefully.\n\n2. The result is five, corresponding to option B.",
+            "confidence": 0.7,
+            "notes": "Conflict.",
+        })
+    except ValueError as exc:
+        assert "conflicts" in str(exc)
+    else:
+        raise AssertionError("A conflicting generated solution must fail")
+
+    assert question.solution_markdown is None
+    assert question.answer == {"option": 0}
+
+
+def test_batch_approval_clears_all_warnings_for_successful_generated_questions():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    question.interaction = {"ingestion_issues": ["taxonomy_uncertain", "missing_solution"]}
+    state = queue_generation(db, job, admin.id, question)
+    generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True,
+        "answer": {"option": 0},
+        "solution_markdown": "1. Add two and two.\n\n2. The value is $4$, so the correct choice is option A.",
+        "confidence": 0.99,
+        "notes": "Solved.",
+    })
+    job.extraction_meta = {**job.extraction_meta, "solution_generation": {
+        **job.extraction_meta["solution_generation"], "status": "completed",
+    }}
+
+    approved = approve_generation(db, job, state["run_id"], admin.id)
+
+    assert approved == 1
+    assert question.approved_at is not None
+    assert question.interaction["ingestion_issues"] == []
+    assert "taxonomy_uncertain" in question.interaction["ignored_ingestion_issues"]
+
+
+def test_only_one_generation_run_can_be_active_per_source_document():
+    db, admin, _, job = setup_db()
+    question_record(db)
+    queue_generation(db, job, admin.id)
+
+    with pytest.raises(ValueError, match="already active"):
+        queue_generation(db, job, admin.id)
+
+
+def test_published_source_requires_a_bank_revision_before_generation():
+    db, _, bank, job = setup_db()
+    job.published_at = bank.created_at
+    db.commit()
+
+    with pytest.raises(HTTPException) as caught:
+        _generation_job(bank.id, job.id, db)
+
+    assert caught.value.status_code == 409
+    assert "revision" in caught.value.detail.lower()
+
+
+def test_document_generation_checkpoints_success_and_continues_after_failure(monkeypatch):
+    db, admin, _, job = setup_db()
+    first = question_record(db)
+    second = Question(
+        id="question-2", owner_id="admin", bank_id="bank", scope=QuestionScope.GLOBAL,
+        import_job_id="job", source_number="2", kind=QuestionKind.SUBJECTIVE,
+        stem_markdown="Explain why the sky appears blue.", options=[], answer=None,
+        solution_markdown=None, interaction={"ingestion_issues": ["missing_solution"]},
+    )
+    db.add(second); db.commit()
+    state = queue_generation(db, job, admin.id); db.commit()
+    run_id, job_id = state["run_id"], job.id
+    calls = 0
+
+    def provider(_):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("provider unavailable")
+        return {
+            "can_solve": True,
+            "answer": {"option": 0},
+            "solution_markdown": "1. Add the two values.\n\n2. The result is $4$, which corresponds to option A.",
+            "confidence": 0.98,
+            "notes": "Solved.",
+        }
+
+    worker_sessions = sessionmaker(bind=db.get_bind())
+    monkeypatch.setattr("app.solution_generation.SessionLocal", worker_sessions)
+    monkeypatch.setattr("app.solution_generation._provider_request", provider)
+    run_generation(job_id, run_id, admin.id)
+
+    db.expire_all()
+    saved = db.get(ImportJob, job_id).extraction_meta["solution_generation"]
+    assert saved["status"] == "completed_with_errors"
+    assert saved["processed"] == 2
+    assert saved["succeeded"] == 1
+    assert saved["failed"] == 1
+    rows = db.query(Question).filter_by(import_job_id=job_id).all()
+    assert sum(bool(row.solution_markdown) for row in rows) == 1
+    assert sum((row.interaction or {}).get("solution_generation", {}).get("status") == "failed" for row in rows) == 1
+

@@ -46,6 +46,8 @@ type Question = {
   interaction?: any;
   scope?: "private" | "global";
   taxonomy?: { id: string; parent_id?: string; kind: string; name: string }[];
+  generation_eligible?: boolean;
+  generation_missing_fields?: ("answer" | "solution")[];
 };
 type QuestionPage = { items: Question[]; page: number; page_size: number; total: number; approved_total?: number; has_more: boolean };
 type ImportJob = {
@@ -57,6 +59,7 @@ type ImportJob = {
   errors?: { page?: number; end_page?: number; message: string }[];
   question_count?: number;
   approved_count?: number;
+  generation_eligible_count?: number;
   published?: boolean;
   published_at?: string;
   meta?: {
@@ -74,6 +77,21 @@ type ImportJob = {
     pause_requested?: boolean;
     cancel_requested?: boolean;
     error_log?: { page?: number; message: string }[];
+    solution_generation?: {
+      run_id: string;
+      mode: "document" | "question";
+      question_id?: string | null;
+      status: "queued" | "running" | "completed" | "completed_with_errors" | "failed";
+      phase?: string;
+      total: number;
+      processed: number;
+      succeeded: number;
+      failed: number;
+      skipped?: number;
+      error?: string;
+      approved?: number;
+      errors?: { question_id?: string; source_number?: string; message: string }[];
+    };
   };
   questions?: Question[];
 };
@@ -2752,6 +2770,8 @@ function BankImportStatus({
   onReextract,
   onInspect,
   onPublish = () => {},
+  onGenerate,
+  onApproveGenerated,
 }: {
   jobs?: ImportJob[];
   onRetry: (job: ImportJob) => void;
@@ -2762,6 +2782,8 @@ function BankImportStatus({
   onReextract: (job: ImportJob) => void;
   onInspect: (job: ImportJob) => void;
   onPublish?: (job: ImportJob) => void;
+  onGenerate: (job: ImportJob) => void;
+  onApproveGenerated: (job: ImportJob) => void;
 }) {
   const groups = (jobs || []).reduce<Record<string, ImportJob[]>>(
     (all, job) => {
@@ -2809,6 +2831,9 @@ function BankImportStatus({
               </span>
             </div>
             {items.map((job) => {
+              const generation = job.meta?.solution_generation;
+              const generationActive = generation?.status === "queued" || generation?.status === "running";
+              const generationComplete = generation?.status === "completed" || generation?.status === "completed_with_errors";
               const paused = Boolean(job.meta?.pause_requested),
                 running =
                   job.status === "uploaded" || job.status === "processing",
@@ -2865,6 +2890,15 @@ function BankImportStatus({
                           {error.page ? error.end_page && error.end_page > error.page ? `Pages ${error.page}–${error.end_page}: ` : `Page ${error.page}: ` : ""}{error.message}
                         </li>)}</ul>
                       </details> : null}
+                      {generation && (
+                        <div className="generation-progress" aria-live="polite">
+                          <div><span>{generation.phase || "Solution generation"}</span><b>{generation.processed || 0}/{generation.total || 0}</b></div>
+                          <progress max={Math.max(1, generation.total || 1)} value={generation.processed || 0} />
+                          <small>{generation.succeeded || 0} generated · {generation.failed || 0} failed{generation.approved ? ` · ${generation.approved} approved` : ""}</small>
+                          {generation.error && <p className="import-error">{generation.error}</p>}
+                          {!!generation.errors?.length && <details className="import-error-log"><summary>Generation failures ({generation.errors.length})</summary><ul>{generation.errors.map((entry,index)=><li key={`${entry.question_id || index}`}>{entry.source_number ? `Question ${entry.source_number}: ` : ""}{entry.message}</li>)}</ul></details>}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="import-controls">
@@ -2885,6 +2919,14 @@ function BankImportStatus({
                     >
                       {job.status === "review" ? "Review" : "Inspect"}
                     </button>
+                    {!job.published && !running && Boolean(job.generation_eligible_count) && !generationActive && (
+                      <button type="button" onClick={() => onGenerate(job)}>
+                        {generation?.status === "failed" || generation?.status === "completed_with_errors" ? "Retry missing generation" : "Generate missing answers & solutions"}
+                      </button>
+                    )}
+                    {!job.published && generationComplete && Boolean(generation?.succeeded) && !generation?.approved && (
+                      <button type="button" onClick={() => onApproveGenerated(job)}>Approve all generated</button>
+                    )}
                     {!job.published && Boolean(job.approved_count) && (
                       <button type="button" onClick={() => onPublish(job)}>
                         {job.status === "approved" ? "Confirm & publish" : "Publish extracted questions"}
@@ -3003,8 +3045,8 @@ function QuestionBankManager({
   useEffect(() => {
     const active = detail?.imports?.some(
       (job) =>
-        (job.status === "uploaded" || job.status === "processing") &&
-        !job.meta?.pause_requested,
+        ((job.status === "uploaded" || job.status === "processing") &&
+        !job.meta?.pause_requested) || ["queued", "running"].includes(job.meta?.solution_generation?.status || ""),
     );
     if (!detail?.id || !active || figureEditing) return;
     const timer = window.setInterval(() => {
@@ -3015,6 +3057,16 @@ function QuestionBankManager({
     }, 3000);
     return () => window.clearInterval(timer);
   }, [detail?.id, detail?.imports, figureEditing]);
+  useEffect(() => {
+    const generation = selectedImport?.meta?.solution_generation;
+    if (!detail?.id || !selectedImport?.id || !generation || !["queued", "running"].includes(generation.status)) return;
+    const timer = window.setInterval(() => {
+      api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}`)
+        .then((report) => { setSelectedImport(report); setSelectedQuestions(report.questions || []); })
+        .catch((e) => setError(e.message));
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [detail?.id, selectedImport?.id, selectedImport?.meta?.solution_generation?.status]);
   useEffect(() => {
     if (!detail?.id || !figureRevalidation || !["queued", "running"].includes(figureRevalidation.status)) return;
     const timer = window.setInterval(() => {
@@ -3206,6 +3258,29 @@ function QuestionBankManager({
       setBusy(false);
     }
   };
+  const generateImportSolutions = async (job: ImportJob) => {
+    if (!detail) return;
+    setBusy(true); setError("");
+    try {
+      const state = await api(`/admin/question-banks/${detail.id}/imports/${job.id}/solution-generation`, { method: "POST" });
+      setSelectedImport((current) => current?.id === job.id ? { ...current, meta: { ...current.meta, solution_generation: state } } : current);
+      await open(detail.id);
+      notify(`${job.filename || "Source document"} queued for answer and solution generation.`);
+    } catch (e: any) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+  const approveGeneratedSolutions = async (job: ImportJob) => {
+    if (!detail || !job.meta?.solution_generation?.run_id) return;
+    if (!window.confirm("Approve every successfully generated question in this run? This clears all remaining warnings on those questions, including unrelated extraction or visual warnings, and records the override in the audit trail.")) return;
+    setBusy(true); setError("");
+    try {
+      const runId = job.meta.solution_generation.run_id;
+      const result = await api(`/admin/question-banks/${detail.id}/imports/${job.id}/solution-generation/${runId}/approve`, { method: "POST" });
+      await open(detail.id); await load();
+      notify(`${result.approved_count || 0} generated questions approved.`);
+    } catch (e: any) { setError(e.message); }
+    finally { setBusy(false); }
+  };
   const revision = async () => {
     if (!detail) return;
     setBusy(true);
@@ -3255,6 +3330,17 @@ function QuestionBankManager({
       setError(e.message);
     } finally {
       setBusy(false);
+    }
+  };
+  const finishQuestionReview = async () => {
+    setFigureEditing(false);
+    setEditingQuestion(null);
+    if (!detail) return;
+    await open(detail.id);
+    if (selectedImport) {
+      const report = await api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}`);
+      setSelectedImport(report);
+      setSelectedQuestions(report.questions || []);
     }
   };
   const visibleQuestions = selectedImport
@@ -3450,6 +3536,8 @@ function QuestionBankManager({
                 onReextract={reextractImport}
                 onInspect={inspectImport}
                 onPublish={publishImport}
+                onGenerate={generateImportSolutions}
+                onApproveGenerated={approveGeneratedSolutions}
               />
               <Card>
                 <h2>
@@ -3486,11 +3574,7 @@ function QuestionBankManager({
                           key={question.id}
                           bankId={detail.id}
                           question={question}
-                          done={async () => {
-                            setFigureEditing(false);
-                            setEditingQuestion(null);
-                            await open(detail.id);
-                          }}
+                          done={finishQuestionReview}
                           cancel={() => { setFigureEditing(false); setEditingQuestion(null); }}
                           onFigureActive={setFigureEditing}
                         />
@@ -3505,11 +3589,7 @@ function QuestionBankManager({
                           key={question.id}
                           bankId={detail.id}
                           question={question}
-                          done={async () => {
-                            setFigureEditing(false);
-                            setEditingQuestion(null);
-                            await open(detail.id);
-                          }}
+                          done={finishQuestionReview}
                           cancel={() => { setFigureEditing(false); setEditingQuestion(null); }}
                           onFigureActive={setFigureEditing}
                         />
@@ -3625,6 +3705,16 @@ function BankQuestionEditor({
     [error, setError] = useState(""),
     [tab, setTab] = useState<"rendered" | "json" | "edit">("rendered");
   const suggestedAnswer = inferredChoiceFromSolution(question);
+  const generation = question.interaction?.solution_generation;
+  const generationActive = generation?.status === "queued" || generation?.status === "running";
+  const generateMissing = async () => {
+    setBusy(true); setError("");
+    try {
+      await api(`/admin/question-banks/${bankId}/questions/${question.id}/solution-generation`, { method: "POST" });
+      await done();
+    } catch (e: any) { setError(e.message || "Could not queue solution generation."); }
+    finally { setBusy(false); }
+  };
   const ignoreWarningsAndApprove = async () => {
     setBusy(true);
     setError("");
@@ -3707,6 +3797,17 @@ function BankQuestionEditor({
           {question.approved ? "Reviewed" : "Needs review"}
         </span>
       </div>
+      {(question.generation_eligible || generation) && (
+        <div className="question-generation-status">
+          <div>
+            <b>{generationActive ? "Generating answer and solution…" : generation?.status === "failed" ? "Generation failed" : generation?.status === "completed" ? "LLM-generated draft ready for review" : `Missing ${(question.generation_missing_fields || []).join(" and ")}`}</b>
+            {generation?.model && <small>Model: {generation.model} · confidence {Math.round((generation.confidence || 0) * 100)}%</small>}
+            {generation?.error && <small className="error-text">{generation.error}</small>}
+          </div>
+          {question.generation_eligible && !generationActive && <button type="button" className="secondary-action" disabled={busy} onClick={generateMissing}>{generation?.status === "failed" ? "Retry generation" : "Generate missing fields"}</button>}
+        </div>
+      )}
+      {error && tab !== "edit" && <Notice kind="error">{error}</Notice>}
       <nav
         className="review-tabs"
         aria-label={`Question ${questionNumber(question.source_number)} view`}
