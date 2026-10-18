@@ -17,6 +17,7 @@ from .figure_repairs import revalidate_bank_figures
 from .seed import ensure_demo_data
 from .figures import is_visual_issue, option_media_issues
 from .solution_generation import ANSWER_KINDS as ANSWER_GENERATION_KINDS, approve_generation, has_usable_answer, missing_generation_fields, queue_generation
+from .import_cleanup import delete_import_records
 
 app=FastAPI(title="TestNow API",version="1.0.0")
 def as_utc(value:datetime)->datetime:
@@ -467,14 +468,18 @@ def cancel_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADM
 
 @app.delete("/admin/question-banks/{bank_id}/imports/{job_id}",status_code=204)
 def delete_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
-    job=db.get(ImportJob,job_id)
+    job=db.query(ImportJob).filter_by(id=job_id).with_for_update().one_or_none()
     if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
-    if job.status==ImportStatus.PROCESSING or (job.status==ImportStatus.UPLOADED and not (job.extraction_meta or {}).get("pause_requested")):raise HTTPException(409,"Pause this material and wait for the current batch to finish before deleting it")
+    meta=dict(job.extraction_meta or {})
+    generation=meta.get("solution_generation") or {}
+    active=job.status==ImportStatus.PROCESSING or generation.get("status") in {"queued","running"}
+    if active:
+        job.extraction_meta={**meta,"cancel_requested":True,"delete_requested":True,"delete_requested_by":user.id,"phase":"Deletion requested — finishing the current page batch"}
+        audit(db,user.id,"question_bank.import_deletion_requested","import",job.id,{"bank_id":bank_id});db.commit();return Response(status_code=204)
     # Paused and cancelled materials are deliberately deletable.  A material
     # may have a useful partial extraction, so publication is offered first in
     # the UI; deletion is the administrator's explicit destructive choice.
-    clear_bank_import_output(db,job)
-    db.delete(job);audit(db,user.id,"question_bank.import_deleted","import",job_id,{"bank_id":bank_id});db.commit()
+    delete_import_records(db,job,user.id);db.commit()
 
 @app.post("/admin/question-banks/{bank_id}/publish")
 def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):

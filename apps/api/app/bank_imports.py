@@ -16,6 +16,7 @@ from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .storage import get, put
+from .import_cleanup import delete_import_records
 from .figures import save_figures, visual_context, mark_scope_conflicts, ground_question_spans, docx_visual_inventory, docx_conversion_issues, requires_source_figure, visual_intent
 from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction, solution_from_key
 
@@ -113,6 +114,7 @@ def _control_state(db, job_id: str) -> str | None:
     db.expire_all()
     current=db.get(ImportJob,job_id)
     meta=(current.extraction_meta or {}) if current else {}
+    if meta.get("delete_requested"): return "deleted"
     if meta.get("cancel_requested"): return "cancelled"
     if meta.get("pause_requested"): return "paused"
     return None
@@ -135,6 +137,8 @@ def _checkpoint(db, job_id: str, updates: dict) -> tuple[ImportJob, dict]:
 
 def _finish_controlled_import(db, job_id: str, control: str, updates: dict) -> None:
     job,meta=_checkpoint(db,job_id,updates)
+    if control=="deleted":
+        delete_import_records(db,job,meta.get("delete_requested_by"));db.commit();return
     job.status=ImportStatus.FAILED if control=="cancelled" else ImportStatus.UPLOADED
     job.error="Cancelled by administrator" if control=="cancelled" else None
     job.extraction_meta={**meta,"phase":"Cancelled" if control=="cancelled" else "Paused by administrator"}
@@ -202,6 +206,8 @@ def run_bank_import(job_id: str) -> None:
         # paused material. Only the resume endpoint clears this durable flag.
         if meta.get("pause_requested"):
             job.status=ImportStatus.UPLOADED;job.extraction_meta={**meta,"phase":"Paused by administrator"};db.commit();return
+        if meta.get("delete_requested"):
+            _finish_controlled_import(db,job_id,"deleted",{});return
         if meta.get("cancel_requested"):
             job.status=ImportStatus.FAILED;job.error="Cancelled by administrator";job.extraction_meta={**meta,"phase":"Cancelled"};db.commit();return
         job.status=ImportStatus.PROCESSING;job.extraction_meta={**meta,"phase":"Reading source"};db.commit()

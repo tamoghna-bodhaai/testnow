@@ -24,6 +24,7 @@ from .models import ImportJob, ImportStatus, Question, QuestionKind, QuestionTax
 from .security import uid
 from .services import audit
 from .storage import get
+from .import_cleanup import delete_import_records
 from .tasks import normalize_answer
 
 
@@ -427,6 +428,11 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
         succeeded = failed = skipped = processed = 0
         errors: list[dict] = []
         for row in rows:
+            db.expire_all()
+            current_job=db.get(ImportJob,job_id)
+            if not current_job:return
+            if (current_job.extraction_meta or {}).get("delete_requested"):
+                delete_import_records(db,current_job,(current_job.extraction_meta or {}).get("delete_requested_by"));db.commit();return
             try:
                 result = generate_question(db, row, job)
                 if result.get("status") == "skipped":
@@ -448,9 +454,13 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
                 failed += 1
                 audit(db, actor_id, "question_solution_generation.failed", "question", row.id, {"run_id": run_id, "error": message[:300]})
             processed += 1
+            db.flush();db.expire_all()
+            current_job=db.get(ImportJob,job_id)
+            if not current_job:return
+            if (current_job.extraction_meta or {}).get("delete_requested"):
+                delete_import_records(db,current_job,(current_job.extraction_meta or {}).get("delete_requested_by"));db.commit();return
             # Persist the question result before _checkpoint expires the
             # identity map to merge the latest job metadata.
-            db.flush()
             job, state = _checkpoint(db, job_id, run_id, {
                 "phase": f"Generated {processed} of {len(rows)} questions",
                 "processed": processed,

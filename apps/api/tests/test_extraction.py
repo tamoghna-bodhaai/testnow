@@ -1,9 +1,9 @@
 import subprocess
 
 import pytest
-from app.bank_imports import _node, _pdf_bytes
-from app.main import clear_bank_import_output
-from app.models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
+from app.bank_imports import _finish_controlled_import, _node, _pdf_bytes
+from app.main import clear_bank_import_output, delete_bank_import
+from app.models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Role, SourceDocument, TaxonomyNode, User
 from app.seed_jee_openrouter import normalize_choice_kind
 from app.tasks import answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, solution_from_key, unit_requires_vision, validate
 from io import BytesIO
@@ -161,4 +161,35 @@ def test_clean_reextraction_removes_only_the_materials_derived_questions(monkeyp
     assert db.get(Question,"extracted") is None
     assert db.get(Question,"untouched") is not None
     assert db.query(QuestionTaxonomy).filter_by(question_id="extracted").count() == 0
+    assert prefixes == ["bank-diagrams/bank/job/"]
+
+
+def test_processing_material_delete_becomes_a_durable_worker_request():
+    engine=create_engine("sqlite+pysqlite:///:memory:"); Base.metadata.create_all(engine); db=sessionmaker(bind=engine)()
+    admin=User(id="admin",name="Admin",email="admin@example.com",role=Role.ADMIN)
+    bank=QuestionBank(id="bank",slug="bank",name="Bank",exam_code="test")
+    source=SourceDocument(id="source",owner_id="admin",filename="physics.pdf",object_key="physics.pdf",sha256="x",media_type="application/pdf",size_bytes=1)
+    job=ImportJob(id="job",owner_id="admin",bank_id="bank",question_document_id="source",status=ImportStatus.PROCESSING)
+    db.add_all([admin,bank,source,job]);db.commit()
+
+    delete_bank_import(bank.id,job.id,admin,db)
+
+    db.refresh(job)
+    assert job.extraction_meta["delete_requested"] is True
+    assert job.extraction_meta["cancel_requested"] is True
+    assert "finishing the current page batch" in job.extraction_meta["phase"]
+
+
+def test_worker_finishes_requested_material_deletion(monkeypatch):
+    engine=create_engine("sqlite+pysqlite:///:memory:"); Base.metadata.create_all(engine); db=sessionmaker(bind=engine)()
+    bank=QuestionBank(id="bank",slug="bank",name="Bank",exam_code="test")
+    job=ImportJob(id="job",owner_id="owner",bank_id="bank",question_document_id="source",status=ImportStatus.PROCESSING,extraction_meta={"delete_requested":True})
+    question=Question(id="question",owner_id="owner",bank_id="bank",scope=QuestionScope.GLOBAL,import_job_id="job",kind=QuestionKind.SUBJECTIVE,stem_markdown="Invalid",options=[],answer=None)
+    db.add_all([bank,job,question]);db.commit()
+    prefixes=[];monkeypatch.setattr("app.import_cleanup.delete_prefix",lambda prefix:prefixes.append(prefix))
+
+    _finish_controlled_import(db,job.id,"deleted",{})
+
+    assert db.get(ImportJob,"job") is None
+    assert db.get(Question,"question") is None
     assert prefixes == ["bank-diagrams/bank/job/"]

@@ -76,6 +76,7 @@ type ImportJob = {
     chunks_total?: number;
     pause_requested?: boolean;
     cancel_requested?: boolean;
+    delete_requested?: boolean;
     error_log?: { page?: number; message: string }[];
     solution_generation?: {
       run_id: string;
@@ -2972,17 +2973,16 @@ function BankImportStatus({
                         Re-extract material
                       </button>
                     )}
-                    {canManageStoredOutput && (
-                      <button
+                    <button
                         type="button"
                         className="text-danger"
-                        title="Delete this source material and every extracted question"
+                        title={job.meta?.delete_requested ? "Deletion will complete after the current page batch" : "Delete this source material and every extracted question"}
                         aria-label={`Delete ${job.filename || "import"}`}
+                        disabled={Boolean(job.meta?.delete_requested)}
                         onClick={() => onDelete(job)}
                       >
-                        Delete material
-                      </button>
-                    )}
+                        {job.meta?.delete_requested ? "Deleting…" : "Delete material"}
+                    </button>
                   </div>
                 </article>
               );
@@ -3209,7 +3209,7 @@ function QuestionBankManager({
       setSelectedImport(null);
       await open(detail.id);
       await load();
-      notify("Source removed from this bank.");
+      notify(job.status === "processing" || job.status === "uploaded" ? "Deletion requested. The material will disappear after its current page batch stops." : "Source removed from this bank.");
     } catch (e: any) {
       setError(e.message);
     } finally {
