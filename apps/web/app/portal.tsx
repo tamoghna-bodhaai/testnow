@@ -311,13 +311,16 @@ function Markdown({
   value: string;
   className?: string;
 }) {
+  const normalized = value
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_, math) => `\n$$\n${math.trim()}\n$$\n`)
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_, math) => `$${math.trim()}$`);
   return (
     <div className={`markdown ${className}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
       >
-        {value}
+        {normalized}
       </ReactMarkdown>
     </div>
   );
@@ -3685,14 +3688,33 @@ function DocumentImportPage({job,questions,activeQuestion,busy,close,edit,delete
       {(job.errors?.length||generation?.errors?.length) ? <section className="document-issue-summary"><h2>Run issues</h2>{job.errors?.map((entry,index)=><p key={`extract-${index}`}>Extraction{entry.page?` · page ${entry.page}`:""}: {entry.message}</p>)}{generation?.errors?.map((entry,index)=><p key={`generation-${entry.question_id||index}`}>{entry.source_number?`Question ${entry.source_number}`:"Question"}: {entry.message}</p>)}</section>:null}
       <nav className="document-filters" aria-label="Filter document questions">{([['all',`All ${questions.length}`],['attention',`Needs attention ${attention.length}`],['generated',`Generated ${generated.length}`],['published',`Passed ${job.approved_count||0}`]] as const).map(([value,label])=><button type="button" key={value} className={filter===value?"active":""} onClick={()=>setFilter(value)}>{label}</button>)}</nav>
       <main className="document-detail-questions">
-        {shown.map(question=><div className={`document-detail-question ${issueFor(question)?"has-issue":""}`} key={question.id}>
-          <div className="document-question-summary"><div><b>{questionNumber(question.source_number)} · {question.kind.replaceAll('_',' ')}</b><p className="document-question-stem">{question.stem_markdown}</p><dl className="document-question-glance"><div><dt>Answer</dt><dd>{question.answer?JSON.stringify(question.answer):"Missing"}</dd></div><div><dt>Solution</dt><dd>{question.solution_markdown||"Missing"}</dd></div></dl><small>{question.approved?"Passed review":issueFor(question)||"Awaiting review"}</small></div><div><button type="button" className="secondary-action" onClick={()=>edit(activeQuestion?.id===question.id?null:question)}>{activeQuestion?.id===question.id?"Close editor":"Review"}</button>{!job.published&&<button type="button" className="text-danger" disabled={busy} onClick={()=>deleteQuestion(question)}>Delete invalid</button>}</div></div>
+        {shown.map(question=><article className={`document-detail-question ${issueFor(question)?"has-issue":""}`} key={question.id}>
+          <header className="document-question-card-header">
+            <div><span className="document-question-number">{questionNumber(question.source_number)}</span><span className="document-question-kind">{question.kind.replaceAll('_',' ')}</span><span className={`document-question-status ${question.approved?"passed":issueFor(question)?"attention":"pending"}`}>{question.approved?"Passed review":issueFor(question)?"Needs attention":"Awaiting review"}</span></div>
+            <div className="document-question-actions"><button type="button" className="secondary-action" onClick={()=>edit(activeQuestion?.id===question.id?null:question)}>{activeQuestion?.id===question.id?"Close editor":"Review question"}</button>{!job.published&&<button type="button" className="text-danger" disabled={busy} onClick={()=>deleteQuestion(question)}>Delete invalid</button>}</div>
+          </header>
+          <div className="document-question-card-body">
+            <Markdown value={question.stem_markdown} className="document-question-stem" />
+            {question.options?.length > 0 && <ol className="document-question-options">{question.options.map((option,index)=><li key={index}><span>{String.fromCharCode(65+index)}</span><Markdown value={optionMarkdown(option)} /></li>)}</ol>}
+            <div className="document-answer-key"><span>Answer key</span><strong>{question.answer?formatQuestionAnswer(question):"Missing"}</strong></div>
+            {(question.solution_markdown||issueFor(question))&&<details className="document-solution"><summary><span>{question.solution_markdown?"Solution":"Solution unavailable"}</span><span className="document-solution-toggle">Show</span></summary><div>{question.solution_markdown?<Markdown value={question.solution_markdown}/>:<p>No solution was generated for this question.</p>}</div></details>}
+            {issueFor(question)&&<p className="document-question-issue"><b>Review note:</b> {issueFor(question).replaceAll('_',' ')}</p>}
+          </div>
           {activeQuestion?.id===question.id&&renderEditor(question)}
-        </div>)}
+        </article>)}
         {!shown.length&&<p className="queue-empty">No questions match this view.</p>}
       </main>
     </div>
   </div>;
+}
+
+function formatQuestionAnswer(question:Question) {
+  const answer=question.answer;
+  if (answer?.option!==undefined) return `Option ${String.fromCharCode(65+Number(answer.option))}`;
+  if (Array.isArray(answer?.options)) return `Options ${answer.options.map((value:number)=>String.fromCharCode(65+Number(value))).join(", ")}`;
+  if (answer?.value!==undefined) return String(answer.value);
+  if (answer?.matches) return Object.entries(answer.matches).map(([row,columns])=>`${row} → ${(columns as unknown[]).join(", ")}`).join("; ");
+  return JSON.stringify(answer);
 }
 
 function QuestionReviewRow({

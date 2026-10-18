@@ -105,3 +105,41 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 @media(max-width:1000px){.student-analytics>summary{grid-template-columns:minmax(180px,1fr) auto auto}.student-analytics>summary>span:nth-child(4),.student-analytics>summary>span:nth-child(5),.student-analytics>summary>span:nth-child(6){display:none}}
 @media(max-width:600px){.student-analytics>summary{grid-template-columns:1fr auto}.student-analytics>summary>span:nth-child(3){display:none}}
 .generation-progress{display:grid;gap:6px;margin-top:10px;max-width:620px;padding:10px 12px;border:1px solid #dfe3ef;border-radius:8px;background:#f8f9fd}.generation-progress>div{display:flex;justify-content:space-between;gap:12px;font-size:11px;color:var(--muted)}.generation-progress progress{width:100%;height:8px;accent-color:var(--blue)}.generation-progress>small{margin:0!important;color:var(--muted)}.question-generation-status{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:14px;padding:12px 14px;border:1px solid #dfe3ef;border-radius:8px;background:var(--indigo-mist)}.question-generation-status>div{display:grid;gap:4px}.question-generation-status b{font-size:12px}.question-generation-status small{font-size:11px;color:var(--muted)}.question-generation-status .error-text{color:var(--red)}
+
+/* Document review uses readable question cards and the shared Markdown/KaTeX renderer. */
+.document-detail-questions{display:grid;gap:14px;padding:16px;background:#f5f6fa;overflow:visible}
+.document-detail-question{padding:0;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+.document-detail-question:last-child{border-bottom:1px solid var(--line)}
+.document-detail-question.has-issue{border-left:3px solid var(--red);box-shadow:none}
+.document-question-card-header{min-height:auto;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:14px 18px;border:0;border-bottom:1px solid var(--line);background:#fafbfe}
+.document-question-card-header>div{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.document-question-number{font:700 13px "DM Mono",monospace;color:var(--navy)}
+.document-question-kind,.document-question-status{padding:4px 7px;border-radius:5px;font:700 9px "DM Mono",monospace;text-transform:uppercase;letter-spacing:.04em}
+.document-question-kind{background:var(--indigo-mist);color:var(--blue)}
+.document-question-status{background:#fff0d9;color:#8b570e}
+.document-question-status.attention{background:#fbeded;color:#983d42}
+.document-question-status.passed{background:#e5f2ef;color:var(--green)}
+.document-question-actions{flex:0 0 auto}
+.document-question-actions button{min-height:40px}
+.document-question-card-body{padding:20px 22px}
+.document-question-stem{max-width:78ch;font-size:15px!important;line-height:1.7;white-space:normal;overflow:visible}
+.document-question-stem>*:first-child{margin-top:0}
+.document-question-options{display:grid;gap:8px;max-width:900px;padding:0;margin:18px 0;list-style:none}
+.document-question-options li{display:grid;grid-template-columns:28px minmax(0,1fr);align-items:start;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#fcfdff}
+.document-question-options li>span{display:grid;place-items:center;width:26px;height:26px;border:1px solid #b8bdda;border-radius:50%;font:700 11px "DM Mono",monospace;color:var(--blue)}
+.document-question-options .markdown>*{margin:1px 0}
+.document-answer-key{display:flex;align-items:baseline;gap:10px;margin-top:16px;padding:10px 12px;border-radius:7px;background:var(--indigo-mist)}
+.document-answer-key span{font:700 9px "DM Mono",monospace;text-transform:uppercase;color:var(--muted)}
+.document-answer-key strong{font-size:12px;color:var(--blue)}
+.document-solution{margin-top:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow:hidden}
+.document-solution summary{display:flex;align-items:center;justify-content:space-between;min-height:44px;padding:10px 13px;cursor:pointer;font-size:12px;font-weight:800;list-style:none}
+.document-solution summary::-webkit-details-marker{display:none}
+.document-solution summary:hover{background:#fafbfe}
+.document-solution-toggle{color:var(--blue);font-weight:700}
+.document-solution[open] .document-solution-toggle{font-size:0}
+.document-solution[open] .document-solution-toggle:after{content:"Hide";font-size:12px}
+.document-solution>div{padding:4px 14px 14px;border-top:1px solid var(--line);background:#fcfdff}
+.document-solution .markdown{max-width:78ch}
+.document-question-issue{margin:12px 0 0!important;padding:10px 12px;border-radius:7px;background:#fff7f7;color:#7d3b40!important;font-size:12px!important}
+.document-detail-question>.bank-question-review{margin:0 18px 18px}
+@media(max-width:900px){.document-detail-questions{padding:10px}.document-question-card-header{align-items:flex-start;flex-direction:column}.document-question-actions{width:100%}.document-question-card-body{padding:17px}}
