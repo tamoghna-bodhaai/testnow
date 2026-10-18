@@ -3666,7 +3666,12 @@ function DocumentImportPage({job,questions,activeQuestion,busy,close,edit,delete
   const [filter,setFilter]=useState<"all"|"attention"|"generated"|"published">("all");
   const generation=job.meta?.solution_generation;
   const generationActive=generation?.status==="queued"||generation?.status==="running";
-  const issueFor=(question:Question)=>question.interaction?.solution_generation?.error || (question.interaction?.ingestion_issues||[]).join(", ");
+  const issueFor=(question:Question)=>{
+    const generationError=question.interaction?.solution_generation?.error;
+    const keyedWithoutSolution=Boolean(question.interaction?.answer_key_authoritative&&question.answer&&!question.solution_markdown);
+    const staleSolutionError=keyedWithoutSolution&&/solution|multi[- ]step/i.test(String(generationError||""));
+    return (!staleSolutionError&&generationError) || (question.interaction?.ingestion_issues||[]).join(", ");
+  };
   const attention=questions.filter(question=>issueFor(question)||!question.approved);
   const generated=questions.filter(question=>question.interaction?.solution_generation?.status==="completed");
   const shown=questions.filter(question=>filter==="all"||filter==="attention"&&attention.includes(question)||filter==="generated"&&generated.includes(question)||filter==="published"&&question.approved);

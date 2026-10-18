@@ -86,7 +86,12 @@ def missing_generation_fields(question: Question) -> list[str]:
     missing: list[str] = []
     if question.kind in ANSWER_KINDS and not has_usable_answer(question.kind, question.answer, question.options or []):
         missing.append("answer")
-    if not str(question.solution_markdown or "").strip():
+    interaction = question.interaction or {}
+    keyed_answer_is_sufficient = bool(
+        interaction.get("answer_key_authoritative")
+        and has_usable_answer(question.kind, question.answer, question.options or [])
+    )
+    if not str(question.solution_markdown or "").strip() and not keyed_answer_is_sufficient:
         missing.append("solution")
     return missing
 

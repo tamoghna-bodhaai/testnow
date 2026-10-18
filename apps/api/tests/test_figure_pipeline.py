@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.bank_imports import _is_critical_provider_error, _pdf_bytes, _save_questions
+from app.bank_imports import _is_critical_provider_error, _issues, _pdf_bytes, _save_questions
 from app.config import settings
 from app.db import Base
 from app.figure_review import review_figures, figure_source, figure_source_page, save_question_draft
@@ -182,6 +182,13 @@ def test_aes_encrypted_pdf_with_empty_user_password_imports(monkeypatch):
     assert result.extraction_meta["processed_pages"]==1
     assert db.query(Question).count()==1
     assert "missing_solution" in db.query(Question).one().interaction["ingestion_issues"]
+
+
+def test_authoritative_answer_key_does_not_create_missing_solution_warning():
+    item = {"kind": "single_choice", "confidence": .99, "chapter": "Chemistry"}
+
+    assert _issues(item, {"option": 0}, [], answer_key_authoritative=True) == []
+    assert _issues(item, {"option": 0}, []) == ["missing_solution"]
 
 
 def test_approving_present_questions_does_not_clear_skipped_source_pages():

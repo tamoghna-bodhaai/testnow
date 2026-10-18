@@ -117,6 +117,14 @@ def test_populated_fields_are_not_generation_eligible():
     assert missing_generation_fields(question) == []
 
 
+def test_authoritative_key_does_not_require_generated_solution():
+    db, _, _, _ = setup_db()
+    question = question_record(db, answer={"option": 0})
+    question.interaction = {"ingestion_issues": [], "answer_key_authoritative": True}
+
+    assert missing_generation_fields(question) == []
+
+
 @pytest.mark.parametrize(("kind", "answer"), [
     (QuestionKind.SINGLE, {"option": None}),
     (QuestionKind.MULTIPLE, {"options": []}),

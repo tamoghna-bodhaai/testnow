@@ -62,10 +62,14 @@ def _node(db, bank_id: str, parent_id: str | None, kind: str, name: str) -> Taxo
     row=TaxonomyNode(id=uid(),bank_id=bank_id,parent_id=parent_id,kind=kind,name=name);db.add(row);db.flush();return row
 
 
-def _issues(item: dict, answer: object, diagrams: list[dict]) -> list[str]:
+def _issues(item: dict, answer: object, diagrams: list[dict], *, answer_key_authoritative: bool = False) -> list[str]:
     issues=list(item.get("_ingestion_issues") or [])
     if not answer and item.get("kind") != "subjective":issues.append("missing_answer")
-    if not str(item.get("solution_markdown") or "").strip():issues.append("missing_solution")
+    # A separately supplied answer key is the authority for objective scoring.
+    # A worked solution is useful enrichment, but its absence must not turn a
+    # directly keyed, scoreable question into a false extraction warning.
+    if not str(item.get("solution_markdown") or "").strip() and not answer_key_authoritative:
+        issues.append("missing_solution")
     if float(item.get("confidence") or 0)<.75:issues.append("low_confidence")
     if "$$$" in str(item.get("stem_markdown") or ""):issues.append("invalid_latex")
     # save_figures supplies concrete validation/storage failures. Raw model
@@ -181,9 +185,11 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
             item["answer"]=answer_from_key(number,item.get("options") or [],answer_text)
         if not item.get("solution_markdown"):
             item["solution_markdown"]=solution_from_key(number,answer_text)
-        answer=_answer_from_solution(item);issues=_issues(item,answer,diagrams);flagged+=bool(issues)
+        answer=_answer_from_solution(item)
+        answer_key_authoritative=bool(str(answer_text or "").strip() and answer)
+        issues=_issues(item,answer,diagrams,answer_key_authoritative=answer_key_authoritative);flagged+=bool(issues)
         chapter=_node(db,bank.id,subject_node.id,"chapter",str(item.get("chapter") or "Unmapped chapter"));topic_name=str(item.get("topic") or "").strip();topic=_node(db,bank.id,chapter.id,"topic",topic_name) if topic_name else None
-        interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"visual_intent":item.get("visual_intent","none"),"answer_inferred_from_solution":bool(answer and not item.get("answer")),"matrix_items":item.get("matrix_items") or [],"matrix_choices":item.get("matrix_choices") or []}
+        interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"visual_intent":item.get("visual_intent","none"),"answer_inferred_from_solution":bool(answer and not item.get("answer")),"answer_key_authoritative":answer_key_authoritative,"matrix_items":item.get("matrix_items") or [],"matrix_choices":item.get("matrix_choices") or []}
         q=Question(id=uid(),owner_id=job.owner_id,bank_id=bank.id,scope=QuestionScope.GLOBAL,import_job_id=job.id,source_number=number,source_key=source_key,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=answer,solution_markdown=item.get("solution_markdown"),confidence=item.get("confidence"),source_spans=item.get("source_spans") or [],diagrams=diagrams,interaction=interaction,approved_at=None if issues else datetime.now(timezone.utc))
         try:
             with db.begin_nested():db.add(q);db.flush()
