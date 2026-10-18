@@ -108,6 +108,7 @@ type Test = {
     status: "submitted" | "in_progress" | "expired" | "cancelled";
     started_at?: string;
     submitted_at?: string;
+    duration_seconds?: number;
     score?: number;
     integrity_flagged?: boolean;
     cancellation_reason?: string;
@@ -149,6 +150,7 @@ type Analytics = {
     percentage?: number;
     started_at?: string;
     submitted_at?: string;
+    duration_seconds?: number;
     attempt_count: number;
     integrity_flagged: boolean;
     best_score?: number;
@@ -258,6 +260,10 @@ const fmtDate = (value?: string) =>
         timeStyle: "short",
       }).format(new Date(value))
     : "—";
+const fmtDuration = (seconds?: number | null) =>
+  seconds === undefined || seconds === null
+    ? "—"
+    : `${Math.floor(seconds / 3600) ? `${Math.floor(seconds / 3600)}h ` : ""}${Math.floor((seconds % 3600) / 60)}m ${seconds % 60}s`;
 const questionNumber = (value?: string) =>
   value ? `Q${String(value).trim().replace(/^q\s*/i, "")}` : "Question";
 const JEE_QUESTION_TYPES = [
@@ -336,7 +342,20 @@ export function Portal() {
     [message, setMessage] = useState("");
   const previousJobs = useRef<Map<string, string>>(new Map()),
     sessionVersion = useRef(0),
-    finishingAttempt = useRef<string | null>(null);
+    finishingAttempt = useRef<string | null>(null),
+    attemptRef = useRef<any>(null),
+    responseSaveQueue = useRef<Promise<boolean>>(Promise.resolve(true)),
+    failedResponseSaves = useRef<Set<string>>(new Set()),
+    activeAttemptId = useRef<string | null>(null);
+  useEffect(() => {
+    attemptRef.current = attempt;
+    if ((attempt?.id || null) !== activeAttemptId.current) {
+      activeAttemptId.current = attempt?.id || null;
+      responseSaveQueue.current = Promise.resolve(true);
+      failedResponseSaves.current.clear();
+      finishingAttempt.current = null;
+    }
+  }, [attempt]);
   const loadImports = async (version = sessionVersion.current) => {
     if (version !== sessionVersion.current) return [];
     const next: ImportJob[] = await api("/teacher/imports");
@@ -466,6 +485,58 @@ export function Portal() {
     setSelectedTestId(id);
     setOpenAssignmentAfterCreate(assignment);
     setView("test-detail");
+  };
+  const queueResponseUpdate = (qid: string, answer: any, marked: boolean) => {
+    const queued = responseSaveQueue.current.then(async () => {
+      const current = attemptRef.current;
+      if (!current) return false;
+      try {
+        const saved = await api(`/attempts/${current.id}/responses/${qid}`, {
+          method: "PUT",
+          body: JSON.stringify({ answer, marked_for_review: marked, revision: current.revision }),
+        });
+        const next = {
+          ...current,
+          revision: saved.revision,
+          responses: { ...current.responses, [qid]: { answer, marked_for_review: marked } },
+        };
+        attemptRef.current = next;
+        setAttempt(next);
+        failedResponseSaves.current.delete(qid);
+        return true;
+      } catch (e: any) {
+        failedResponseSaves.current.add(qid);
+        setMessage(e.message);
+        return false;
+      }
+    });
+    responseSaveQueue.current = queued;
+    return queued;
+  };
+  const finishAttempt = async () => {
+    const current = attemptRef.current;
+    if (!current || finishingAttempt.current === current.id) return false;
+    finishingAttempt.current = current.id;
+    try {
+      await responseSaveQueue.current;
+      const latest = attemptRef.current;
+      const expired = Date.now() >= new Date(latest.ends_at).getTime();
+      if (failedResponseSaves.current.size && !expired) {
+        throw new Error("One or more answers could not be saved. Review the highlighted response and submit again.");
+      }
+      const submitted = await api(`/attempts/${latest.id}/submit`, {
+        method: "POST",
+        body: JSON.stringify({ revision: latest.revision }),
+      });
+      attemptRef.current = submitted;
+      setAttempt(submitted);
+      setView("result");
+      return true;
+    } catch (e: any) {
+      finishingAttempt.current = null;
+      setMessage(e.message);
+      return false;
+    }
   };
   return (
     <main>
@@ -662,43 +733,8 @@ export function Portal() {
             setView("home");
             await load(user);
           }}
-          finish={async () => {
-            if (finishingAttempt.current === attempt.id) return false;
-            finishingAttempt.current = attempt.id;
-            try {
-              await api(`/attempts/${attempt.id}/submit`, { method: "POST" });
-              setView("result");
-              return true;
-            } catch (e: any) {
-              finishingAttempt.current = null;
-              setMessage(e.message);
-              return false;
-            }
-          }}
-          update={async (qid, answer, marked) => {
-            try {
-              const x = await api(`/attempts/${attempt.id}/responses/${qid}`, {
-                method: "PUT",
-                body: JSON.stringify({
-                  answer,
-                  marked_for_review: marked,
-                  revision: attempt.revision,
-                }),
-              });
-              setAttempt({
-                ...attempt,
-                revision: x.revision,
-                responses: {
-                  ...attempt.responses,
-                  [qid]: { answer, marked_for_review: marked },
-                },
-              });
-              return true;
-            } catch (e: any) {
-              setMessage(e.message);
-              return false;
-            }
-          }}
+          finish={finishAttempt}
+          update={queueResponseUpdate}
         />
       )}
       {view === "result" && attempt && <Result attempt={attempt} />}
@@ -1514,6 +1550,7 @@ function AnalyticsPanel({ analytics }: { analytics: Analytics | null }) {
                   <span><b>{row.student.name}</b><small>{row.student.email} · {row.classes.map((item) => item.name).join(", ") || "Individually assigned"}</small></span>
                   <span className={`badge ${row.status}`}>{row.status.replace("_", " ")}</span>
                   <span><b>{row.percentage !== undefined && row.percentage !== null ? `${row.percentage}%` : "—"}</b><small>Latest score</small></span>
+                  <span><b>{fmtDuration(row.duration_seconds)}</b><small>Time taken</small></span>
                   <span><b>{row.attempt_count}</b><small>Attempts</small></span>
                   <span className={row.integrity_flagged ? "integrity-label" : "integrity-clear"}>{row.integrity_flagged ? "⚑ Flagged" : "Clear"}</span>
                 </summary>
@@ -1526,7 +1563,7 @@ function AnalyticsPanel({ analytics }: { analytics: Analytics | null }) {
                         <td><span className={`badge ${attempt.status}`}>{attempt.status}</span></td>
                         <td>{attempt.score ?? "—"} / {attempt.max_score}<small>{attempt.percentage !== undefined && attempt.percentage !== null ? `${attempt.percentage}%` : "—"}</small></td>
                         <td>{attempt.correct} / {attempt.incorrect} / {attempt.unanswered}</td>
-                        <td>{attempt.duration_seconds !== undefined && attempt.duration_seconds !== null ? `${Math.floor(attempt.duration_seconds / 60)}m ${attempt.duration_seconds % 60}s` : "In progress"}</td>
+                        <td>{attempt.duration_seconds !== undefined && attempt.duration_seconds !== null ? fmtDuration(attempt.duration_seconds) : "In progress"}</td>
                         <td>{attempt.integrity_flagged ? <span className="integrity-label">{(attempt.cancellation_reason || "violation").replaceAll("_", " ")}<small>{fmtDate(attempt.incidents[0]?.detected_at)}</small></span> : <span className="integrity-clear">No incidents</span>}</td>
                       </tr>
                     ))}</tbody>
@@ -2624,7 +2661,7 @@ function StudentHome({
                 {submitted && (
                   <small>
                     Submitted: {fmtDate(latest.submitted_at)} · Score:{" "}
-                    {latest.score ?? "—"}
+                    {latest.score ?? "—"} · Time taken: {fmtDuration(latest.duration_seconds)}
                   </small>
                 )}
                 {cancelled && (
@@ -4061,6 +4098,17 @@ function Exam({
   };
   const finishNormally = async () => {
     integrityTriggered.current = true;
+    if (draftChanged) {
+      setSaving(true);
+      setSaveError("");
+      const saved = await update(q.id, draft, draftReview);
+      if (mounted.current) setSaving(false);
+      if (!saved) {
+        integrityTriggered.current = false;
+        if (mounted.current) setSaveError("Could not save the current response. Check your connection and submit again.");
+        return false;
+      }
+    }
     const submitted = await finish();
     if (!submitted) integrityTriggered.current = false;
     return submitted;
@@ -4070,8 +4118,8 @@ function Exam({
   const matrix = q.kind === "matrix_match";
   const written = ["numerical", "integer", "subjective"].includes(q.kind);
   const toggle = (i: number) => {
-    const selected: Array<number> = Array.isArray(r.answer?.options)
-      ? r.answer.options
+    const selected: Array<number> = Array.isArray(draft?.options)
+      ? draft.options
       : [];
     const next = selected.includes(i)
       ? selected.filter((x) => x !== i)
@@ -4079,12 +4127,24 @@ function Exam({
     setDraft({ options: next });
   };
   const toggleMatch = (row: string, choice: string) => {
-    const matches: Record<string, string[]> = { ...(r.answer?.matches || {}) };
+    const matches: Record<string, string[]> = { ...(draft?.matches || {}) };
     const selected = matches[row] || [];
     matches[row] = selected.includes(choice)
       ? selected.filter((x) => x !== choice)
       : [...selected, choice].sort();
     setDraft({ matches });
+  };
+  const selectSingle = async (i: number) => {
+    if (saving) return;
+    const answer = { option: i };
+    setDraft(answer);
+    setSaving(true);
+    setSaveError("");
+    const ok = await update(q.id, answer, r.marked_for_review);
+    if (mounted.current) {
+      setSaving(false);
+      if (!ok) setSaveError("Could not save this option. Check your connection and try again.");
+    }
   };
   if (!started) return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">SECURE CBT</p><h1>Your secure attempt has started</h1><p>{blueprint.instructions}</p><ul><li>The server timer is already running and integrity monitoring is active.</li><li>Keep this exam visible and in fullscreen until you submit.</li><li>Changing tabs, switching apps, hiding the page, or leaving fullscreen immediately cancels and flags the attempt.</li><li>On iPhone and iPad, app and tab switching is monitored even when browser fullscreen is unavailable.</li></ul>{startError && <Notice kind="error">{startError}</Notice>}<button onClick={startExam}>Continue in secure fullscreen</button></div></main>;
   return (
@@ -4172,10 +4232,11 @@ function Exam({
                   <button
                     key={i}
                     className={selected ? "chosen" : ""}
+                    disabled={saving}
                     onClick={() =>
                       multiple
                         ? toggle(i)
-                        : update(q.id, { option: i }, r.marked_for_review)
+                        : void selectSingle(i)
                     }
                   >
                     <span className="option-letter">
@@ -4198,12 +4259,12 @@ function Exam({
           <button onClick={() => save(draftReview, true)} disabled={saving}>
             Save & next
           </button>
-          <button className="danger" onClick={() => setSubmitReview(true)}>
+          <button className="danger" onClick={() => setSubmitReview(true)} disabled={saving}>
             Submit test
           </button>
         </footer>
       </section>
-      {submitReview && <div className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response is not saved and will not be submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finishNormally}>Submit test</button></div></div></div>}
+      {submitReview && <div className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response will be saved before the test is submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finishNormally} disabled={saving}>Submit test</button></div></div></div>}
       {integrityIncident && <div className="exam-dialog integrity-dialog" role="alertdialog" aria-modal="true"><div><p className="eyebrow">INTEGRITY WARNING</p><h2>{integrityIncident.saved && integrityIncident.cancelled === false ? "Integrity incident flagged" : "Assessment cancelled"}</h2><p>The secure exam detected <b>{integrityIncident.eventType.replaceAll("_", " ")}</b>. {integrityIncident.saved && integrityIncident.cancelled === false ? "The server had already closed your attempt, so its completed status was preserved and the incident was flagged for your teacher." : "Your saved responses were submitted, this attempt was cancelled immediately, and your teacher can see the incident."}</p>{!integrityIncident.saved && !integrityIncident.error && <Notice>Recording the incident securely…</Notice>}{integrityIncident.error && <Notice kind="error">The exam remains locked. Reconnect before closing this page so the incident can be recorded: {integrityIncident.error}</Notice>}<div className="dialog-actions">{integrityIncident.error && <button onClick={() => { const {eventType,clientTime}=integrityIncident; setIntegrityIncident({ eventType, clientTime, saved:false }); void cancelForIntegrity(eventType,clientTime).then((result) => { try { window.localStorage.removeItem(`testnow:integrity:${attempt.id}`); } catch {} setIntegrityIncident({ eventType, clientTime, saved:true, cancelled:Boolean(result.cancelled_at) }); }).catch((error:Error) => setIntegrityIncident({ eventType, clientTime, saved:false, error:error.message })); }}>Retry secure report</button>}<button disabled={!integrityIncident.saved} onClick={async () => { if (document.fullscreenElement) await document.exitFullscreen().catch(() => {}); await returnHome(); }}>Return to dashboard</button></div></div></div>}
     </div>
   );
@@ -4226,6 +4287,7 @@ function Result({ attempt }: { attempt: any }) {
   return (
     <div className="page">
       <h1>Score: {data.attempt.score}</h1>
+      <Card><b>Total time taken</b><p>{fmtDuration(data.attempt.duration_seconds)}</p></Card>
       {data.questions.map(
         (q: Question & { response: any; correct: boolean; points: number }, index: number) => (
           <Card key={q.id}>

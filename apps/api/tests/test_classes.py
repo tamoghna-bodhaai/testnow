@@ -4,10 +4,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, create_import_test, create_student, delete_import, delete_test, get_attempt, integrity_violation, question_media, questions, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
+from app.main import assigned_student_ids, create_import_test, create_student, delete_import, delete_test, get_attempt, integrity_violation, question_media, questions, save_response, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
 from app.models import AccountStatus, Attempt, AttemptEvent, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.tasks import finalize_expired_attempts
-from app.schemas import ImportTestCreate, IntegrityViolationIn, LoginIn, RosterUpdate, StudentCreate
+from app.schemas import ImportTestCreate, IntegrityViolationIn, LoginIn, ResponseIn, RosterUpdate, StudentCreate, SubmitIn
 from fastapi import HTTPException
 
 def make_db():
@@ -40,6 +40,50 @@ def test_class_assignment_controls_visibility_and_analytics():
     assert assessments[0]["attempts_remaining"]==0
     assert assessments[0]["latest_attempt"]["id"]=="attempt"
     assert assessments[0]["latest_attempt"]["status"]=="submitted"
+
+def test_completed_attempt_exposes_the_same_duration_to_student_and_teacher():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT)
+    test=Assessment(id="test",owner_id=teacher.id,title="Physics",subject="Physics",status=AssessmentStatus.PUBLISHED,duration_seconds=7200,max_attempts=1,results_policy={"mode":"immediate"})
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc));test.published_version_id=version.id
+    started_at=datetime(2025,1,1,10,0,0,tzinfo=timezone.utc)
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=started_at,ends_at=datetime(2025,1,1,12,0,0,tzinfo=timezone.utc),submitted_at=datetime(2025,1,1,11,2,3,tzinfo=timezone.utc),score=0)
+    from app.models import Enrollment
+    db.add_all([teacher,student,test,version,attempt,Enrollment(test_id=test.id,student_id=student.id)]);db.commit()
+
+    student_attempt=get_attempt(attempt.id,student,db)
+    student_dashboard=student_tests(student,db)
+    teacher_dashboard=assessment_analytics(test.id,teacher,db)
+
+    assert student_attempt["duration_seconds"]==3723
+    assert student_dashboard[0]["latest_attempt"]["duration_seconds"]==3723
+    assert teacher_dashboard["students"][0]["duration_seconds"]==3723
+    assert teacher_dashboard["students"][0]["attempts"][0]["duration_seconds"]==3723
+
+def test_submit_rejects_a_stale_revision_and_preserves_the_saved_option():
+    db=make_db()
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=3600,max_attempts=1)
+    question={"id":"question","kind":"single_choice","options":[{"markdown":"A"},{"markdown":"B"}],"answer":{"option":1},"scoring":{"correct":4,"incorrect":-1,"unanswered":0}}
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[question]},published_at=datetime.now(timezone.utc));test.published_version_id=version.id
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime(2030,1,1,tzinfo=timezone.utc))
+    db.add_all([student,test,version,attempt]);db.commit()
+
+    saved=save_response(attempt.id,"question",ResponseIn(answer={"option":1},revision=0),student,db)
+    assert saved["revision"]==1
+
+    try:
+        submit(attempt.id,SubmitIn(revision=0),student,db)
+        assert False,"expected stale submission to be rejected"
+    except HTTPException as exc:
+        assert exc.status_code==409
+    assert db.get(Attempt,attempt.id).submitted_at is None
+    assert db.get(AnswerResponse,{"attempt_id":attempt.id,"question_id":"question"}).answer=={"option":1}
+
+    completed=submit(attempt.id,SubmitIn(revision=1),student,db)
+    assert completed["score"]==4
+    assert completed["responses"]["question"]["answer"]=={"option":1}
 
 def test_student_classes_returns_only_the_current_students_enrolments():
     db=make_db()
@@ -189,7 +233,7 @@ def test_expired_attempt_is_auto_submitted_with_saved_responses():
     # Explicit enrolment keeps this test assigned even without a classroom.
     from app.models import Enrollment
     db.add(Enrollment(test_id=test.id,student_id=student.id));db.commit()
-    completed=submit(attempt.id,student,db)
+    completed=submit(attempt.id,SubmitIn(revision=0),student,db)
     assert completed["submitted_at"] is not None
     assert completed["score"]==4
     assert db.get(Attempt,attempt.id).submitted_at is not None

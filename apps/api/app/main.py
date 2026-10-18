@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
 from .models import AccountStatus, Attempt, AttemptEvent, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, IntegrityViolationIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, IntegrityViolationIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, SubmitIn, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import attempt_event, audit, cancel_for_integrity, delivery_blueprint, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions, source_number_key, validate_blueprint
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
@@ -20,6 +20,9 @@ from .figures import is_visual_issue, option_media_issues
 app=FastAPI(title="TestNow API",version="1.0.0")
 def as_utc(value:datetime)->datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+def attempt_duration_seconds(attempt:Attempt)->int|None:
+    if not attempt.submitted_at:return None
+    return max(0,int((as_utc(attempt.submitted_at)-as_utc(attempt.started_at)).total_seconds()))
 from .figure_review import router as figure_review_router
 app.include_router(figure_review_router)
 app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
@@ -1044,9 +1047,7 @@ def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN
         total,review=score(version.content,responses_by_attempt.get(attempt.id,{}))
         maximum=sum(float((question.get("scoring") or {}).get("correct",4)) for question in version.content.get("questions",[]))
         attempt_incidents=incidents_by_attempt.get(attempt.id,[])
-        submitted_at=as_utc(attempt.submitted_at) if attempt.submitted_at else None
-        started_at=as_utc(attempt.started_at)
-        return {"id":attempt.id,"status":"cancelled" if attempt.cancelled_at else "submitted" if attempt.submitted_at else "in_progress","score":attempt.score if attempt.score is not None else total if attempt.submitted_at else None,"max_score":maximum,"percentage":round((float(attempt.score if attempt.score is not None else total)/maximum)*100,1) if attempt.submitted_at and maximum else None,"correct":sum(1 for item in review if item["response"] is not None and item["correct"]),"incorrect":sum(1 for item in review if item["response"] is not None and not item["correct"]),"unanswered":sum(1 for item in review if item["response"] is None),"started_at":attempt.started_at,"submitted_at":attempt.submitted_at,"duration_seconds":max(0,int((submitted_at-started_at).total_seconds())) if submitted_at else None,"integrity_flagged":attempt.integrity_flagged,"cancellation_reason":attempt.cancellation_reason,"incidents":[{"event_type":event.data.get("event_type",attempt.cancellation_reason),"detected_at":event.data.get("detected_at") or event.created_at,"client_time":event.data.get("client_time")} for event in attempt_incidents]}
+        return {"id":attempt.id,"status":"cancelled" if attempt.cancelled_at else "submitted" if attempt.submitted_at else "in_progress","score":attempt.score if attempt.score is not None else total if attempt.submitted_at else None,"max_score":maximum,"percentage":round((float(attempt.score if attempt.score is not None else total)/maximum)*100,1) if attempt.submitted_at and maximum else None,"correct":sum(1 for item in review if item["response"] is not None and item["correct"]),"incorrect":sum(1 for item in review if item["response"] is not None and not item["correct"]),"unanswered":sum(1 for item in review if item["response"] is None),"started_at":attempt.started_at,"submitted_at":attempt.submitted_at,"duration_seconds":attempt_duration_seconds(attempt),"integrity_flagged":attempt.integrity_flagged,"cancellation_reason":attempt.cancellation_reason,"incidents":[{"event_type":event.data.get("event_type",attempt.cancellation_reason),"detected_at":event.data.get("detected_at") or event.created_at,"client_time":event.data.get("client_time")} for event in attempt_incidents]}
 
     for student in students:
         attempts=attempts_by_student[student.id]
@@ -1054,7 +1055,7 @@ def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN
         details=[attempt_metrics(attempt) for attempt in attempts]
         status="not_started" if not latest else "cancelled" if latest.cancelled_at else "submitted" if latest.submitted_at else "in_progress"
         valid_scores=[float(a.score) for a in attempts if a.submitted_at and not a.cancelled_at and a.score is not None]
-        rows.append({"student":user_public(student),"classes":[{"id":class_id,"name":class_names[class_id]} for class_id,members in class_memberships.items() if student.id in members],"status":status,"score":latest.score if latest else None,"percentage":details[0]["percentage"] if details else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"attempt_count":len(attempts),"integrity_flagged":any(a.integrity_flagged for a in attempts),"best_score":max(valid_scores) if valid_scores else None,"average_score":round(sum(valid_scores)/len(valid_scores),2) if valid_scores else None,"attempts":details})
+        rows.append({"student":user_public(student),"classes":[{"id":class_id,"name":class_names[class_id]} for class_id,members in class_memberships.items() if student.id in members],"status":status,"score":latest.score if latest else None,"percentage":details[0]["percentage"] if details else None,"started_at":latest.started_at if latest else None,"submitted_at":latest.submitted_at if latest else None,"duration_seconds":details[0]["duration_seconds"] if details else None,"attempt_count":len(attempts),"integrity_flagged":any(a.integrity_flagged for a in attempts),"best_score":max(valid_scores) if valid_scores else None,"average_score":round(sum(valid_scores)/len(valid_scores),2) if valid_scores else None,"attempts":details})
     def aggregate(ids:set[str],class_id:str|None=None)->dict:
         selected=[]
         for student_id in ids:
@@ -1101,6 +1102,7 @@ def student_tests(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(ge
                 "status":"cancelled" if latest.cancelled_at else "submitted" if latest.submitted_at else "in_progress",
                 "started_at":latest.started_at,
                 "submitted_at":latest.submitted_at,
+                "duration_seconds":attempt_duration_seconds(latest),
                 "score":latest.score,
                 "integrity_flagged":latest.integrity_flagged,
                 "cancellation_reason":latest.cancellation_reason,
@@ -1164,12 +1166,13 @@ def visit_question(attempt_id:str,question_id:str,user:User=Depends(require(Role
     elif not response.visited_at: response.visited_at=datetime.now(timezone.utc)
     attempt_event(db,a.id,"question_visited",{"question_id":question_id});db.commit();return {"ok":True}
 @app.post("/attempts/{attempt_id}/submit")
-def submit(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
+def submit(attempt_id:str,data:SubmitIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
     if not a or a.student_id!=user.id:raise HTTPException(404,"Attempt not found")
     if a.submitted_at:return attempt_view(a,db)
     now=datetime.now(timezone.utc)
     if not finalize_if_expired(db,a,now):
+        if data.revision!=a.revision:raise HTTPException(409,"An answer is still being saved. Review the latest responses and submit again.")
         finalize_attempt(db,a,submitted_at=now,actor_id=user.id,action="attempt.submitted")
     db.commit();return attempt_view(a,db)
 
@@ -1194,4 +1197,4 @@ def attempt_view(a:Attempt,db:Session):
     v=db.get(TestVersion,a.version_id)
     resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review,"visited_at":r.visited_at} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)}
     questions=[{k:snapshot[k] for k in ("id","source_number","kind","stem_markdown","options","diagrams","scoring","interaction") if k in snapshot} for snapshot in v.content["questions"]]
-    return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"cancelled_at":a.cancelled_at,"cancellation_reason":a.cancellation_reason,"integrity_flagged":a.integrity_flagged,"delivery_blueprint":delivery_blueprint(v.content),"questions":questions,"responses":resp}
+    return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"duration_seconds":attempt_duration_seconds(a),"score":a.score,"revision":a.revision,"cancelled_at":a.cancelled_at,"cancellation_reason":a.cancellation_reason,"integrity_flagged":a.integrity_flagged,"delivery_blueprint":delivery_blueprint(v.content),"questions":questions,"responses":resp}
