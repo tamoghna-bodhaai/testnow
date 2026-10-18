@@ -7,7 +7,7 @@ from fastapi import HTTPException
 import pytest
 
 from app.db import Base
-from app.main import _generation_job, import_view, question_view
+from app.main import _generation_job, delete_bank_import_question, import_view, question_view
 from app.models import (
     AuditEvent,
     ImportJob,
@@ -170,6 +170,30 @@ def test_import_view_reports_generation_eligible_count():
     assert view["generation_eligible_count"] == 1
 
 
+def test_invalid_question_can_be_deleted_before_document_publication():
+    db, admin, bank, job = setup_db()
+    question = question_record(db)
+    question.scope = QuestionScope.GLOBAL
+    db.commit()
+
+    delete_bank_import_question(bank.id, job.id, question.id, admin, db)
+
+    assert db.get(Question, question.id) is None
+    assert db.get(ImportJob, job.id).extraction_meta["question_count"] == 0
+
+
+def test_question_cannot_be_deleted_after_document_publication():
+    db, admin, bank, job = setup_db()
+    question = question_record(db)
+    job.published_at = datetime.now(timezone.utc)
+    db.commit()
+
+    with pytest.raises(HTTPException) as caught:
+        delete_bank_import_question(bank.id, job.id, question.id, admin, db)
+
+    assert caught.value.status_code == 409
+
+
 def test_generation_fills_only_missing_fields_and_stages_review():
     db, admin, _, job = setup_db()
     question = question_record(db, answer={"option": 0})
@@ -189,6 +213,59 @@ def test_generation_fills_only_missing_fields_and_stages_review():
     assert result["generated_fields"] == ["solution"]
     assert question.approved_at is None
     assert "llm_generated_unreviewed" in question.interaction["ingestion_issues"]
+
+
+def test_direct_question_accepts_a_concise_one_line_solution():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    queue_generation(db, job, admin.id, question)
+
+    result = generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True,
+        "answer": {"option": 0},
+        "solution_markdown": "$2+2=4$.",
+        "confidence": 0.99,
+        "notes": "A direct calculation.",
+    })
+
+    assert result["status"] == "completed"
+    assert question.solution_markdown == "$2+2=4$."
+
+
+def test_placeholder_is_not_accepted_as_a_concise_solution():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    queue_generation(db, job, admin.id, question)
+
+    with pytest.raises(ValueError, match="valid solution"):
+        generate_question(db, question, job, provider=lambda _: {
+            "can_solve": True,
+            "answer": {"option": 0},
+            "solution_markdown": "N/A",
+            "confidence": 0.1,
+            "notes": "No solution.",
+        })
+
+
+def test_generation_approval_preserves_unrelated_review_findings():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    question.interaction = {"ingestion_issues": ["taxonomy_uncertain", "missing_solution"]}
+    state = queue_generation(db, job, admin.id, question)
+    generate_question(db, question, job, provider=lambda _: {
+        "can_solve": True,
+        "answer": {"option": 0},
+        "solution_markdown": "$2+2=4$.",
+        "confidence": 0.99,
+        "notes": "Solved.",
+    })
+    job.extraction_meta = {**job.extraction_meta, "solution_generation": {**job.extraction_meta["solution_generation"], "status": "completed"}}
+
+    approved = approve_generation(db, job, state["run_id"], admin.id)
+
+    assert approved == 0
+    assert question.approved_at is None
+    assert question.interaction["ingestion_issues"] == ["taxonomy_uncertain"]
 
 
 def test_generation_rejects_solution_that_conflicts_with_existing_answer():
@@ -213,10 +290,10 @@ def test_generation_rejects_solution_that_conflicts_with_existing_answer():
     assert question.answer == {"option": 0}
 
 
-def test_batch_approval_clears_all_warnings_for_successful_generated_questions():
+def test_batch_approval_approves_successful_generation_without_other_findings():
     db, admin, _, job = setup_db()
     question = question_record(db, answer={"option": 0})
-    question.interaction = {"ingestion_issues": ["taxonomy_uncertain", "missing_solution"]}
+    question.interaction = {"ingestion_issues": ["missing_solution"]}
     state = queue_generation(db, job, admin.id, question)
     generate_question(db, question, job, provider=lambda _: {
         "can_solve": True,
@@ -234,9 +311,8 @@ def test_batch_approval_clears_all_warnings_for_successful_generated_questions()
     assert approved == 1
     assert question.approved_at is not None
     assert question.interaction["ingestion_issues"] == []
-    assert "taxonomy_uncertain" in question.interaction["ignored_ingestion_issues"]
     event = db.query(AuditEvent).filter_by(action="question_solution_generation.approved").one()
-    assert event.data["warnings_overridden"] == [{"question_id": question.id, "warnings": ["taxonomy_uncertain", "llm_generated_unreviewed"]}]
+    assert event.data["question_results"] == [{"question_id": question.id, "resolved_generation_warnings": ["llm_generated_unreviewed"], "remaining_warnings": []}]
 
 
 def test_only_one_generation_run_can_be_active_per_source_document():

@@ -385,6 +385,27 @@ def get_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)
     if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")
     return {**import_view(job,db),"questions":[question_view(q,db) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.created_at.desc()).all()]}
 
+@app.delete("/admin/question-banks/{bank_id}/imports/{job_id}/questions/{question_id}",status_code=204)
+def delete_bank_import_question(bank_id:str,job_id:str,question_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
+    """Discard one invalid extracted question while preserving its document."""
+    job=db.query(ImportJob).filter_by(id=job_id).with_for_update().one_or_none()
+    question=db.get(Question,question_id)
+    if not job or job.bank_id!=bank_id or not question or question.import_job_id!=job.id:
+        raise HTTPException(404,"Question not found in this source document")
+    if job.published_at:
+        raise HTTPException(409,"A live question cannot be deleted. Create a bank revision first")
+    generation=(job.extraction_meta or {}).get("solution_generation") or {}
+    if job.status in {ImportStatus.UPLOADED,ImportStatus.PROCESSING} or generation.get("status") in {"queued","running"}:
+        raise HTTPException(409,"Wait for extraction and solution generation to stop before deleting a question")
+    db.query(QuestionTaxonomy).filter_by(question_id=question.id).delete(synchronize_session=False)
+    db.delete(question)
+    db.flush()
+    remaining=db.query(Question).filter_by(import_job_id=job.id).all()
+    flagged=sum(1 for row in remaining if (row.interaction or {}).get("ingestion_issues"))
+    job.extraction_meta={**(job.extraction_meta or {}),"question_count":len(remaining),"flagged_count":flagged}
+    audit(db,user.id,"question.deleted_as_invalid","question",question_id,{"bank_id":bank_id,"import_job_id":job_id,"source_number":question.source_number})
+    db.commit()
+
 def _generation_job(bank_id:str,job_id:str,db:Session)->ImportJob:
     job=db.get(ImportJob,job_id)
     if not job or job.bank_id!=bank_id:raise HTTPException(404,"Import not found")

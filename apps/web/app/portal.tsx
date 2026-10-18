@@ -90,6 +90,7 @@ type ImportJob = {
       skipped?: number;
       error?: string;
       approved?: number;
+      approved_at?: string;
       errors?: { question_id?: string; source_number?: string; message: string }[];
     };
   };
@@ -2859,7 +2860,7 @@ function BankImportStatus({
                       {failedJob ? "!" : "↗"}
                     </span>
                     <div>
-                      <b>{job.filename || "Untitled import"}</b>
+                      <button type="button" className="import-file-link" onClick={() => onInspect(job)}>{job.filename || "Untitled import"}</button>
                       <small>
                         {failedJob
                           ? "Extraction stopped"
@@ -2924,7 +2925,7 @@ function BankImportStatus({
                         {generation?.status === "failed" || generation?.status === "completed_with_errors" ? "Retry missing generation" : "Generate missing answers & solutions"}
                       </button>
                     )}
-                    {!job.published && generationComplete && Boolean(generation?.succeeded) && !generation?.approved && (
+                    {!job.published && generationComplete && Boolean(generation?.succeeded) && !generation?.approved_at && (
                       <button type="button" onClick={() => onApproveGenerated(job)}>Approve all generated</button>
                     )}
                     {!job.published && Boolean(job.approved_count) && (
@@ -3041,6 +3042,19 @@ function QuestionBankManager({
   };
   useEffect(() => {
     load().catch((e) => setError(e.message));
+  }, []);
+  useEffect(() => {
+    const match=window.location.hash.match(/^#bank=([^&]+)&document=(.+)$/);
+    if (!match || detail || selectedImport) return;
+    const bankId=decodeURIComponent(match[1]), documentId=decodeURIComponent(match[2]);
+    Promise.all([api(`/admin/question-banks/${bankId}`),api(`/admin/question-banks/${bankId}/imports/${documentId}`)])
+      .then(([bank,report])=>{setDetail(bank);setSelectedImport(report);setSelectedQuestions(report.questions||[]);})
+      .catch((e)=>setError(e.message));
+  }, [detail,selectedImport]);
+  useEffect(() => {
+    const navigate=()=>{if(!window.location.hash.includes("&document=")){setSelectedImport(null);setSelectedQuestions(null);setEditingQuestion(null);}};
+    window.addEventListener("popstate",navigate);
+    return()=>window.removeEventListener("popstate",navigate);
   }, []);
   useEffect(() => {
     const active = detail?.imports?.some(
@@ -3271,7 +3285,7 @@ function QuestionBankManager({
   };
   const approveGeneratedSolutions = async (job: ImportJob) => {
     if (!detail || !job.meta?.solution_generation?.run_id) return;
-    if (!window.confirm("Approve every successfully generated question in this run? This clears all remaining warnings on those questions, including unrelated extraction or visual warnings, and records the override in the audit trail.")) return;
+    if (!window.confirm("Approve every successfully generated question in this run? Questions with separate extraction, taxonomy, or visual issues will stay in review.")) return;
     setBusy(true); setError("");
     try {
       const runId = job.meta.solution_generation.run_id;
@@ -3326,6 +3340,7 @@ function QuestionBankManager({
       setSelectedImport(report);
       setSelectedQuestions(report.questions || []);
       setEditingQuestion(null);
+      window.history.pushState({},"",`#bank=${encodeURIComponent(detail.id)}&document=${encodeURIComponent(job.id)}`);
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -3342,6 +3357,17 @@ function QuestionBankManager({
       setSelectedImport(report);
       setSelectedQuestions(report.questions || []);
     }
+  };
+  const deleteQuestion = async (question: Question) => {
+    if (!detail || !selectedImport || !window.confirm(`Delete ${questionNumber(question.source_number)} as an invalid extracted question? This cannot be undone.`)) return;
+    setBusy(true); setError("");
+    try {
+      await api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}/questions/${question.id}`, { method: "DELETE" });
+      setEditingQuestion(null);
+      await finishQuestionReview();
+      notify(`${questionNumber(question.source_number)} deleted from ${selectedImport.filename || "the source document"}.`);
+    } catch (e: any) { setError(e.message); }
+    finally { setBusy(false); }
   };
   const visibleQuestions = selectedImport
     ? selectedQuestions
@@ -3539,6 +3565,21 @@ function QuestionBankManager({
                 onGenerate={generateImportSolutions}
                 onApproveGenerated={approveGeneratedSolutions}
               />
+              {selectedImport && (
+                <DocumentImportPage
+                  job={selectedImport}
+                  questions={selectedQuestions || []}
+                  activeQuestion={editingQuestion}
+                  busy={busy}
+                  close={() => { setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); window.history.pushState({},"",window.location.pathname); }}
+                  edit={setEditingQuestion}
+                  deleteQuestion={deleteQuestion}
+                  publish={() => publishImport(selectedImport)}
+                  generate={() => generateImportSolutions(selectedImport)}
+                  approveGenerated={() => approveGeneratedSolutions(selectedImport)}
+                  renderEditor={(question) => <BankQuestionEditor key={question.id} bankId={detail.id} question={question} done={finishQuestionReview} cancel={() => setEditingQuestion(null)} onFigureActive={setFigureEditing} />}
+                />
+              )}
               <Card>
                 <h2>
                   {selectedImport
@@ -3612,6 +3653,46 @@ function QuestionBankManager({
       </section>
     </div>
   );
+}
+
+function DocumentImportPage({job,questions,activeQuestion,busy,close,edit,deleteQuestion,publish,generate,approveGenerated,renderEditor}:{
+  job:ImportJob; questions:Question[]; activeQuestion:Question|null; busy:boolean; close:()=>void; edit:(question:Question|null)=>void;
+  deleteQuestion:(question:Question)=>void; publish:()=>void; generate:()=>void; approveGenerated:()=>void;
+  renderEditor:(question:Question)=>React.ReactNode;
+}) {
+  const [filter,setFilter]=useState<"all"|"attention"|"generated"|"published">("all");
+  const generation=job.meta?.solution_generation;
+  const generationActive=generation?.status==="queued"||generation?.status==="running";
+  const issueFor=(question:Question)=>question.interaction?.solution_generation?.error || (question.interaction?.ingestion_issues||[]).join(", ");
+  const attention=questions.filter(question=>issueFor(question)||!question.approved);
+  const generated=questions.filter(question=>question.interaction?.solution_generation?.status==="completed");
+  const shown=questions.filter(question=>filter==="all"||filter==="attention"&&attention.includes(question)||filter==="generated"&&generated.includes(question)||filter==="published"&&question.approved);
+  return <div className="document-detail-page" role="dialog" aria-modal="true" aria-label={`Document details for ${job.filename || "source"}`}>
+    <div className="document-detail-shell">
+      <header className="document-detail-header">
+        <button type="button" className="secondary-action" onClick={close}>← Back to documents</button>
+        <div><p className="eyebrow">SOURCE DOCUMENT</p><h1>{job.filename || "Untitled import"}</h1><p>{job.meta?.subject || "Unclassified"} · {job.meta?.phase || job.status}</p></div>
+        <div className="document-detail-actions">
+          {!job.published && Boolean(job.generation_eligible_count) && !generationActive && <button type="button" className="secondary-action" disabled={busy} onClick={generate}>Generate missing</button>}
+          {!job.published && generation && ["completed","completed_with_errors"].includes(generation.status) && Boolean(generation.succeeded) && !generation.approved_at && <button type="button" className="secondary-action" disabled={busy} onClick={approveGenerated}>Approve generated passes</button>}
+          {!job.published && Boolean(job.approved_count) && <button type="button" disabled={busy} onClick={publish}>Publish {job.approved_count} passed</button>}
+          {job.published && <span className="badge published">Live</span>}
+        </div>
+      </header>
+      <section className="document-metrics">
+        <span><b>{questions.length}</b><small>questions</small></span><span><b>{job.approved_count || 0}</b><small>passed review</small></span><span className={attention.length?"needs-action":""}><b>{attention.length}</b><small>need attention</small></span><span><b>{generation?.succeeded || 0}</b><small>solutions generated</small></span><span><b>{generation?.failed || 0}</b><small>generation errors</small></span>
+      </section>
+      {(job.errors?.length||generation?.errors?.length) ? <section className="document-issue-summary"><h2>Run issues</h2>{job.errors?.map((entry,index)=><p key={`extract-${index}`}>Extraction{entry.page?` · page ${entry.page}`:""}: {entry.message}</p>)}{generation?.errors?.map((entry,index)=><p key={`generation-${entry.question_id||index}`}>{entry.source_number?`Question ${entry.source_number}`:"Question"}: {entry.message}</p>)}</section>:null}
+      <nav className="document-filters" aria-label="Filter document questions">{([['all',`All ${questions.length}`],['attention',`Needs attention ${attention.length}`],['generated',`Generated ${generated.length}`],['published',`Passed ${job.approved_count||0}`]] as const).map(([value,label])=><button type="button" key={value} className={filter===value?"active":""} onClick={()=>setFilter(value)}>{label}</button>)}</nav>
+      <main className="document-detail-questions">
+        {shown.map(question=><div className={`document-detail-question ${issueFor(question)?"has-issue":""}`} key={question.id}>
+          <div className="document-question-summary"><div><b>{questionNumber(question.source_number)} · {question.kind.replaceAll('_',' ')}</b><p className="document-question-stem">{question.stem_markdown}</p><dl className="document-question-glance"><div><dt>Answer</dt><dd>{question.answer?JSON.stringify(question.answer):"Missing"}</dd></div><div><dt>Solution</dt><dd>{question.solution_markdown||"Missing"}</dd></div></dl><small>{question.approved?"Passed review":issueFor(question)||"Awaiting review"}</small></div><div><button type="button" className="secondary-action" onClick={()=>edit(activeQuestion?.id===question.id?null:question)}>{activeQuestion?.id===question.id?"Close editor":"Review"}</button>{!job.published&&<button type="button" className="text-danger" disabled={busy} onClick={()=>deleteQuestion(question)}>Delete invalid</button>}</div></div>
+          {activeQuestion?.id===question.id&&renderEditor(question)}
+        </div>)}
+        {!shown.length&&<p className="queue-empty">No questions match this view.</p>}
+      </main>
+    </div>
+  </div>;
 }
 
 function QuestionReviewRow({

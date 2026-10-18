@@ -124,7 +124,7 @@ SOLUTION_SCHEMA = {
 SOLUTION_SYSTEM = """You are a careful educational assessment solver. Solve exactly one supplied question.
 Return JSON matching the schema. Never invent missing question text or unreadable visual facts. If the question cannot be solved unambiguously, set can_solve=false, answer=null, solution_markdown=null, and explain why in notes.
 
-For a solvable question, derive the answer independently and write a pedagogical Markdown solution with at least two explicitly numbered steps. Preserve mathematical expressions as valid LaTeX. For single-choice and assertion-reason questions return {\"option\": zero_based_index}; for multiple-choice return {\"options\": [zero_based_indices]}; for numerical/integer return {\"value\": value}; for matrix match return {\"matches\": {row: [columns]}} and copy every row label into matrix_items and every selectable column label into matrix_choices. Return empty matrix arrays for other question types. Subjective questions must return answer=null and a model solution.
+For a solvable question, derive the answer independently and write a clear pedagogical Markdown solution. Use numbered steps when the reasoning genuinely has multiple stages; a concise one-line explanation is correct for a direct fact or calculation. Preserve mathematical expressions as valid LaTeX. For single-choice and assertion-reason questions return {\"option\": zero_based_index}; for multiple-choice return {\"options\": [zero_based_indices]}; for numerical/integer return {\"value\": value}; for matrix match return {\"matches\": {row: [columns]}} and copy every row label into matrix_items and every selectable column label into matrix_choices. Return empty matrix arrays for other question types. Subjective questions must return answer=null and a model solution.
 
 An existing answer or solution is authoritative context. Do not propose changing it. When an existing answer is supplied, your derived answer must agree with it."""
 
@@ -219,12 +219,16 @@ def _answers_equivalent(kind:QuestionKind,generated:dict|None,existing:dict|None
     return generated==existing
 
 
-def _step_by_step(value: object) -> bool:
+def _valid_solution(value: object) -> bool:
     text = str(value or "").strip()
-    markers = re.findall(r"(?m)^\s*\d+[.)]\s+", text)
     dollars=len(re.findall(r"(?<!\\)\$",text))
     balanced=(dollars%2==0 and text.count(r"\(")==text.count(r"\)") and text.count(r"\[")==text.count(r"\]") and _balanced_braces(text))
-    return len(text) >= 40 and len(markers) >= 2 and "$$$" not in text and balanced
+    # Direct questions often need only a short sentence or equation. Structure
+    # is a presentation choice, not evidence that the solution is valid.
+    placeholder=text.lower().strip(" .:;!?-") in {"n/a","na","none","unknown","answer","solution"}
+    words=re.findall(r"[A-Za-z]{2,}",text)
+    substantive_equation=bool(re.search(r"(?:\d|[A-Za-z])\s*(?:=|\\approx|\\times|\\div|[+\-*/])\s*(?:\d|[A-Za-z])",text))
+    return len(text) >= 8 and not placeholder and (len(words)>=3 or substantive_equation) and "$$$" not in text and balanced
 
 
 def _balanced_braces(text:str)->bool:
@@ -342,8 +346,8 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
     raw_answer=result.get("answer")
     generated_answer = normalize_answer(raw_answer, question.options or [])
     solution = str(result.get("solution_markdown") or "").strip()
-    if not _step_by_step(solution):
-        raise ValueError("The model did not return a valid multi-step solution")
+    if not _valid_solution(solution):
+        raise ValueError("The model did not return a valid solution")
     if question.kind == QuestionKind.SUBJECTIVE:
         generated_answer = None
     validation_interaction = interaction
@@ -490,18 +494,19 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
         if generation.get("run_id") != run_id or generation.get("status") != "completed" or missing_generation_fields(question):
             continue
         warnings = list(interaction.get("ingestion_issues") or [])
+        remaining_warnings = [warning for warning in warnings if warning not in {"llm_generated_unreviewed", "solution_generation_failed", "missing_answer", "missing_solution"}]
         question.interaction = {
             **interaction,
-            "ingestion_issues": [],
-            "ignored_ingestion_issues": warnings,
-            "warnings_ignored_by": actor_id,
-            "warnings_ignored_at": now.isoformat(),
-            "reviewed_by": actor_id,
+            "ingestion_issues": remaining_warnings,
             "solution_generation": {**generation, "approved_at": now.isoformat(), "approved_by": actor_id},
         }
-        question.approved_at = now
-        approved += 1
-        overrides.append({"question_id":question.id,"warnings":warnings})
+        # Confirming generated content must not silently waive a separate
+        # extraction, taxonomy, or visual defect.
+        if not remaining_warnings:
+            question.interaction = {**question.interaction, "reviewed_by": actor_id}
+            question.approved_at = now
+            approved += 1
+        overrides.append({"question_id":question.id,"resolved_generation_warnings":[warning for warning in warnings if warning not in remaining_warnings],"remaining_warnings":remaining_warnings})
     state = {**state, "approved": approved, "approved_at": now.isoformat(), "approved_by": actor_id}
     if current.get("run_id")==run_id:current=state
     elif history_index is not None:history[history_index]=state
@@ -511,6 +516,6 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
     if not remaining and not failed_pages:
         job.status = ImportStatus.APPROVED
     job.extraction_meta = {**job.extraction_meta, "flagged_count": sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"))}
-    audit(db, actor_id, "question_solution_generation.approved", "import", job.id, {"run_id": run_id, "questions": approved, "warnings_overridden": overrides})
+    audit(db, actor_id, "question_solution_generation.approved", "import", job.id, {"run_id": run_id, "questions": approved, "question_results": overrides})
     return approved
 
