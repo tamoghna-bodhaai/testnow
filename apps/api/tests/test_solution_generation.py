@@ -1,3 +1,6 @@
+import json
+from datetime import datetime, timezone
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
@@ -6,6 +9,7 @@ import pytest
 from app.db import Base
 from app.main import _generation_job, import_view, question_view
 from app.models import (
+    AuditEvent,
     ImportJob,
     ImportStatus,
     Question,
@@ -14,6 +18,8 @@ from app.models import (
     QuestionScope,
     Role,
     SourceDocument,
+    QuestionTaxonomy,
+    TaxonomyNode,
     User,
 )
 from app.solution_generation import approve_generation, generate_question, queue_generation, run_generation
@@ -162,6 +168,8 @@ def test_batch_approval_clears_all_warnings_for_successful_generated_questions()
     assert question.approved_at is not None
     assert question.interaction["ingestion_issues"] == []
     assert "taxonomy_uncertain" in question.interaction["ignored_ingestion_issues"]
+    event = db.query(AuditEvent).filter_by(action="question_solution_generation.approved").one()
+    assert event.data["warnings_overridden"] == [{"question_id": question.id, "warnings": ["taxonomy_uncertain", "llm_generated_unreviewed"]}]
 
 
 def test_only_one_generation_run_can_be_active_per_source_document():
@@ -226,4 +234,78 @@ def test_document_generation_checkpoints_success_and_continues_after_failure(mon
     rows = db.query(Question).filter_by(import_job_id=job_id).all()
     assert sum(bool(row.solution_markdown) for row in rows) == 1
     assert sum((row.interaction or {}).get("solution_generation", {}).get("status") == "failed" for row in rows) == 1
+
+
+def test_solver_receives_taxonomy_and_records_the_actual_fallback_model():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    subject = TaxonomyNode(id="subject", bank_id="bank", parent_id=None, kind="subject", name="Physics")
+    chapter = TaxonomyNode(id="chapter", bank_id="bank", parent_id="subject", kind="chapter", name="Mechanics")
+    db.add_all([subject, chapter]); db.flush()
+    db.add_all([QuestionTaxonomy(question_id=question.id, taxonomy_node_id=subject.id), QuestionTaxonomy(question_id=question.id, taxonomy_node_id=chapter.id)])
+    queue_generation(db, job, admin.id, question)
+    captured = {}
+
+    def provider(payload):
+        captured.update(payload)
+        return ({
+            "can_solve": True, "answer": {"option": 0},
+            "solution_markdown": "1. Add the given values.\n\n2. The result is $4$, corresponding to option A.",
+            "confidence": 0.95, "notes": "Solved.",
+        }, "fallback/model")
+
+    generate_question(db, question, job, provider=provider)
+
+    prompt = json.loads(captured["messages"][1]["content"][0]["text"])
+    assert {item["name"] for item in prompt["taxonomy"]} == {"Physics", "Mechanics"}
+    assert question.interaction["solution_generation"]["model"] == "fallback/model"
+
+
+def test_solver_rejects_out_of_range_multiple_choice_output():
+    db, admin, _, job = setup_db()
+    question = question_record(db, kind=QuestionKind.MULTIPLE)
+    queue_generation(db, job, admin.id, question)
+
+    with pytest.raises(ValueError, match="valid answer"):
+        generate_question(db, question, job, provider=lambda _: {
+            "can_solve": True, "answer": {"options": [0, 99]},
+            "solution_markdown": "1. Check every supplied choice.\n\n2. The selected choices are A and an invalid option.",
+            "confidence": 0.5, "notes": "Invalid.",
+        })
+    assert question.answer is None and question.solution_markdown is None
+
+
+def test_solver_includes_saved_question_images(monkeypatch):
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    question.diagrams = [{"object_key": "diagram.png", "role": "question"}]
+    queue_generation(db, job, admin.id, question)
+    monkeypatch.setattr("app.solution_generation.get", lambda _: b"image-bytes")
+    captured = {}
+
+    def provider(payload):
+        captured.update(payload)
+        return {
+            "can_solve": True, "answer": {"option": 0},
+            "solution_markdown": "1. Inspect the supplied diagram.\n\n2. It supports option A as the correct answer.",
+            "confidence": 0.9, "notes": "Used image.",
+        }
+
+    generate_question(db, question, job, provider=provider)
+    assert any(part["type"] == "image_url" for part in captured["messages"][1]["content"])
+
+
+def test_generation_aborts_if_source_becomes_published_before_write():
+    db, admin, _, job = setup_db()
+    question = question_record(db, answer={"option": 0})
+    queue_generation(db, job, admin.id, question)
+    job.published_at = datetime.now(timezone.utc); db.flush()
+
+    with pytest.raises(ValueError, match="became live"):
+        generate_question(db, question, job, provider=lambda _: {
+            "can_solve": True, "answer": {"option": 0},
+            "solution_markdown": "1. Add the two values.\n\n2. The result is four, corresponding to option A.",
+            "confidence": 0.99, "notes": "Solved.",
+        })
+    assert question.solution_markdown is None
 

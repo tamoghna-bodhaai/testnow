@@ -16,7 +16,7 @@ from .tasks import extract_import, extract_bank_import, generate_bank_solutions
 from .figure_repairs import revalidate_bank_figures
 from .seed import ensure_demo_data
 from .figures import is_visual_issue, option_media_issues
-from .solution_generation import approve_generation, missing_generation_fields, queue_generation
+from .solution_generation import ANSWER_KINDS as ANSWER_GENERATION_KINDS, approve_generation, missing_generation_fields, queue_generation
 
 app=FastAPI(title="TestNow API",version="1.0.0")
 def as_utc(value:datetime)->datetime:
@@ -459,7 +459,8 @@ def delete_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADM
 def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
     bank=db.get(QuestionBank,bank_id)
     if not bank:raise HTTPException(404,"Question bank not found")
-    jobs=db.query(ImportJob).filter_by(bank_id=bank.id,published_at=None).all();ready=[]
+    jobs=db.query(ImportJob).filter_by(bank_id=bank.id,published_at=None).with_for_update().all();ready=[]
+    if any(((job.extraction_meta or {}).get("solution_generation") or {}).get("status") in {"queued","running"} for job in jobs):raise HTTPException(409,"Wait for answer and solution generation to finish before publishing")
     for job in jobs:
         if db.query(Question).filter_by(import_job_id=job.id).filter(Question.approved_at.is_not(None)).first():ready.append(job)
     manual_ready=db.query(Question).filter_by(bank_id=bank.id,import_job_id=None).filter(Question.approved_at.is_not(None)).count()
@@ -471,9 +472,10 @@ def publish_question_bank(bank_id:str,user:User=Depends(require(Role.ADMIN)),db:
 
 @app.post("/admin/question-banks/{bank_id}/imports/{job_id}/publish")
 def publish_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
-    bank=db.get(QuestionBank,bank_id);job=db.get(ImportJob,job_id)
+    bank=db.get(QuestionBank,bank_id);job=db.query(ImportJob).filter_by(id=job_id).with_for_update().first()
     if not bank or not job or job.bank_id!=bank.id:raise HTTPException(404,"Import not found")
     if job.published_at:raise HTTPException(409,"This source document is already live")
+    if (((job.extraction_meta or {}).get("solution_generation") or {}).get("status") in {"queued","running"}):raise HTTPException(409,"Wait for answer and solution generation to finish before publishing")
     approved=db.query(Question).filter_by(import_job_id=job.id).filter(Question.approved_at.is_not(None)).count()
     if not approved:raise HTTPException(422,"This source document has no approved questions to publish")
     job.published_at=datetime.now(timezone.utc);bank.is_global=True;bank.status="published"
@@ -655,7 +657,7 @@ def import_view(job:ImportJob,db:Session|None=None):
     meta=job.extraction_meta or {}
     errors=[{**entry,"message":entry.get("message") or entry.get("error") or "Extraction failed"}
             for entry in list(meta.get("error_log") or meta.get("failed_pages") or [])[-10:]]
-    eligible=sum(1 for question in questions.all() if missing_generation_fields(question)) if questions is not None else 0
+    eligible=sum(1 for kind,answer,solution in questions.with_entities(Question.kind,Question.answer,Question.solution_markdown) if ((kind in ANSWER_GENERATION_KINDS and not answer) or not str(solution or "").strip())) if questions is not None else 0
     return {"id":job.id,"status":job.status.value,"error":job.error,"meta":meta,"errors":errors,"created_at":job.created_at,"filename":source.filename if source else None,"source_id":source.id if source else None,"question_count":total,"approved_count":approved,"published":bool(job.published_at),"published_at":job.published_at,"generation_eligible_count":eligible}
 def normalized_options(options):
     output=[]

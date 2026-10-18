@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import SessionLocal
-from .models import ImportJob, ImportStatus, Question, QuestionKind, SourceDocument
+from .models import ImportJob, ImportStatus, Question, QuestionKind, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
 from .services import audit
 from .storage import get
@@ -93,9 +93,20 @@ def _run(job: ImportJob) -> dict:
 
 def queue_generation(db: Session, job: ImportJob, actor_id: str, question: Question | None = None) -> dict:
     """Create one durable document or per-question run and return its status."""
+    # Serialize starts at the source-document seam. Without this lock, two
+    # concurrent admin requests can both observe an idle JSON state.
+    job = db.query(ImportJob).filter_by(id=job.id).with_for_update().one()
     current = _run(job)
     if current.get("status") in ACTIVE_RUN_STATUSES:
         raise ValueError("A solution-generation run is already active for this source document")
+    pending_success = any(
+        (row.interaction or {}).get("solution_generation", {}).get("run_id") == current.get("run_id")
+        and (row.interaction or {}).get("solution_generation", {}).get("status") == "completed"
+        and row.approved_at is None
+        for row in db.query(Question).filter_by(import_job_id=job.id)
+    )
+    if pending_success:
+        raise ValueError("Approve the successful generated questions before retrying this source document")
     rows = [question] if question is not None else db.query(Question).filter_by(import_job_id=job.id).order_by(Question.created_at, Question.id).all()
     rows = [row for row in rows if row is not None and missing_generation_fields(row)]
     if not rows:
@@ -130,26 +141,51 @@ def queue_generation(db: Session, job: ImportJob, actor_id: str, question: Quest
     return state
 
 
-def _answer_valid(kind: QuestionKind, answer: dict | None) -> bool:
+def _answer_valid(kind: QuestionKind, raw: object, answer: dict | None, options: list, interaction: dict) -> bool:
     if kind == QuestionKind.SUBJECTIVE:
-        return answer is None
-    if not isinstance(answer, dict):
+        return raw is None and answer is None
+    if not isinstance(raw, dict) or not isinstance(answer, dict):
         return False
     if kind in {QuestionKind.SINGLE, QuestionKind.ASSERTION}:
-        return isinstance(answer.get("option"), int) and not isinstance(answer.get("option"), bool)
+        value=raw.get("option")
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(options) and answer == {"option": value}
     if kind == QuestionKind.MULTIPLE:
-        return bool(answer.get("options")) and all(isinstance(value, int) and not isinstance(value, bool) for value in answer["options"])
+        values=raw.get("options")
+        return isinstance(values,list) and bool(values) and len(values)==len(set(values)) and all(isinstance(value,int) and not isinstance(value,bool) and 0<=value<len(options) for value in values) and answer=={"options":sorted(values)}
     if kind in {QuestionKind.NUMERICAL, QuestionKind.INTEGER}:
-        return answer.get("value") is not None
+        value=raw.get("value")
+        if value is None or isinstance(value,bool) or (isinstance(value,str) and not value.strip()):return False
+        if kind==QuestionKind.INTEGER:
+            try:
+                if float(value)!=int(float(value)):return False
+            except (TypeError,ValueError):return False
+        return answer=={"value":value}
     if kind == QuestionKind.MATRIX:
-        return isinstance(answer.get("matches"), dict) and bool(answer["matches"])
+        matches=raw.get("matches")
+        if not isinstance(matches,dict) or not matches:return False
+        if not all(str(row).strip() and isinstance(choices,list) and bool(choices) and all(str(choice).strip() for choice in choices) for row,choices in matches.items()):return False
+        allowed_rows={str(value) for value in interaction.get("matrix_items") or []}
+        allowed_choices={str(value) for value in interaction.get("matrix_choices") or []}
+        if allowed_rows and not set(map(str,matches)).issubset(allowed_rows):return False
+        if allowed_choices and any(not set(map(str,choices)).issubset(allowed_choices) for choices in matches.values()):return False
+        return answer==normalize_answer(raw,options)
     return False
 
 
 def _step_by_step(value: object) -> bool:
     text = str(value or "").strip()
     markers = re.findall(r"(?m)^\s*\d+[.)]\s+", text)
-    return len(text) >= 40 and len(markers) >= 2 and "$$$" not in text
+    dollars=len(re.findall(r"(?<!\\)\$",text))
+    balanced=(dollars%2==0 and text.count(r"\(")==text.count(r"\)") and text.count(r"\[")==text.count(r"\]") and _balanced_braces(text))
+    return len(text) >= 40 and len(markers) >= 2 and "$$$" not in text and balanced
+
+
+def _balanced_braces(text:str)->bool:
+    depth=0
+    for match in re.finditer(r"(?<!\\)[{}]",text):
+        depth += 1 if match.group()=="{" else -1
+        if depth<0:return False
+    return depth==0
 
 
 def _image_part(raw: bytes, media_type: str = "image/png") -> dict:
@@ -189,7 +225,7 @@ def _visual_context(db: Session, question: Question, job: ImportJob) -> list[dic
     return parts
 
 
-def _provider_request(payload: dict) -> dict:
+def _provider_request(payload: dict) -> tuple[dict,str]:
     if not settings().openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
     models = [settings().openrouter_model]
@@ -212,7 +248,7 @@ def _provider_request(payload: dict) -> dict:
                     timeout=settings().openrouter_timeout_seconds,
                 )
                 response.raise_for_status()
-                return json.loads(response.json()["choices"][0]["message"]["content"])
+                return json.loads(response.json()["choices"][0]["message"]["content"]),model
             except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
                 if attempt < 2:
@@ -230,10 +266,12 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
     requested = [field for field in requested if field in current_missing]
     if not requested:
         return {"status": "skipped", "generated_fields": []}
+    taxonomy=[{"kind":node.kind,"name":node.name} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==question.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
     content = [{"type": "text", "text": json.dumps({
         "kind": question.kind.value,
         "stem_markdown": question.stem_markdown,
         "options": question.options or [],
+        "taxonomy": taxonomy,
         "existing_answer": question.answer,
         "existing_solution_markdown": question.solution_markdown,
         "fields_to_generate": requested,
@@ -247,19 +285,25 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
         "max_tokens": min(settings().openrouter_max_output_tokens, 8192),
         "stream": False,
     }
-    result = (provider or _provider_request)(payload)
+    provider_result = (provider or _provider_request)(payload)
+    if isinstance(provider_result,tuple):result,provider_model=provider_result
+    else:result,provider_model=provider_result,settings().openrouter_model
     if not isinstance(result, dict) or result.get("can_solve") is not True:
         raise ValueError(str((result or {}).get("notes") if isinstance(result, dict) else "The model did not return a valid result")[:300])
-    generated_answer = normalize_answer(result.get("answer"), question.options or [])
+    raw_answer=result.get("answer")
+    generated_answer = normalize_answer(raw_answer, question.options or [])
     solution = str(result.get("solution_markdown") or "").strip()
     if not _step_by_step(solution):
         raise ValueError("The model did not return a valid multi-step solution")
     if question.kind == QuestionKind.SUBJECTIVE:
         generated_answer = None
-    elif not _answer_valid(question.kind, generated_answer):
+    elif not _answer_valid(question.kind,raw_answer,generated_answer,question.options or [],interaction):
         raise ValueError("The model did not return a valid answer for this question type")
     if question.kind != QuestionKind.SUBJECTIVE and question.answer is not None and generated_answer != question.answer:
         raise ValueError("The generated solution conflicts with the existing answer key")
+    locked_job=db.query(ImportJob).filter_by(id=job.id).with_for_update().one()
+    if locked_job.published_at:
+        raise ValueError("This source document became live during generation; create a bank revision before changing it")
     # Both missing fields are committed only after every validation succeeds.
     if "answer" in requested:
         question.answer = generated_answer
@@ -272,7 +316,7 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
         **generation,
         "status": "completed",
         "generated_fields": requested,
-        "model": settings().openrouter_model,
+        "model": provider_model,
         "confidence": float(result.get("confidence") or 0),
         "notes": str(result.get("notes") or "")[:1000],
         "completed_at": _now(),
@@ -314,7 +358,7 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
                     skipped += 1
                 else:
                     succeeded += 1
-                    audit(db, actor_id, "question_solution_generation.completed", "question", row.id, {"run_id": run_id, "generated_fields": result.get("generated_fields", [])})
+                    audit(db, actor_id, "question_solution_generation.completed", "question", row.id, {"run_id": run_id, "generated_fields": result.get("generated_fields", []),"model":result.get("model")})
             except Exception as exc:
                 db.rollback()
                 row = db.get(Question, row.id)
@@ -363,6 +407,7 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
         raise ValueError("This solution-generation run is not ready for approval")
     now = datetime.now(timezone.utc)
     approved = 0
+    overrides=[]
     for question in db.query(Question).filter_by(import_job_id=job.id).all():
         interaction = dict(question.interaction or {})
         generation = dict(interaction.get("solution_generation") or {})
@@ -380,6 +425,7 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
         }
         question.approved_at = now
         approved += 1
+        overrides.append({"question_id":question.id,"warnings":warnings})
     state = {**state, "approved": approved, "approved_at": now.isoformat(), "approved_by": actor_id}
     job.extraction_meta = {**(job.extraction_meta or {}), "solution_generation": state}
     remaining = db.query(Question).filter_by(import_job_id=job.id, approved_at=None).first()
@@ -387,6 +433,6 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
     if not remaining and not failed_pages:
         job.status = ImportStatus.APPROVED
     job.extraction_meta = {**job.extraction_meta, "flagged_count": sum(1 for row in db.query(Question).filter_by(import_job_id=job.id) if (row.interaction or {}).get("ingestion_issues"))}
-    audit(db, actor_id, "question_solution_generation.approved", "import", job.id, {"run_id": run_id, "questions": approved, "warnings_overridden": True})
+    audit(db, actor_id, "question_solution_generation.approved", "import", job.id, {"run_id": run_id, "questions": approved, "warnings_overridden": overrides})
     return approved
 
