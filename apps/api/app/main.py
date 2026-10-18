@@ -8,9 +8,9 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
 from .models import AccountStatus, Attempt, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
-from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
+from .schemas import AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
-from .services import audit, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions
+from .services import attempt_event, audit, delivery_blueprint, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions, source_number_key, validate_blueprint
 from .storage import client as storage_client, delete_prefix, digest, get, put, signed_get
 from .tasks import extract_import, extract_bank_import
 from .figure_repairs import revalidate_bank_figures
@@ -510,15 +510,26 @@ async def create_import(question_paper:UploadFile=File(...),answer_key:UploadFil
     paper=await store_upload(question_paper,user,db); key=await store_upload(answer_key,user,db)
     job=ImportJob(id=uid(),owner_id=user.id,question_document_id=paper.id,answer_document_id=key.id if key else None,status=ImportStatus.UPLOADED,extraction_meta={"phase":"Queued for extraction"});db.add(job);audit(db,user.id,"import.created","import",job.id);db.commit();extract_import.delay(job.id);return import_view(job,db)
 @app.get("/teacher/imports")
-def list_imports(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+def list_imports(limit:int=Query(default=25,ge=1,le=500),user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     query=db.query(ImportJob)
     if user.role!=Role.ADMIN: query=query.filter_by(owner_id=user.id)
-    return [import_view(job,db) for job in query.order_by(ImportJob.created_at.desc()).limit(25)]
+    return [import_view(job,db) for job in query.order_by(ImportJob.created_at.desc()).limit(limit)]
+@app.get("/teacher/import-sources")
+def list_import_sources(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    query=db.query(ImportJob)
+    if user.role!=Role.ADMIN:query=query.filter_by(owner_id=user.id)
+    views=[]
+    for job in query.order_by(ImportJob.created_at.desc()):
+        view=import_view(job,db)
+        if view["approved_count"]:views.append(view)
+    return views
 @app.get("/teacher/imports/{job_id}")
 def get_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     job=db.get(ImportJob,job_id)
     if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
-    return {**import_view(job,db),"questions":[question_view(q) for q in db.query(Question).filter_by(import_job_id=job.id).order_by(Question.source_number)]}
+    questions=db.query(Question).filter_by(import_job_id=job.id).all()
+    questions.sort(key=lambda question:source_number_key(question.source_number))
+    return {**import_view(job,db),"questions":[question_view(q) for q in questions]}
 @app.delete("/teacher/imports/{job_id}",status_code=204)
 def delete_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     """Remove a completed import and its reviewable question records.
@@ -653,7 +664,7 @@ def question_view(q:Question, db:Session|None=None, taxonomy:list[dict]|None=Non
         job=db.get(ImportJob,q.import_job_id)
         source=db.get(SourceDocument,job.question_document_id) if job else None
         if source:interaction["source_filename"]=source.filename
-    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":interaction,"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"scope":q.scope.value,"taxonomy":taxonomy}
+    return {"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":options,"answer":answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"source_spans":q.source_spans,"interaction":interaction,"confidence":confidence,"approved":bool(q.approved_at),"bank_id":q.bank_id,"import_job_id":q.import_job_id,"scope":q.scope.value,"taxonomy":taxonomy}
 
 def question_views(rows:list[Question],db:Session)->list[dict]:
     """Serialize a page of questions without one taxonomy query per question."""
@@ -672,10 +683,20 @@ def question_views(rows:list[Question],db:Session)->list[dict]:
 def questions(
     page:int|None=Query(default=None,ge=1),
     page_size:int=Query(default=20,ge=1,le=100),
+    approved:bool|None=Query(default=None),
+    import_job_id:str|None=Query(default=None),
     user:User=Depends(require(Role.TEACHER,Role.ADMIN)),
     db:Session=Depends(get_db),
 ):
-    rows=db.query(Question).filter((Question.owner_id==user.id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
+    owner_id=user.id
+    if import_job_id:
+        job=db.get(ImportJob,import_job_id)
+        if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
+        owner_id=job.owner_id
+    rows=db.query(Question).filter((Question.owner_id==owner_id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
+    if approved is True:rows=rows.filter(Question.approved_at.is_not(None))
+    elif approved is False:rows=rows.filter(Question.approved_at.is_(None))
+    if import_job_id:rows=rows.filter(Question.import_job_id==import_job_id)
     if page is not None:
         total=rows.count()
         approved_total=rows.filter(Question.approved_at.is_not(None)).count()
@@ -800,7 +821,8 @@ def question_media(question_id:str,index:int,user:User=Depends(current_user),db:
     # Do not redirect the browser to an internal object-store hostname. In local and
     # private deployments that hostname is unreachable from the browser, producing a
     # broken image despite successful diagram extraction.
-    return StreamingResponse(iter([get(key)]),media_type="image/png",headers={"Cache-Control":"private, max-age=300"})
+    diagram=next((item for item in q.diagrams if item.get("object_key")==key),{})
+    return StreamingResponse(iter([get(key)]),media_type=diagram.get("media_type","image/png"),headers={"Cache-Control":"private, max-age=300"})
 @app.post("/questions",status_code=201)
 def create_question(data:QuestionIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     q=Question(id=uid(),owner_id=user.id,approved_at=datetime.now(timezone.utc),**data.model_dump());db.add(q);audit(db,user.id,"question.created","question",q.id);db.commit();return question_view(q)
@@ -883,15 +905,50 @@ async def import_class_students(class_id:str,file:UploadFile=File(...),user:User
         if not db.get(ClassMembership,{"class_id":classroom.id,"student_id":student.id}):db.add(ClassMembership(class_id=classroom.id,student_id=student.id));result["linked"]+=1
     audit(db,user.id,"class.students_imported","class",classroom.id,result);db.commit();return result
 
-@app.post("/tests",status_code=201)
-def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+def create_test_record(data:TestCreate|ImportTestCreate,question_ids:list[str],user:User,db:Session,*,publish_now:bool=False,question_owner_id:str|None=None,allow_reviewed_subjective:bool=False)->Test:
     if data.closes_at and data.opens_at and data.closes_at<=data.opens_at:raise HTTPException(422,"Closing time must be after opening time")
     duration_seconds=data.duration_minutes*60
     test=Test(id=uid(),owner_id=user.id,title=data.title,subject=data.subject,duration_seconds=duration_seconds,opens_at=data.opens_at,closes_at=data.closes_at,max_attempts=data.max_attempts,results_policy=data.results_policy);db.add(test);db.flush()
-    selected=snapshot_questions(db,data.question_ids,user.id)
+    selected=snapshot_questions(db,question_ids,question_owner_id or user.id)
+    if data.delivery_blueprint:
+        validate_blueprint(data.delivery_blueprint,question_ids)
+        if not allow_reviewed_subjective and any(question["kind"]=="subjective" for question in selected):raise HTTPException(422,"Subjective questions need manual evaluation and cannot be published in a CBT blueprint")
     for question in selected:
         question["scoring"]={**(question.get("scoring") or {}),"correct":data.marks_per_question}
-    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":selected,"duration_seconds":duration_seconds,"results_policy":data.results_policy});db.add(draft);audit(db,user.id,"test.created","test",test.id,{"marks_per_question":data.marks_per_question});db.commit();return test_view(test,db)
+    draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":selected,"duration_seconds":duration_seconds,"results_policy":data.results_policy,"delivery_blueprint":data.delivery_blueprint})
+    db.add(draft)
+    if publish_now:
+        published=TestVersion(id=uid(),test_id=test.id,ordinal=2,content=draft.content,published_at=datetime.now(timezone.utc))
+        db.add(published);test.status=TestStatus.PUBLISHED;test.published_version_id=published.id
+        audit(db,user.id,"test.published","test",test.id,{"version":published.ordinal,"source":"approved_import"})
+    audit(db,user.id,"test.created","test",test.id,{"marks_per_question":data.marks_per_question});db.commit()
+    return test
+
+@app.post("/tests",status_code=201)
+def create_test(data:TestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    test=create_test_record(data,data.question_ids,user,db)
+    return test_view(test,db)
+
+@app.post("/teacher/imports/{job_id}/tests",status_code=201)
+def create_import_test(job_id:str,data:ImportTestCreate,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    job=db.get(ImportJob,job_id)
+    if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
+    if job.status!=ImportStatus.APPROVED:raise HTTPException(409,"Approve every question in this paper before creating its test")
+    if db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first():raise HTTPException(409,"Approve every question in this paper before creating its test")
+    source_questions=(db.query(Question).filter_by(import_job_id=job.id)
+                      .filter(Question.approved_at.is_not(None)).all())
+    source_questions.sort(key=lambda question:source_number_key(question.source_number))
+    if not source_questions:raise HTTPException(422,"This paper has no approved questions")
+    question_ids=[question.id for question in source_questions]
+    supplied=data.delivery_blueprint or {}
+    supplied_sections=supplied.get("sections") if isinstance(supplied.get("sections"),list) else []
+    supplied_section=supplied_sections[0] if supplied_sections and isinstance(supplied_sections[0],dict) else {}
+    blueprint={"preset":str(supplied.get("preset") or "source-paper"),"instructions":str(supplied.get("instructions") or "Read every question carefully. Use Save & Next to record an answer."),"languages":supplied.get("languages") or ["en"],"accommodations":supplied.get("accommodations") or {},"sections":[{"id":str(supplied_section.get("id") or "section-1"),"title":str(supplied_section.get("title") or "Section 1"),"question_ids":question_ids,"navigation":"free","optional_groups":[]}]}
+    payload=data.model_copy(update={"delivery_blueprint":blueprint})
+    # Every imported answer was explicitly reviewed before the job could reach
+    # APPROVED, so the source-paper path can preserve written questions too.
+    test=create_test_record(payload,question_ids,user,db,publish_now=True,question_owner_id=job.owner_id,allow_reviewed_subjective=True)
+    return test_view(test,db)
 @app.get("/tests")
 def list_tests(user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):return [test_view(t,db) for t in db.query(Test).filter_by(owner_id=user.id).order_by(Test.created_at.desc())]
 @app.get("/tests/{test_id}")
@@ -1016,29 +1073,42 @@ def start_attempt(test_id:str,user:User=Depends(require(Role.STUDENT)),db:Sessio
     prior=db.query(Attempt).filter_by(test_id=test_id,student_id=user.id).count()
     if prior>=test.max_attempts:raise HTTPException(409,"Attempt limit reached")
     now=datetime.now(timezone.utc); ends=min(now+timedelta(seconds=test.duration_seconds),test.closes_at) if test.closes_at else now+timedelta(seconds=test.duration_seconds)
-    a=Attempt(id=uid(),test_id=test.id,version_id=test.published_version_id,student_id=user.id,started_at=now,ends_at=ends);db.add(a);audit(db,user.id,"attempt.started","attempt",a.id);db.commit();return attempt_view(a,db)
+    a=Attempt(id=uid(),test_id=test.id,version_id=test.published_version_id,student_id=user.id,started_at=now,ends_at=ends);db.add(a);audit(db,user.id,"attempt.started","attempt",a.id);attempt_event(db,a.id,"started",{"ends_at":ends.isoformat()});db.commit();return attempt_view(a,db)
 @app.get("/attempts/{attempt_id}")
 def get_attempt(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
-    if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
+    # Assignment is only an entry gate. Removing a candidate from a class must
+    # never strand an already-issued timed attempt.
+    if not a or a.student_id!=user.id:raise HTTPException(404,"Attempt not found")
     if finalize_if_expired(db,a):db.commit()
     return attempt_view(a,db)
 @app.put("/attempts/{attempt_id}/responses/{question_id}")
 def save_response(attempt_id:str,question_id:str,data:ResponseIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.get(Attempt,attempt_id)
-    if not a or a.student_id!=user.id or a.submitted_at or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(409,"Attempt cannot be changed")
+    if not a or a.student_id!=user.id or a.submitted_at:raise HTTPException(409,"Attempt cannot be changed")
     if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired")
     content=db.get(TestVersion,a.version_id).content
     if question_id not in {q["id"] for q in content["questions"]}:raise HTTPException(422,"Question is not part of this attempt")
     if data.revision!=a.revision:raise HTTPException(409,"Attempt changed in another session")
     response=db.get(AnswerResponse,{"attempt_id":a.id,"question_id":question_id})
-    if not response:response=AnswerResponse(attempt_id=a.id,question_id=question_id,answer=data.answer,marked_for_review=data.marked_for_review);db.add(response)
-    else:response.answer=data.answer;response.marked_for_review=data.marked_for_review
-    a.revision+=1;db.commit();return {"revision":a.revision,"server_time":datetime.now(timezone.utc)}
+    if not response:response=AnswerResponse(attempt_id=a.id,question_id=question_id,answer=data.answer,marked_for_review=data.marked_for_review,visited_at=datetime.now(timezone.utc));db.add(response)
+    else:response.answer=data.answer;response.marked_for_review=data.marked_for_review;response.visited_at=response.visited_at or datetime.now(timezone.utc)
+    a.revision+=1;attempt_event(db,a.id,"response_saved",{"question_id":question_id,"marked_for_review":data.marked_for_review});db.commit();return {"revision":a.revision,"server_time":datetime.now(timezone.utc)}
+@app.post("/attempts/{attempt_id}/questions/{question_id}/visit")
+def visit_question(attempt_id:str,question_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
+    a=db.get(Attempt,attempt_id)
+    if not a or a.student_id!=user.id or a.submitted_at:raise HTTPException(404,"Attempt not found")
+    if datetime.now(timezone.utc)>=as_utc(a.ends_at):raise HTTPException(409,"Attempt has expired")
+    content=db.get(TestVersion,a.version_id).content
+    if question_id not in {q["id"] for q in content["questions"]}:raise HTTPException(422,"Question is not part of this attempt")
+    response=db.get(AnswerResponse,{"attempt_id":a.id,"question_id":question_id})
+    if not response: db.add(AnswerResponse(attempt_id=a.id,question_id=question_id,answer=None,marked_for_review=False,visited_at=datetime.now(timezone.utc)))
+    elif not response.visited_at: response.visited_at=datetime.now(timezone.utc)
+    attempt_event(db,a.id,"question_visited",{"question_id":question_id});db.commit();return {"ok":True}
 @app.post("/attempts/{attempt_id}/submit")
 def submit(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
-    if not a or a.student_id!=user.id or not student_can_access(db.get(Test,a.test_id),user.id,db):raise HTTPException(404,"Attempt not found")
+    if not a or a.student_id!=user.id:raise HTTPException(404,"Attempt not found")
     if a.submitted_at:return attempt_view(a,db)
     now=datetime.now(timezone.utc)
     if not finalize_if_expired(db,a,now):
@@ -1052,4 +1122,7 @@ def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=De
     if policy.get("mode")!="immediate" and (not release or datetime.now(timezone.utc)<datetime.fromisoformat(release.replace("Z","+00:00"))):raise HTTPException(403,"Results have not been released")
     responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};_,items=score(db.get(TestVersion,a.version_id).content,responses);return {"attempt":attempt_view(a,db),"questions":items}
 def attempt_view(a:Attempt,db:Session):
-    v=db.get(TestVersion,a.version_id);resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"questions":[{k:x[k] for k in ("id","source_number","kind","stem_markdown","options","diagrams","scoring","interaction") if k in x} for x in v.content["questions"]],"responses":resp}
+    v=db.get(TestVersion,a.version_id)
+    resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review,"visited_at":r.visited_at} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)}
+    questions=[{k:snapshot[k] for k in ("id","source_number","kind","stem_markdown","options","diagrams","scoring","interaction") if k in snapshot} for snapshot in v.content["questions"]]
+    return {"id":a.id,"test_id":a.test_id,"started_at":a.started_at,"ends_at":a.ends_at,"submitted_at":a.submitted_at,"score":a.score,"revision":a.revision,"delivery_blueprint":delivery_blueprint(v.content),"questions":questions,"responses":resp}

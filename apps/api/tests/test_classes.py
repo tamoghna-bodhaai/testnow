@@ -4,10 +4,10 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app import main
-from app.main import assigned_student_ids, create_student, delete_import, delete_test, question_media, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
+from app.main import assigned_student_ids, create_import_test, create_student, delete_import, delete_test, get_attempt, question_media, questions, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
 from app.models import AccountStatus, Attempt, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.tasks import finalize_expired_attempts
-from app.schemas import LoginIn, RosterUpdate, StudentCreate
+from app.schemas import ImportTestCreate, LoginIn, RosterUpdate, StudentCreate
 from fastapi import HTTPException
 
 def make_db():
@@ -82,6 +82,68 @@ def test_teacher_can_delete_a_finished_import(monkeypatch):
     assert db.get(ImportJob,"job") is None
     assert db.get(Question,"question") is None
 
+def test_teacher_question_library_filters_approved_questions_by_source_pdf():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    first_source=SourceDocument(id="source-1",owner_id=teacher.id,filename="worksheet-1.pdf",object_key="documents/teacher/worksheet-1.pdf",sha256="a" * 64,media_type="application/pdf",size_bytes=10)
+    second_source=SourceDocument(id="source-2",owner_id=teacher.id,filename="worksheet-2.pdf",object_key="documents/teacher/worksheet-2.pdf",sha256="b" * 64,media_type="application/pdf",size_bytes=10)
+    first_job=ImportJob(id="job-1",owner_id=teacher.id,question_document_id=first_source.id,status=ImportStatus.REVIEW)
+    second_job=ImportJob(id="job-2",owner_id=teacher.id,question_document_id=second_source.id,status=ImportStatus.REVIEW)
+    approved_at=datetime.now(timezone.utc)
+    db.add_all([
+        teacher,first_source,second_source,first_job,second_job,
+        Question(id="approved-first",owner_id=teacher.id,import_job_id=first_job.id,kind=QuestionKind.SINGLE,stem_markdown="First approved",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
+        Question(id="pending-first",owner_id=teacher.id,import_job_id=first_job.id,kind=QuestionKind.SINGLE,stem_markdown="First pending",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0}),
+        Question(id="approved-second",owner_id=teacher.id,import_job_id=second_job.id,kind=QuestionKind.SINGLE,stem_markdown="Second approved",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
+    ]);db.commit()
+
+    result=questions(page=1,page_size=20,approved=True,import_job_id=first_job.id,user=teacher,db=db)
+
+    assert result["total"]==1
+    assert [item["id"] for item in result["items"]]==["approved-first"]
+    assert result["items"][0]["import_job_id"]==first_job.id
+
+def test_teacher_can_create_and_publish_a_test_from_one_approved_pdf():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    source=SourceDocument(id="source",owner_id=teacher.id,filename="worksheet-1.pdf",object_key="documents/teacher/worksheet-1.pdf",sha256="a" * 64,media_type="application/pdf",size_bytes=10)
+    job=ImportJob(id="job",owner_id=teacher.id,question_document_id=source.id,status=ImportStatus.APPROVED)
+    approved_at=datetime.now(timezone.utc)
+    questions_from_source=[
+        Question(id="q1",owner_id=teacher.id,import_job_id=job.id,source_number="1",kind=QuestionKind.SINGLE,stem_markdown="One",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
+        Question(id="q10",owner_id=teacher.id,import_job_id=job.id,source_number="10",kind=QuestionKind.SINGLE,stem_markdown="Ten",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
+        Question(id="q2",owner_id=teacher.id,import_job_id=job.id,source_number="2",kind=QuestionKind.SINGLE,stem_markdown="Two",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":1},approved_at=approved_at),
+        Question(id="q3",owner_id=teacher.id,import_job_id=job.id,source_number="3",kind=QuestionKind.SUBJECTIVE,stem_markdown="Explain",options=[],answer={"value":"Because"},approved_at=approved_at),
+    ]
+    db.add_all([teacher,source,job,*questions_from_source]);db.commit()
+    data=ImportTestCreate(title="Worksheet 1",subject="Physics",duration_minutes=30,max_attempts=1,marks_per_question=4,delivery_blueprint={"preset":"custom","instructions":"Use the supplied worksheet.","sections":[{"id":"worksheet","title":"Worksheet 1"}]})
+
+    result=create_import_test(job.id,data,teacher,db)
+
+    saved=db.get(Assessment,result["id"])
+    assert result["status"]=="published"
+    assert result["question_count"]==4
+    assert saved.published_version_id is not None
+    version=db.get(AssessmentVersion,saved.published_version_id)
+    assert [item["id"] for item in version.content["questions"]]==["q1","q2","q3","q10"]
+    assert version.content["delivery_blueprint"]["instructions"]=="Use the supplied worksheet."
+    assert version.content["delivery_blueprint"]["sections"][0]["title"]=="Worksheet 1"
+
+def test_admin_can_publish_a_teacher_owned_approved_pdf():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    admin=User(id="admin",name="Admin",email="admin@example.com",password_hash="x",role=Role.ADMIN)
+    source=SourceDocument(id="source",owner_id=teacher.id,filename="worksheet.pdf",object_key="documents/teacher/worksheet.pdf",sha256="a" * 64,media_type="application/pdf",size_bytes=10)
+    job=ImportJob(id="job",owner_id=teacher.id,question_document_id=source.id,status=ImportStatus.APPROVED)
+    question=Question(id="q1",owner_id=teacher.id,import_job_id=job.id,source_number="1",kind=QuestionKind.SINGLE,stem_markdown="One",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=datetime.now(timezone.utc))
+    db.add_all([teacher,admin,source,job,question]);db.commit()
+
+    page=questions(page=1,page_size=20,approved=True,import_job_id=job.id,user=admin,db=db)
+    result=create_import_test(job.id,ImportTestCreate(title="Worksheet",subject="Physics",duration_minutes=30),admin,db)
+
+    assert [item["id"] for item in page["items"]]==[question.id]
+    assert result["status"]=="published"
+
 def test_question_media_streams_bytes_without_object_store_redirect(monkeypatch):
     db=make_db()
     teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
@@ -141,3 +203,12 @@ def test_expiry_worker_finalizes_attempt_without_a_browser(monkeypatch):
 
     assert finalize_expired_attempts.run()=={"finalized":1}
     assert db.get(Attempt,attempt.id).submitted_at is not None
+
+def test_existing_attempt_is_not_stranded_after_assignment_changes():
+    db=make_db()
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=1)
+    version=AssessmentVersion(id="version",test_id="test",ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc))
+    attempt=Attempt(id="attempt",test_id="test",version_id="version",student_id="student",started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc))
+    db.add_all([student,test,version,attempt]);db.commit()
+    assert get_attempt(attempt.id,student,db)["id"]==attempt.id

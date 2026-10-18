@@ -1,10 +1,16 @@
 from datetime import datetime, timezone
+import re
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from .models import Attempt, Question, QuestionScope, Response, Test, TestVersion, TestStatus
+from .models import Attempt, AttemptEvent, Question, QuestionScope, Response, Test, TestVersion, TestStatus
 from .security import uid
 
 CHOICE_KINDS={"single_choice","multiple_choice","assertion_reason"}
+
+def source_number_key(value:object)->tuple:
+    """Natural ordering for printed identifiers: 1, 2, ... 10, 11."""
+    return tuple((0,int(part)) if part.isdigit() else (1,part.lower())
+                 for part in re.split(r"(\d+)",str(value or "")))
 
 def safe_question_kind(kind:object, options:object)->str:
     """Avoid delivering legacy optionless records as unanswerable MCQs."""
@@ -14,6 +20,42 @@ def safe_question_kind(kind:object, options:object)->str:
 def audit(db:Session, actor:str|None, action:str, entity_type:str, entity_id:str, data:dict|None=None):
     from .models import AuditEvent
     db.add(AuditEvent(id=uid(),actor_id=actor,action=action,entity_type=entity_type,entity_id=entity_id,data=data or {}))
+def attempt_event(db:Session, attempt_id:str, event_type:str, data:dict|None=None):
+    db.add(AttemptEvent(id=uid(),attempt_id=attempt_id,event_type=event_type,data=data or {}))
+
+def delivery_blueprint(content:dict)->dict:
+    """Return a safe blueprint for both new sectioned and historic flat papers."""
+    questions=content.get("questions") or []
+    supplied=content.get("delivery_blueprint") or {}
+    sections=supplied.get("sections") if isinstance(supplied,dict) else None
+    ids={q.get("id") for q in questions}
+    if not isinstance(sections,list) or not sections:
+        sections=[{"id":"general","title":"General","question_ids":[q.get("id") for q in questions],"navigation":"free","optional_groups":[]}]
+    normalized=[]; seen=set()
+    for index,section in enumerate(sections):
+        if not isinstance(section,dict): continue
+        question_ids=[qid for qid in section.get("question_ids",[]) if qid in ids and qid not in seen]
+        seen.update(question_ids)
+        normalized.append({"id":str(section.get("id") or f"section-{index+1}"),"title":str(section.get("title") or f"Section {index+1}"),"question_ids":question_ids,"navigation":"free","optional_groups":section.get("optional_groups") if isinstance(section.get("optional_groups"),list) else []})
+    remaining=[q.get("id") for q in questions if q.get("id") not in seen]
+    if remaining:
+        normalized.append({"id":"general" if not normalized else "remaining","title":"General" if not normalized else "Other questions","question_ids":remaining,"navigation":"free","optional_groups":[]})
+    return {"preset":str(supplied.get("preset") or "legacy"),"instructions":str(supplied.get("instructions") or "Read every question carefully. Use Save & Next to record an answer."),"sections":normalized,"languages":supplied.get("languages") or ["en"],"accommodations":supplied.get("accommodations") or {}}
+
+def validate_blueprint(blueprint:dict, question_ids:list[str]):
+    if not blueprint:return
+    sections=blueprint.get("sections")
+    if not isinstance(sections,list) or not sections:raise HTTPException(422,"A CBT blueprint requires at least one section")
+    expected=set(question_ids); seen=[]
+    for section in sections:
+        if not isinstance(section,dict) or not str(section.get("title") or "").strip():raise HTTPException(422,"Every CBT section needs a title")
+        ids=section.get("question_ids")
+        if not isinstance(ids,list) or not ids:raise HTTPException(422,"Every CBT section needs questions")
+        seen.extend(ids)
+        for group in section.get("optional_groups",[]) or []:
+            if not isinstance(group,dict) or not isinstance(group.get("question_ids"),list) or not isinstance(group.get("choose"),int):raise HTTPException(422,"Invalid optional-question group")
+            if group["choose"]<1 or group["choose"]>len(group["question_ids"]):raise HTTPException(422,"Invalid optional-question choice count")
+    if len(seen)!=len(set(seen)) or set(seen)!=expected:raise HTTPException(422,"Blueprint sections must contain every selected question exactly once")
 def snapshot_questions(db:Session, ids:list[str], owner_id:str)->list[dict]:
     found=db.query(Question).filter(Question.id.in_(ids),Question.approved_at.is_not(None)).filter((Question.owner_id==owner_id)|(Question.scope==QuestionScope.GLOBAL)).all()
     by_id={q.id:q for q in found}
@@ -67,6 +109,7 @@ def finalize_attempt(db:Session, attempt:Attempt, *, submitted_at:datetime, acto
     attempt.score,_=score(version.content,responses)
     attempt.submitted_at=submitted_at
     audit(db,actor_id,action,"attempt",attempt.id)
+    attempt_event(db,attempt.id,"submitted" if action=="attempt.submitted" else "auto_submitted",{"at":submitted_at.isoformat()})
     return True
 
 def finalize_if_expired(db:Session, attempt:Attempt, now:datetime|None=None)->bool:

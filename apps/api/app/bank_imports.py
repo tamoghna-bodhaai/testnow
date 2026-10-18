@@ -17,7 +17,7 @@ from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKin
 from .security import uid
 from .storage import get, put
 from .figures import save_figures, visual_context, mark_scope_conflicts, ground_question_spans, docx_visual_inventory, docx_conversion_issues, requires_source_figure, visual_intent
-from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction
+from .tasks import SCHEMA, SYSTEM, answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, native_image_regions, native_vector_regions, page_unit_content, prepare_item_for_ingestion, request_extraction, solution_from_key
 
 
 def _pdf_bytes(source: SourceDocument, conversion_info:dict|None=None) -> bytes:
@@ -174,6 +174,8 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
         item["_ingestion_issues"] += visual_issues
         if not item.get("answer"):
             item["answer"]=answer_from_key(number,item.get("options") or [],answer_text)
+        if not item.get("solution_markdown"):
+            item["solution_markdown"]=solution_from_key(number,answer_text)
         answer=_answer_from_solution(item);issues=_issues(item,answer,diagrams);flagged+=bool(issues)
         chapter=_node(db,bank.id,subject_node.id,"chapter",str(item.get("chapter") or "Unmapped chapter"));topic_name=str(item.get("topic") or "").strip();topic=_node(db,bank.id,chapter.id,"topic",topic_name) if topic_name else None
         interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"visual_intent":item.get("visual_intent","none"),"answer_inferred_from_solution":bool(answer and not item.get("answer"))}
@@ -221,7 +223,9 @@ def run_bank_import(job_id: str) -> None:
         page_texts=best_page_text(raw,reader,rendered)
         if job.answer_document_id:
             answer_source=db.get(SourceDocument,job.answer_document_id);answer_raw=_pdf_bytes(answer_source)
-            answer_text="\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(answer_raw)).pages)
+            answer_reader=PdfReader(BytesIO(answer_raw));answer_rendered=fitz.open(stream=answer_raw,filetype="pdf")
+            try:answer_text="\n".join(best_page_text(answer_raw,answer_reader,answer_rendered))
+            finally:answer_rendered.close()
         else:answer_text=""
         answer_lookup_text=answer_text or embedded_answer_key_text(page_texts)
         if not settings().openrouter_api_key:raise RuntimeError("OPENROUTER_API_KEY is not configured")

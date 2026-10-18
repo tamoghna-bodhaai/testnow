@@ -32,6 +32,7 @@ type AdminDashboard = {
 };
 type Question = {
   id: string;
+  import_job_id?: string;
   source_number?: string;
   kind: string;
   stem_markdown: string;
@@ -283,6 +284,8 @@ export function Portal() {
     [admin, setAdmin] = useState<AdminDashboard | null>(null),
     [selectedJobId, setSelectedJobId] = useState<string | null>(null),
     [selectedTestId, setSelectedTestId] = useState<string | null>(null),
+    [builderImportId, setBuilderImportId] = useState<string | null>(null),
+    [openAssignmentAfterCreate, setOpenAssignmentAfterCreate] = useState(false),
     [attempt, setAttempt] = useState<any>(null),
     [index, setIndex] = useState(0),
     [message, setMessage] = useState("");
@@ -313,7 +316,7 @@ export function Portal() {
     } else if (me.role === "teacher") {
       const [loadedTests, loadedQuestions, loadedClasses] = await Promise.all([
         api("/tests"),
-        api("/questions?page=1&page_size=20"),
+        api("/questions?page=1&page_size=20&approved=true"),
         api("/classes"),
       ]);
       if (version !== sessionVersion.current) return;
@@ -414,8 +417,9 @@ export function Portal() {
     setUser(null);
     setView("home");
   };
-  const openTest = (id: string) => {
+  const openTest = (id: string, assignment = false) => {
     setSelectedTestId(id);
+    setOpenAssignmentAfterCreate(assignment);
     setView("test-detail");
   };
   return (
@@ -436,7 +440,7 @@ export function Portal() {
                 <button className={view === "reviews" ? "active" : ""} onClick={() => setView("reviews")}>
                   Review papers
                 </button>
-                <button className={view === "builder" ? "active" : ""} onClick={() => setView("builder")}>Build test</button>
+                <button className={view === "builder" ? "active" : ""} onClick={() => { setBuilderImportId(null); setView("builder"); }}>Build test</button>
               </>
             )}
             {user.role === "admin" && (
@@ -538,6 +542,10 @@ export function Portal() {
           job={jobs.find((job) => job.id === selectedJobId) || null}
           jobs={jobs}
           selectJob={setSelectedJobId}
+          createTestFromImport={(id) => {
+            setBuilderImportId(id);
+            setView("builder");
+          }}
           onDeleted={(id) => {
             const remaining = jobs.filter((item) => item.id !== id);
             setJobs(remaining);
@@ -559,9 +567,14 @@ export function Portal() {
         <Builder
           initialQuestions={questions}
           initialQuestionCount={questionCount}
-          onDone={async (id) => {
-            openTest(id);
-            setMessage("Draft created. Add classes and publish it when ready.");
+          imports={jobs}
+          initialImportId={builderImportId}
+          onDone={async (id, publishedFromImport) => {
+            setBuilderImportId(null);
+            openTest(id, publishedFromImport);
+            setMessage(publishedFromImport
+              ? "Test created and published. Assign it to a class now."
+              : "Draft created. Add classes and publish it when ready.");
             // Creating the draft already succeeded before this callback runs.
             // Refresh the dashboard in the background so a stale or malformed
             // question in the library cannot turn that successful operation
@@ -573,6 +586,7 @@ export function Portal() {
       {view === "test-detail" && selectedTestId && (
         <TestDetail
           testId={selectedTestId}
+          initialTab={openAssignmentAfterCreate ? "assignment" : "preview"}
           allClasses={classes}
           back={() => setView("home")}
           refresh={() => load(user)}
@@ -615,8 +629,10 @@ export function Portal() {
                   [qid]: { answer, marked_for_review: marked },
                 },
               });
+              return true;
             } catch (e: any) {
               setMessage(e.message);
+              return false;
             }
           }}
         />
@@ -1157,12 +1173,14 @@ function ClassesScreen({
 
 function TestDetail({
   testId,
+  initialTab,
   allClasses,
   back,
   refresh,
   notify,
 }: {
   testId: string;
+  initialTab?: "preview" | "assignment" | "analytics";
   allClasses: Classroom[];
   back: () => void;
   refresh: () => Promise<void>;
@@ -1170,7 +1188,7 @@ function TestDetail({
 }) {
   const [test, setTest] = useState<Test | null>(null),
     [analytics, setAnalytics] = useState<Analytics | null>(null),
-    [tab, setTab] = useState<"preview" | "assignment" | "analytics">("preview"),
+    [tab, setTab] = useState<"preview" | "assignment" | "analytics">(initialTab || "preview"),
     [error, setError] = useState(""),
     [publishing, setPublishing] = useState(false),
     [savingAssignments, setSavingAssignments] = useState(false),
@@ -1431,6 +1449,7 @@ function ImportScreen({
   jobs,
   selectJob,
   openReview,
+  createTestFromImport,
   onDeleted,
   refresh,
   reviewOnly = false,
@@ -1440,6 +1459,7 @@ function ImportScreen({
   jobs: ImportJob[];
   selectJob: (id: string | null) => void;
   openReview?: (id: string) => void;
+  createTestFromImport?: (id: string) => void;
   onDeleted: (id: string) => void;
   refresh: () => void;
   reviewOnly?: boolean;
@@ -1586,7 +1606,7 @@ function ImportScreen({
           </aside>
           <div className="review-main">
             {job && (
-              <ImportReview job={job} active={!!active} refresh={refresh} />
+              <ImportReview job={job} active={!!active} refresh={refresh} createTest={() => createTestFromImport?.(job.id)} />
             )}
           </div>
           {job && (
@@ -1600,6 +1620,9 @@ function ImportScreen({
               <div><b>Extraction</b><small>{job.meta?.phase || "Checking import status"}</small></div>
               {job.meta?.failed_pages?.length ? <Notice kind="error">{job.meta.failed_pages.length} page(s) need attention.</Notice> : null}
               <a href={`/api/teacher/imports/${job.id}/source`} target="_blank" rel="noreferrer">Open source PDF</a>
+              {job.status === "approved" && createTestFromImport && (
+                <button type="button" onClick={() => createTestFromImport(job.id)}>Create test from this paper</button>
+              )}
               <button
                 type="button"
                 className="text-danger"
@@ -1619,10 +1642,12 @@ function ImportReview({
   job,
   active,
   refresh,
+  createTest,
 }: {
   job: ImportJob;
   active: boolean;
   refresh: () => void;
+  createTest: () => void;
 }) {
   const [busy, setBusy] = useState(false),
     [questionIndex, setQuestionIndex] = useState(0);
@@ -1677,6 +1702,9 @@ function ImportReview({
             >
               {busy ? "Restarting…" : "Re-extract paper"}
             </button>
+          )}
+          {job.status === "approved" && (
+            <button onClick={createTest}>Create test from this paper</button>
           )}
           <button onClick={refresh}>Refresh</button>
         </div>
@@ -1873,11 +1901,15 @@ function ReviewQuestion({
 function Builder({
   initialQuestions,
   initialQuestionCount,
+  imports,
+  initialImportId,
   onDone,
 }: {
   initialQuestions: Question[];
   initialQuestionCount: number;
-  onDone: (id: string) => void;
+  imports: ImportJob[];
+  initialImportId: string | null;
+  onDone: (id: string, publishedFromImport: boolean) => void;
 }) {
   const [selected, setSelected] = useState<string[]>([]),
     [error, setError] = useState(""),
@@ -1885,6 +1917,9 @@ function Builder({
     [bankId, setBankId] = useState(""),
     [nodes, setNodes] = useState<any[]>([]),
     [source, setSource] = useState<"bank" | "mine">("bank"),
+    [paperId, setPaperId] = useState(initialImportId || ""),
+    [includeWholePaper, setIncludeWholePaper] = useState(!!initialImportId),
+    [sourceJobs, setSourceJobs] = useState<ImportJob[]>(imports),
     [subjectId, setSubjectId] = useState(""),
     [chapterId, setChapterId] = useState(""),
     [subtopicId, setSubtopicId] = useState(""),
@@ -1903,6 +1938,20 @@ function Builder({
     [loading, setLoading] = useState(false),
     [countsLoading, setCountsLoading] = useState(false);
   const activeBank = banks.find((bank) => bank.id === bankId);
+  const sourceImports = sourceJobs.filter((item) => (item.approved_count || 0) > 0),
+    activePaper = sourceImports.find((item) => item.id === paperId),
+    directPaperMode = source === "mine" && activePaper?.status === "approved" && includeWholePaper;
+  useEffect(() => {
+    api("/teacher/import-sources").then(setSourceJobs).catch((e) => setError(e.message));
+  }, []);
+  useEffect(() => {
+    if (!initialImportId) return;
+    setSource("mine");
+    setPaperId(initialImportId);
+    setIncludeWholePaper(true);
+    setPage(1);
+    setSelected([]);
+  }, [initialImportId]);
   useEffect(() => {
     api("/question-banks")
       .then((rows: any[]) => {
@@ -1957,12 +2006,14 @@ function Builder({
   }, [source, bankId, subjectId, chapterId, subtopicId, kinds, page]);
   useEffect(() => {
     if (source !== "mine") return;
+    const params = new URLSearchParams({ page: String(page), page_size: "20", approved: "true" });
+    if (paperId) params.set("import_job_id", paperId);
     setLoading(true);
-    api(`/questions?page=${page}&page_size=20`)
+    api(`/questions?${params}`)
       .then(setMine)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [source, page]);
+  }, [source, paperId, page]);
   const subjects = nodes.filter((node) => node.kind === "subject"),
     chapters = nodes.filter(
       (node) => node.kind === "chapter" && node.parent_id === subjectId,
@@ -1989,20 +2040,35 @@ function Builder({
         const f = Object.fromEntries(new FormData(e.currentTarget));
         const toIso = (value: FormDataEntryValue | undefined) =>
           value ? new Date(String(value)).toISOString() : null;
-        const result = await api("/tests", {
+        const questionIds = directPaperMode ? [] : selected;
+        const payload: any = {
+          ...f,
+          opens_at: toIso(f.opens_at),
+          closes_at: toIso(f.closes_at),
+          duration_minutes: Number(f.duration_minutes),
+          max_attempts: Number(f.max_attempts),
+          marks_per_question: Number(f.marks_per_question),
+          results_policy: { mode: "immediate" },
+        };
+        if (!directPaperMode) payload.question_ids = questionIds;
+        payload.delivery_blueprint = {
+          preset: String(f.blueprint_preset || "jee-practice"),
+          instructions: String(f.candidate_instructions || "Read every question carefully. Use Save & Next to record an answer.").trim(),
+          languages: ["en"],
+          accommodations: {},
+          sections: [{
+            id: "section-1",
+            title: String(f.section_title || "Section 1").trim(),
+            question_ids: questionIds,
+            navigation: "free",
+            optional_groups: [],
+          }],
+        };
+        const result = await api(directPaperMode ? `/teacher/imports/${paperId}/tests` : "/tests", {
           method: "POST",
-          body: JSON.stringify({
-            ...f,
-            opens_at: toIso(f.opens_at),
-            closes_at: toIso(f.closes_at),
-            duration_minutes: Number(f.duration_minutes),
-            max_attempts: Number(f.max_attempts),
-            marks_per_question: Number(f.marks_per_question),
-            question_ids: selected,
-            results_policy: { mode: "immediate" },
-          }),
+          body: JSON.stringify(payload),
         });
-        onDone(result.id);
+        onDone(result.id, directPaperMode);
       } catch (e: any) {
         setError(e.message);
       }
@@ -2048,6 +2114,24 @@ function Builder({
               <input name="marks_per_question" type="number" min="1" defaultValue="4" required />
             </div>
             <div>
+              <label>CBT preset</label>
+              <select name="blueprint_preset" defaultValue="jee-practice">
+                <option value="jee-practice">JEE-style practice CBT</option>
+                <option value="custom">Custom practice CBT</option>
+              </select>
+            </div>
+            <div>
+              <label>First section title</label>
+              <input name="section_title" defaultValue="Section 1" required />
+            </div>
+            <div className="builder-wide-field">
+              <label>Candidate instructions</label>
+              <textarea name="candidate_instructions" rows={3} defaultValue="Read every question carefully. Use Save & Next to record an answer. Mark for Review & Next saves your response and flags it for review." />
+              <small>{directPaperMode
+                ? "Every approved question type from this source PDF is included in the published test."
+                : "New CBT papers use an explicit delivery blueprint. Subjective questions require manual evaluation and cannot be published in this mode."}</small>
+            </div>
+            <div>
               <label>
                 Opens at <span className="optional">(optional)</span>
               </label>
@@ -2065,7 +2149,9 @@ function Builder({
           <h2>
             {source === "bank"
               ? `${activeBank?.name || "Global"} global question bank`
-              : "Your approved questions"}
+              : activePaper
+                ? `Approved questions from ${activePaper.meta?.paper_title || activePaper.filename || "selected paper"}`
+                : "Your approved questions"}
           </h2>
           <div className="stacked-form compact-form">
             <label>
@@ -2075,6 +2161,7 @@ function Builder({
                 onChange={(e) => {
                   setSource(e.target.value as "bank" | "mine");
                   setPage(1);
+                  setSelected([]);
                 }}
               >
                 <option value="bank" disabled={!bankId}>
@@ -2177,6 +2264,33 @@ function Builder({
                 </details>
               </>
             )}
+            {source === "mine" && (
+              <label>
+                Source PDF
+                <select
+                  value={paperId}
+                  onChange={(e) => {
+                    setPaperId(e.target.value);
+                    setIncludeWholePaper(false);
+                    setPage(1);
+                    setSelected([]);
+                  }}
+                >
+                  <option value="">All approved papers (manual selection)</option>
+                  {sourceImports.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.meta?.paper_title || item.filename || "Imported paper"} ({item.approved_count})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {source === "mine" && activePaper?.status === "approved" && (
+              <label className="assignment-choice builder-paper-mode">
+                <input type="checkbox" checked={includeWholePaper} onChange={(e) => { setIncludeWholePaper(e.target.checked); setSelected([]); }} />
+                <span><b>Use entire PDF</b><small>Create and publish with every approved question—no manual selection.</small></span>
+              </label>
+            )}
           </div>
           <div className="builder-question-list">
             {loading ? (
@@ -2187,7 +2301,8 @@ function Builder({
                   <input
                     aria-label={`Include ${questionNumber(q.source_number)}`}
                     type="checkbox"
-                    checked={selected.includes(q.id)}
+                    checked={directPaperMode || selected.includes(q.id)}
+                    disabled={directPaperMode}
                     onChange={() =>
                       setSelected((x) =>
                         x.includes(q.id)
@@ -2203,7 +2318,9 @@ function Builder({
               <p>
                 {source === "bank"
                   ? "No published questions match these filters yet."
-                  : "Approve questions from an imported paper before building a test."}
+                  : paperId
+                    ? "This paper has no approved questions."
+                    : "Approve questions from an imported paper before building a test."}
               </p>
             )}
           </div>
@@ -2232,14 +2349,19 @@ function Builder({
         <Card className="builder-selection">
           <div className="builder-selection-heading">
             <span>Selection tray</span>
-            <b>{selected.length.toString().padStart(2, "0")}</b>
+            <b>{(directPaperMode ? activePaper.approved_count || mine.total : selected.length).toString().padStart(2, "0")}</b>
           </div>
           <div className="builder-selection-summary">
-            <span><small>Questions</small><b>{selected.length}</b></span>
-            <span><small>Source</small><b>{source === "bank" ? "Bank" : "Mine"}</b></span>
+            <span><small>Questions</small><b>{directPaperMode ? activePaper.approved_count : selected.length}</b></span>
+            <span><small>Source</small><b>{source === "bank" ? "Bank" : directPaperMode ? "One PDF" : "Mine"}</b></span>
           </div>
           <div className="builder-selection-list">
-            {selected.length ? <>
+            {directPaperMode ? (
+              <div className="paper-selection-summary">
+                <b>{activePaper.meta?.paper_title || activePaper.filename || "Imported paper"}</b>
+                <small>Every approved question from this PDF will be included. The test is published immediately, then you can assign a class.</small>
+              </div>
+            ) : selected.length ? <>
               <div className="selection-preview">
                 {selected.slice(0, 4).map((id, index) => {
                   const question = selectedQuestions.find((item) => item.id === id);
@@ -2256,8 +2378,10 @@ function Builder({
               </details>
             </> : <p>Add questions from the library to build your test.</p>}
           </div>
-          <button className="builder-selection-submit" disabled={!selected.length}>
-            Create draft{selected.length ? ` (${selected.length})` : ""}
+          <button className="builder-selection-submit" disabled={directPaperMode ? !(activePaper.approved_count || mine.total) : !selected.length}>
+            {directPaperMode
+              ? `Create & publish (${activePaper.approved_count || mine.total})`
+              : `Create draft${selected.length ? ` (${selected.length})` : ""}`}
           </button>
         </Card>
       </form>
@@ -3603,10 +3727,12 @@ function QuestionCard({
   q,
   mode = "teacher",
   studentAnswer,
+  displayNumber,
 }: {
   q: Question;
   mode?: "teacher" | "student-result" | "exam";
   studentAnswer?: any;
+  displayNumber?: number;
 }) {
   const [showSolution, setShowSolution] = useState(false),
     correct = answerOptionIndex(q),
@@ -3647,9 +3773,9 @@ function QuestionCard({
   return (
     <article className="question">
       <b>
-        {questionNumber(q.source_number)} · {q.kind.replaceAll("_", " ")}
+        {questionNumber(displayNumber === undefined ? q.source_number : String(displayNumber))} · {q.kind.replaceAll("_", " ")}
       </b>
-      <Markdown value={q.stem_markdown} />
+      <Markdown value={mode === "teacher" ? q.stem_markdown : q.stem_markdown.replace(/^\s*(?:q(?:uestion)?\s*)?\d+\s*[.)]\s*/i, "")} />
       {questionDiagrams.map(renderDiagram)}
       {mode !== "exam" &&
         q.options?.map((o: any, i: number) => {
@@ -3715,10 +3841,19 @@ function Exam({
   attempt: any;
   index: number;
   setIndex: (n: number) => void;
-  update: (q: string, a: any, m: boolean) => void;
+  update: (q: string, a: any, m: boolean) => Promise<boolean>;
   finish: () => Promise<boolean>;
 }) {
-  const q = attempt.questions[index],
+  const blueprint = attempt.delivery_blueprint || { instructions: "Read every question carefully. Use Save & Next to record an answer.", sections: [{ id: "general", title: "General", question_ids: attempt.questions.map((question: any) => question.id) }] },
+    [started, setStarted] = useState(false),
+    [sectionId, setSectionId] = useState(blueprint.sections[0]?.id || "general"),
+    [paletteOpen, setPaletteOpen] = useState(false),
+    [submitReview, setSubmitReview] = useState(false),
+    [draft, setDraft] = useState<any>(null),
+    [draftReview, setDraftReview] = useState(false),
+    [saving, setSaving] = useState(false),
+    [saveError, setSaveError] = useState(""),
+    q = attempt.questions[index],
     r = attempt.responses[q.id] || {},
     [now, setNow] = useState(Date.now()),
     [expiryRetry, setExpiryRetry] = useState(0),
@@ -3733,6 +3868,13 @@ function Exam({
     return () => clearInterval(x);
   }, []);
   const left = Math.max(0, new Date(attempt.ends_at).getTime() - now);
+  useEffect(() => { setDraft(r.answer ?? null); setDraftReview(!!r.marked_for_review); setSaveError(""); }, [q.id, r.answer, r.marked_for_review]);
+  useEffect(() => { if (started) void api(`/attempts/${attempt.id}/questions/${q.id}/visit`, { method: "POST" }); }, [attempt.id, q.id, started]);
+  useEffect(() => {
+    const closeOnEscape=(event:KeyboardEvent) => { if (event.key === "Escape") { setPaletteOpen(false); setSubmitReview(false); } };
+    window.addEventListener("keydown",closeOnEscape);
+    return () => window.removeEventListener("keydown",closeOnEscape);
+  }, []);
   useEffect(() => {
     if (!left && !attempt.submitted_at && !expirySubmissionStarted.current) {
       expirySubmissionStarted.current = true;
@@ -3744,6 +3886,13 @@ function Exam({
       });
     }
   }, [left, attempt.submitted_at, expiryRetry, finish]);
+  const sections = blueprint.sections as { id: string; title: string; question_ids: string[] }[];
+  const activeSection = sections.find((section) => section.id === sectionId) || sections[0];
+  const sectionQuestions = activeSection?.question_ids.map((id) => attempt.questions.find((question: any) => question.id === id)).filter(Boolean) || [];
+  const draftChanged = JSON.stringify(draft) !== JSON.stringify(r.answer ?? null) || draftReview !== !!r.marked_for_review;
+  const status = (question: any) => { const response = attempt.responses[question.id]; if (!response?.visited_at && !response?.answer && !response?.marked_for_review) return "unvisited"; if (response?.answer && response?.marked_for_review) return "answered-review"; if (response?.answer) return "answered"; if (response?.marked_for_review) return "review"; return "unanswered"; };
+  const goto = (next: number) => { if (draftChanged) { setSaveError("Save or clear this response before moving to another question."); return; } setIndex(next); };
+  const save = async (review = draftReview, advance = false) => { setSaving(true); setSaveError(""); const ok = await update(q.id, draft, review); setSaving(false); if (!ok) { setSaveError("Could not save. Check your connection and try again."); return; } if (advance) { const pos = attempt.questions.findIndex((question: any) => question.id === q.id); setIndex(Math.min(pos + 1, attempt.questions.length - 1)); } };
   const multiple = q.kind === "multiple_choice";
   const matrix = q.kind === "matrix_match";
   const written = ["numerical", "integer", "subjective"].includes(q.kind);
@@ -3754,7 +3903,7 @@ function Exam({
     const next = selected.includes(i)
       ? selected.filter((x) => x !== i)
       : [...selected, i].sort((a, b) => a - b);
-    update(q.id, { options: next }, r.marked_for_review);
+    setDraft({ options: next });
   };
   const toggleMatch = (row: string, choice: string) => {
     const matches: Record<string, string[]> = { ...(r.answer?.matches || {}) };
@@ -3762,8 +3911,9 @@ function Exam({
     matches[row] = selected.includes(choice)
       ? selected.filter((x) => x !== choice)
       : [...selected, choice].sort();
-    update(q.id, { matches }, r.marked_for_review);
+    setDraft({ matches });
   };
+  if (!started) return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">CBT PRACTICE</p><h1>Ready to begin?</h1><p>{blueprint.instructions}</p><ul><li>The timer starts now and is controlled by the server.</li><li>Use Save & Next or Mark for Review & Next to record answers.</li><li>Review your responses before final submission.</li></ul><button onClick={() => setStarted(true)}>I am ready to begin</button></div></main>;
   return (
     <div className="exam">
       <header>
@@ -3772,32 +3922,41 @@ function Exam({
           {Math.floor(left / 60000)}:
           {String(Math.floor(left / 1000) % 60).padStart(2, "0")}
         </strong>
+        <span className={`save-state ${saving ? "saving" : saveError ? "error" : ""}`} aria-live="polite">{saving ? "Saving…" : saveError || (draftChanged ? "Unsaved changes" : "All changes saved")}</span>
+        <button className="palette-trigger" onClick={() => setPaletteOpen(!paletteOpen)} aria-expanded={paletteOpen} aria-controls="question-palette">Questions</button>
       </header>
-      <aside>
-        {attempt.questions.map((x: any, i: number) => (
+      <nav className="exam-sections" aria-label="Test sections" role="tablist">
+        {sections.map((section) => <button key={section.id} role="tab" aria-selected={section.id === sectionId} className={section.id === sectionId ? "active" : ""} onClick={() => { setSectionId(section.id); const next = attempt.questions.findIndex((question: any) => question.id === section.question_ids[0]); if (next >= 0) goto(next); }}>{section.title}</button>)}
+      </nav>
+      <aside id="question-palette" className={paletteOpen ? "open" : ""}>
+        <div className="palette-heading"><b>Question palette</b><button onClick={() => setPaletteOpen(false)} aria-label="Close question palette">×</button></div>
+        <div className="palette-legend" aria-label="Question status legend"><span className="unvisited">Unvisited</span><span className="unanswered">Not answered</span><span className="answered">Answered</span><span className="review">Review</span><span className="answered-review">Answered & review</span></div>
+        {sectionQuestions.map((x: any) => {
+          const i = attempt.questions.findIndex((question: any) => question.id === x.id);
+          return (
           <button
-            className={`${i === index ? "active" : ""} ${attempt.responses[x.id]?.answer ? "answered" : ""}`}
+            className={`${i === index ? "active" : ""} ${status(x)}`}
             key={x.id}
-            onClick={() => setIndex(i)}
+            onClick={() => { goto(i); setPaletteOpen(false); }}
+            aria-label={`Question ${i + 1}, ${status(x).replace("-", " ")}`}
           >
             {i + 1}
           </button>
-        ))}
+        )})}
       </aside>
       <section>
         <p>
           QUESTION {index + 1} OF {attempt.questions.length}
         </p>
         <div className="exam-scroll">
-          <QuestionCard q={q} mode="exam" />
+          <QuestionCard q={q} mode="exam" displayNumber={index + 1} />
           <div className="answers">
             {written ? (
               <textarea
                 aria-label="Your answer"
-                value={r.answer?.value ?? ""}
-                onChange={(e) =>
-                  update(q.id, { value: e.target.value }, r.marked_for_review)
-                }
+                value={draft?.value ?? ""}
+                inputMode={q.kind === "integer" ? "numeric" : "decimal"}
+                onChange={(e) => setDraft({ value: e.target.value })}
                 placeholder={
                   q.kind === "subjective"
                     ? "Type your answer"
@@ -3817,7 +3976,7 @@ function Exam({
                             type="button"
                             key={choice}
                             className={
-                              (r.answer?.matches?.[row] || []).includes(choice)
+                              (draft?.matches?.[row] || []).includes(choice)
                                 ? "chosen"
                                 : ""
                             }
@@ -3834,8 +3993,8 @@ function Exam({
             ) : (
               q.options.map((option: any, i: number) => {
                 const selected = multiple
-                  ? (r.answer?.options || []).includes(i)
-                  : JSON.stringify(r.answer) === JSON.stringify({ option: i });
+                  ? (draft?.options || []).includes(i)
+                  : JSON.stringify(draft) === JSON.stringify({ option: i });
                 return (
                   <button
                     key={i}
@@ -3857,24 +4016,21 @@ function Exam({
           </div>
         </div>
         <footer>
-          <button onClick={() => update(q.id, null, r.marked_for_review)}>
+          <button onClick={() => setDraft(null)} disabled={saving}>
             Clear response
           </button>
-          <button onClick={() => update(q.id, r.answer, !r.marked_for_review)}>
-            {r.marked_for_review ? "Unmark review" : "Mark for review"}
+          <button onClick={() => save(!draftReview, true)} disabled={saving}>
+            Mark for Review & Next
           </button>
-          <button
-            onClick={() =>
-              setIndex(Math.min(index + 1, attempt.questions.length - 1))
-            }
-          >
+          <button onClick={() => save(draftReview, true)} disabled={saving}>
             Save & next
           </button>
-          <button className="danger" onClick={finish}>
+          <button className="danger" onClick={() => setSubmitReview(true)}>
             Submit test
           </button>
         </footer>
       </section>
+      {submitReview && <div className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response is not saved and will not be submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finish}>Submit test</button></div></div></div>}
     </div>
   );
 }
@@ -3897,12 +4053,13 @@ function Result({ attempt }: { attempt: any }) {
     <div className="page">
       <h1>Score: {data.attempt.score}</h1>
       {data.questions.map(
-        (q: Question & { response: any; correct: boolean; points: number }) => (
+        (q: Question & { response: any; correct: boolean; points: number }, index: number) => (
           <Card key={q.id}>
             <QuestionCard
               q={q}
               mode="student-result"
               studentAnswer={q.response}
+              displayNumber={index + 1}
             />
             <p>
               Your response:{" "}

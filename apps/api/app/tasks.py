@@ -85,6 +85,15 @@ def normalize_item(item:dict)->dict:
         if recovered:
             item["stem_markdown"]=stem;options=recovered
             if item.get("kind")=="subjective":item["kind"]="single_choice"
+    number=str(item.get("number") or "").strip()
+    if number and isinstance(item.get("stem_markdown"),str):
+        # The printed identifier is provenance. Candidate-facing numbering is
+        # assigned from the selected test order, so do not duplicate Q20 in a
+        # question delivered as question 1.
+        item["stem_markdown"]=re.sub(
+            rf"^\s*(?:q(?:uestion)?\s*)?{re.escape(number)}\s*[.)]\s*",
+            "",item["stem_markdown"],count=1,flags=re.I,
+        )
     visual_indices={d.get("option_index") for d in (item.get("diagrams") or []) if isinstance(d,dict)
                     and d.get("role")=="option" and isinstance(d.get("option_index"),int)
                     and not isinstance(d.get("option_index"),bool) and 0<=d["option_index"]<8}
@@ -140,6 +149,22 @@ def answer_from_key(number:object, options:list[dict], key_text:str)->dict|None:
     displayed A-H labels, so prose in a solution cannot become a false key.
     """
     if not key_text:return None
+    # A full worked-solution document contains the complete question before
+    # its key. Resolve its explicit final answer first, otherwise wording such
+    # as "Q3. A force..." can be mistaken for compact key entry "3. A".
+    block=_numbered_solution_block(number,key_text)
+    if block:
+        final=re.search(r"final\s+answer\s*:\s*\(?\s*([A-H])\s*\)?",block,re.I)
+        if final:
+            choice=final.group(1).lower()
+            for index,option in enumerate(options):
+                if choice in {str(index+1),str(option.get("value","")).lower(),chr(97+index)}:
+                    return {"option":index}
+        numeric_final=re.search(r"final\s+answer\s*:\s*([-+]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[-+]?\d+)?)\b",block,re.I)
+        if numeric_final and not options:return {"value":numeric_final.group(1)}
+        # A full solution block is not a compact answer table. Never let the
+        # first word or number in its question stem masquerade as the key.
+        return None
     prefix=r"(?<!\d)(?:q(?:uestion)?\s*)?"+re.escape(str(number).strip())+r"(?!\d)\s*(?:[).:-]\s*)?(?:ans(?:wer)?\s*[:=-]?\s*)?"
     match=re.search(prefix+r"\(?([A-H])\)?(?=\s|$)",key_text,re.I)
     if match:
@@ -155,6 +180,27 @@ def answer_from_key(number:object, options:list[dict], key_text:str)->dict|None:
         if value.isdigit() and 1<=int(value)<=len(options):return {"option":int(value)-1}
         return {"value":value}
     return None
+
+def _numbered_solution_block(number:object,key_text:str)->str:
+    """Return one explicit Q-number block without crossing into its neighbour."""
+    if not key_text:return ""
+    marker=re.compile(rf"(?i)(?<![A-Za-z0-9])q(?:uestion)?\s*{re.escape(str(number).strip())}\s*[.)]\s*")
+    for match in marker.finditer(key_text):
+        following=re.search(r"(?i)(?<![A-Za-z0-9])q(?:uestion)?\s*\d{1,4}\s*[.)]\s*",key_text[match.end():])
+        end=match.end()+(following.start() if following else len(key_text)-match.end())
+        block=key_text[match.start():end]
+        if re.search(r"//\s*answer|final\s+answer|\bsolution\b",block,re.I):return block
+    return ""
+
+def solution_from_key(number:object,key_text:str)->str|None:
+    """Recover a worked solution from a separately uploaded native key."""
+    block=_numbered_solution_block(number,key_text)
+    if not block:return None
+    split=re.split(r"//\s*answer\s*",block,maxsplit=1,flags=re.I)
+    if len(split)<2:return None
+    solution=re.sub(r"[\t \u200b]+"," ",split[1])
+    solution=re.sub(r"\n\s*\n(?:\s*\n)+","\n\n",solution).strip()
+    return solution or None
 def validate(item:dict):
     if not item.get("stem_markdown"):raise ValueError("Blank question stem")
     if item["kind"] in ("single_choice","multiple_choice","assertion_reason") and len(item.get("options",[]))<2:raise ValueError("Choice question requires two options")
@@ -197,12 +243,18 @@ def best_page_text(raw:bytes, reader:PdfReader, rendered:fitz.Document)->list[st
     layer while pypdf returns an empty or scrambled one.  This is deliberately
     page-local so a single bad page cannot poison a long-running import.
     """
+    def clean(value:str)->str:
+        lines=[re.sub(r"[\t \u200b]+"," ",line).rstrip() for line in value.splitlines()]
+        return re.sub(r"\n{3,}","\n\n","\n".join(lines)).strip()
     result=[]
     for index, page in enumerate(reader.pages):
-        pypdf_text=(page.extract_text() or "").strip()
-        try:mupdf_text=(rendered[index].get_text("text") or "").strip()
+        pypdf_text=clean(page.extract_text() or "")
+        try:
+            # Chrome/KaTeX PDFs append inline glyphs late in the content
+            # stream. Spatial sorting restores numerals and units in-place.
+            mupdf_text=clean(rendered[index].get_text("text",sort=True) or "")
         except Exception:mupdf_text=""
-        result.append(mupdf_text if len(mupdf_text)>len(pypdf_text) else pypdf_text)
+        result.append(mupdf_text if len(mupdf_text)>=max(32,len(pypdf_text)//2) else pypdf_text)
     return result
 
 def expected_questions(text:str)->int:
@@ -313,7 +365,9 @@ def extract_import(self, job_id:str):
       key_text=""
       if job.answer_document_id:
           key_doc=db.get(SourceDocument,job.answer_document_id)
-          key_text="\nANSWER KEY DOCUMENT:\n"+"\n".join(p.extract_text() or "" for p in PdfReader(BytesIO(get(key_doc.object_key))).pages)
+          key_raw=get(key_doc.object_key);key_reader=PdfReader(BytesIO(key_raw));key_rendered=fitz.open(stream=key_raw,filetype="pdf")
+          try:key_text="\nANSWER KEY DOCUMENT:\n"+"\n".join(best_page_text(key_raw,key_reader,key_rendered))
+          finally:key_rendered.close()
       # Combined books often append a compact answer table.  Use it for native
       # answer lookup even when no separately uploaded key exists.
       answer_lookup_text=key_text or embedded_answer_key_text(page_texts)
@@ -347,6 +401,8 @@ def extract_import(self, job_id:str):
             skipped+=1;continue
           if not item.get("answer"):
             item["answer"]=answer_from_key(item.get("number"),item.get("options") or [],answer_lookup_text)
+          if not item.get("solution_markdown"):
+            item["solution_markdown"]=solution_from_key(item.get("number"),answer_lookup_text)
           number=str(item["number"])
           owned_page=int((item.get("source_spans") or [{}])[0].get("page") or start+1)
           # Reject a model returning continuation-owned records, rather than

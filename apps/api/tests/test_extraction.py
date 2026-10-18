@@ -5,7 +5,10 @@ from app.bank_imports import _node, _pdf_bytes
 from app.main import clear_bank_import_output
 from app.models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from app.seed_jee_openrouter import normalize_choice_kind
-from app.tasks import answer_from_key, embedded_answer_key_text, expected_questions, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, unit_requires_vision, validate
+from app.tasks import answer_from_key, best_page_text, embedded_answer_key_text, expected_questions, extraction_units, normalize_item, page_unit_content, prepare_item_for_ingestion, solution_from_key, unit_requires_vision, validate
+from io import BytesIO
+import fitz
+from pypdf import PdfReader
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db import Base
@@ -55,6 +58,48 @@ def test_native_answer_key_lookup_maps_only_explicit_numbered_choice():
     assert answer_from_key("42",options,"41. A\n42. (B)\n43. A") == {"option":1}
     assert answer_from_key("44",[],"44. -2.5") == {"value":"-2.5"}
     assert answer_from_key("42",options,"The answer to 42 may be B in some versions.") is None
+
+def test_layout_sorted_pdf_text_keeps_late_inline_numerals_in_their_visual_position():
+    document=fitz.open();page=document.new_page(width=600,height=800)
+    prefix="Q10. An elevator cab of mass";first="800 kg";middle="carries a load of";second="200 kg"
+    x1=40+fitz.get_text_length(prefix,fontsize=11)+6
+    xm=x1+fitz.get_text_length(first,fontsize=11)+6
+    x2=xm+fitz.get_text_length(middle,fontsize=11)+6
+    page.insert_text((40,80),prefix,fontsize=11)
+    page.insert_text((xm,80),middle,fontsize=11)
+    page.insert_text((x2+fitz.get_text_length(second,fontsize=11)+3,80),".",fontsize=11)
+    page.insert_text((x1,80),first,fontsize=11)
+    page.insert_text((x2,80),second,fontsize=11)
+    page.insert_text((40,100),"(a) 30 kW   (b) 42 kW",fontsize=11)
+    raw=document.tobytes();document.close()
+    rendered=fitz.open(stream=raw,filetype="pdf")
+    text=best_page_text(raw,PdfReader(BytesIO(raw)),rendered)[0]
+    rendered.close()
+    assert "mass 800 kg" in text
+    assert "load of 200 kg" in text
+    assert text.index("800 kg") < text.index("(a) 30 kW")
+
+def test_answer_and_solution_are_recovered_from_numbered_solution_block():
+    key="""Q9. Pump question\n// ANSWER\nWorking: first result.\nFinal Answer: (A) 3 kW\nQ10. Elevator question\n// ANSWER\nGiven: 800 kg and 200 kg.\nWorking:\n1. F = Mg + f.\n2. P = Fv = 42 kW.\nFinal Answer: (B) 42 kW\nQ11. Next question"""
+    options=[{"value":"a","markdown":"30 kW"},{"value":"b","markdown":"42 kW"}]
+    assert answer_from_key("10",options,key) == {"option":1}
+    solution=solution_from_key("10",key)
+    assert "800 kg and 200 kg" in solution
+    assert "P = Fv = 42 kW" in solution
+    assert "Next question" not in solution
+
+def test_worked_solution_final_answer_wins_over_question_starting_with_a():
+    key="Q3. A force acts on a particle.\n// ANSWER\nWorking: integrate it.\nFinal Answer: (B) 18 J"
+    options=[{"value":"a","markdown":"16 J"},{"value":"b","markdown":"18 J"}]
+    assert answer_from_key("3",options,key) == {"option":1}
+
+def test_numerical_worked_solution_uses_final_answer_not_first_stem_value():
+    key="Q4. 2 kg is accelerated.\n// ANSWER\nWorking: calculate it.\nFinal Answer: 18.5"
+    assert answer_from_key("4",[],key) == {"value":"18.5"}
+
+def test_source_question_label_is_removed_from_stored_stem():
+    item=normalize_item({"number":"20","kind":"subjective","stem_markdown":"Q20. Calculate the work done.","options":[],"answer":None,"confidence":1})
+    assert item["stem_markdown"] == "Calculate the work done."
 
 def test_sparse_pages_are_batched_but_dense_pages_are_bounded():
     pages=["cover", "index", "1 Let x be real\n2. If y is positive\n3. Find z\n4. Given a\n5. Which value\n6. The result\n7. In a set\n8. Prove that\n9. Evaluate x", "10. Let j be real"]
