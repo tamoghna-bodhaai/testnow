@@ -138,9 +138,9 @@ def test_teacher_question_library_filters_approved_questions_by_source_pdf():
     approved_at=datetime.now(timezone.utc)
     db.add_all([
         teacher,first_source,second_source,first_job,second_job,
-        Question(id="approved-first",owner_id=teacher.id,import_job_id=first_job.id,kind=QuestionKind.SINGLE,stem_markdown="First approved",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
-        Question(id="pending-first",owner_id=teacher.id,import_job_id=first_job.id,kind=QuestionKind.SINGLE,stem_markdown="First pending",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0}),
-        Question(id="approved-second",owner_id=teacher.id,import_job_id=second_job.id,kind=QuestionKind.SINGLE,stem_markdown="Second approved",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
+        Question(id="approved-first",owner_id=teacher.id,import_job_id=first_job.id,kind=QuestionKind.SINGLE,stem_markdown="First approved",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=approved_at),
+        Question(id="pending-first",owner_id=teacher.id,import_job_id=first_job.id,kind=QuestionKind.SINGLE,stem_markdown="First pending",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0}),
+        Question(id="approved-second",owner_id=teacher.id,import_job_id=second_job.id,kind=QuestionKind.SINGLE,stem_markdown="Second approved",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=approved_at),
     ]);db.commit()
 
     result=questions(page=1,page_size=20,approved=True,import_job_id=first_job.id,user=teacher,db=db)
@@ -156,10 +156,10 @@ def test_teacher_can_create_and_publish_a_test_from_one_approved_pdf():
     job=ImportJob(id="job",owner_id=teacher.id,question_document_id=source.id,status=ImportStatus.APPROVED)
     approved_at=datetime.now(timezone.utc)
     questions_from_source=[
-        Question(id="q1",owner_id=teacher.id,import_job_id=job.id,source_number="1",kind=QuestionKind.SINGLE,stem_markdown="One",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
-        Question(id="q10",owner_id=teacher.id,import_job_id=job.id,source_number="10",kind=QuestionKind.SINGLE,stem_markdown="Ten",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=approved_at),
-        Question(id="q2",owner_id=teacher.id,import_job_id=job.id,source_number="2",kind=QuestionKind.SINGLE,stem_markdown="Two",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":1},approved_at=approved_at),
-        Question(id="q3",owner_id=teacher.id,import_job_id=job.id,source_number="3",kind=QuestionKind.SUBJECTIVE,stem_markdown="Explain",options=[],answer={"value":"Because"},approved_at=approved_at),
+        Question(id="q1",owner_id=teacher.id,import_job_id=job.id,source_number="1",kind=QuestionKind.SINGLE,stem_markdown="One",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=approved_at),
+        Question(id="q10",owner_id=teacher.id,import_job_id=job.id,source_number="10",kind=QuestionKind.SINGLE,stem_markdown="Ten",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=approved_at),
+        Question(id="q2",owner_id=teacher.id,import_job_id=job.id,source_number="2",kind=QuestionKind.SINGLE,stem_markdown="Two",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":1},approved_at=approved_at),
+        Question(id="q3",owner_id=teacher.id,import_job_id=job.id,source_number="3",kind=QuestionKind.SUBJECTIVE,stem_markdown="Explain",options=[],answer={"value":"Because"},solution_markdown="The forces balance at equilibrium.",approved_at=approved_at),
     ]
     db.add_all([teacher,source,job,*questions_from_source]);db.commit()
     data=ImportTestCreate(title="Worksheet 1",subject="Physics",duration_minutes=30,max_attempts=1,marks_per_question=4,delivery_blueprint={"preset":"custom","instructions":"Use the supplied worksheet.","sections":[{"id":"worksheet","title":"Worksheet 1"}]})
@@ -181,7 +181,7 @@ def test_admin_can_publish_a_teacher_owned_approved_pdf():
     admin=User(id="admin",name="Admin",email="admin@example.com",password_hash="x",role=Role.ADMIN)
     source=SourceDocument(id="source",owner_id=teacher.id,filename="worksheet.pdf",object_key="documents/teacher/worksheet.pdf",sha256="a" * 64,media_type="application/pdf",size_bytes=10)
     job=ImportJob(id="job",owner_id=teacher.id,question_document_id=source.id,status=ImportStatus.APPROVED)
-    question=Question(id="q1",owner_id=teacher.id,import_job_id=job.id,source_number="1",kind=QuestionKind.SINGLE,stem_markdown="One",options=[{"markdown":"A"},{"markdown":"B"}],answer={"option":0},approved_at=datetime.now(timezone.utc))
+    question=Question(id="q1",owner_id=teacher.id,import_job_id=job.id,source_number="1",kind=QuestionKind.SINGLE,stem_markdown="One",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=datetime.now(timezone.utc))
     db.add_all([teacher,admin,source,job,question]);db.commit()
 
     page=questions(page=1,page_size=20,approved=True,import_job_id=job.id,user=admin,db=db)
@@ -316,10 +316,11 @@ def test_expiry_worker_finalizes_attempt_without_a_browser(monkeypatch):
     version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc))
     attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc).replace(year=2020))
     db.add_all([student,test,version,attempt]);db.commit()
+    attempt_id=attempt.id  # The worker owns/closes its session; retain the stable fixture ID.
     monkeypatch.setattr("app.tasks.SessionLocal",lambda:db)
 
     assert finalize_expired_attempts.run()=={"finalized":1}
-    assert db.get(Attempt,attempt.id).submitted_at is not None
+    assert db.get(Attempt,attempt_id).submitted_at is not None
 
 def test_existing_attempt_is_not_stranded_after_assignment_changes():
     db=make_db()

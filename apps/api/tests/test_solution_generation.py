@@ -255,7 +255,7 @@ def test_placeholder_is_not_accepted_as_a_concise_solution():
         })
 
 
-def test_generation_approval_preserves_unrelated_review_findings():
+def test_generation_approval_preserves_advisory_taxonomy_finding():
     db, admin, _, job = setup_db()
     question = question_record(db, answer={"option": 0})
     question.interaction = {"ingestion_issues": ["taxonomy_uncertain", "missing_solution"]}
@@ -271,8 +271,9 @@ def test_generation_approval_preserves_unrelated_review_findings():
 
     approved = approve_generation(db, job, state["run_id"], admin.id)
 
-    assert approved == 0
-    assert question.approved_at is None
+    assert approved == 1
+    assert question.approved_at is not None
+    assert question.interaction["readiness"]["content_valid"] is True
     assert question.interaction["ingestion_issues"] == ["taxonomy_uncertain"]
 
 

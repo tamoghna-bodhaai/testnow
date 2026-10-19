@@ -2,26 +2,36 @@
 from contextlib import contextmanager
 
 import fitz
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from .db import get_db
 from .figures import coverage, extract_figures, ground_question_spans, image_regions, is_visual_issue, option_media_issues, page_number, rect, unrotated, vector_regions
-from .models import ImportJob, ImportStatus, Question, Role, SourceDocument, User
+from .models import ImportJob, ImportStatus, Question, QuestionScope, QuestionTaxonomy, Role, SourceDocument, User
 from .schemas import FigureReviewIn, QuestionIn
 from .security import require, uid
 from .services import audit
 from .storage import get, put
+from .readiness import record_readiness
+from .question_revisions import question_revision, require_revision
 
 router = APIRouter()
 
 
-def review_question(question_id, user, db):
-    question = db.get(Question, question_id)
+def review_question(question_id, user, db, lock=False):
+    question = db.query(Question).filter_by(id=question_id).populate_existing().with_for_update().one_or_none() if lock else db.get(Question, question_id)
     if not question or (user.role != Role.ADMIN and question.owner_id != user.id):
         raise HTTPException(404, "Question not found")
     return question
+
+
+def verify_source_scope(question,source,db):
+    if source.owner_id==question.owner_id:return
+    linked=db.query(ImportJob.id).filter_by(bank_id=question.bank_id,question_document_id=source.id).first() if question.bank_id else None
+    if not linked and question.bank_id and question.scope==QuestionScope.GLOBAL and (question.interaction or {}).get("copied_from_bank"):
+        linked=db.query(ImportJob.id).filter_by(bank_id=question.interaction["copied_from_bank"],question_document_id=source.id).first()
+    if not linked:raise HTTPException(422,"This source is not owned by the question author or linked to its bank; use the audited relinking workflow")
 
 
 @contextmanager
@@ -31,7 +41,9 @@ def source_pdf(question, db):
     source = db.get(SourceDocument, source_id) if source_id else None
     if not source:
         raise HTTPException(422, "The original source is unavailable for this question")
-    canonical = (job.extraction_meta or {}).get("canonical_pdf_key") if job else None
+    verify_source_scope(question,source,db)
+    source_job=db.get(ImportJob,(question.interaction or {}).get("relinked_source_job_id")) if (question.interaction or {}).get("relinked_source_job_id") else job
+    canonical = (source_job.extraction_meta or {}).get("canonical_pdf_key") if source_job and source_job.question_document_id==source.id else None
     if canonical:
         raw = get(canonical)
     elif source.media_type == "application/pdf":
@@ -91,17 +103,29 @@ def figure_source(question_id:str, user:User=Depends(require(Role.TEACHER,Role.A
                 merged=(merged+(-24,-24,24,24)) & page.rect
                 focus={"page":focus_page,"bbox":[round(v,2) for v in merged]}
         return {"filename":source.filename,"pages":pages,"diagrams":question.diagrams,"stem_markdown":question.stem_markdown,
-                "original_url":f"/api/teacher/imports/{_job.id}/source" if _job else None,
+                "original_url":f"/api/questions/{question.id}/source",
+                "revision":question_revision(question,[link.taxonomy_node_id for link in db.query(QuestionTaxonomy).filter_by(question_id=question.id)]),
                 "conversion_issues":(_job.extraction_meta or {}).get("docx_visual_issues",[]) if _job else [],
                 "source_page":(focus or {}).get("page") or (question.interaction or {}).get("source_page") or ((question.source_spans or [{}])[0].get("page")) or 1,
                 "focus":focus,
                 "visual_intent":(question.interaction or {}).get("visual_intent","none")}
 
 
-@router.put("/questions/{question_id}/draft")
-def save_question_draft(question_id:str, data:QuestionIn, user:User=Depends(require(Role.TEACHER,Role.ADMIN)), db:Session=Depends(get_db)):
-    """Allow missing choice definitions to be corrected before image approval."""
+@router.get("/questions/{question_id}/source")
+def question_original_source(question_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     question=review_question(question_id,user,db)
+    source_id=(question.interaction or {}).get("source_document_id")
+    job=db.get(ImportJob,question.import_job_id) if question.import_job_id else None
+    source=db.get(SourceDocument,source_id or (job.question_document_id if job else None))
+    if not source:raise HTTPException(404,"The original source is unavailable for this legacy question")
+    verify_source_scope(question,source,db)
+    return Response(get(source.object_key),media_type=source.media_type,headers={"Cache-Control":"private, max-age=60"})
+
+@router.put("/questions/{question_id}/draft")
+def save_question_draft(question_id:str, data:QuestionIn, user:User=Depends(require(Role.TEACHER,Role.ADMIN)), db:Session=Depends(get_db), if_match:str|None=Header(default=None)):
+    """Allow missing choice definitions to be corrected before image approval."""
+    question=review_question(question_id,user,db,lock=True)
+    if isinstance(if_match,str):require_revision(question,if_match,[link.taxonomy_node_id for link in db.query(QuestionTaxonomy).filter_by(question_id=question.id)])
     effective_options=data.options if "options" in data.model_fields_set else question.options
     if data.kind.value in {"single_choice","multiple_choice","assertion_reason"} and len(effective_options or [])<2:
         raise HTTPException(422,"Choice questions need at least two options")
@@ -118,9 +142,10 @@ def save_question_draft(question_id:str, data:QuestionIn, user:User=Depends(requ
     question.approved_at=None
     job=db.get(ImportJob,question.import_job_id) if question.import_job_id else None
     if job:job.status=ImportStatus.REVIEW
+    readiness=record_readiness(question)
     audit(db,user.id,"question.draft_saved","question",question.id,{"fields":sorted(data.model_fields_set & allowed)})
     db.commit()
-    return {"id":question.id,"approved":False}
+    return {"id":question.id,"approved":False,"readiness":readiness.to_dict()}
 
 
 @router.get("/questions/{question_id}/figure-source/{number}")
@@ -135,8 +160,9 @@ def figure_source_page(question_id:str, number:int, user:User=Depends(require(Ro
 
 
 @router.put("/questions/{question_id}/figures")
-def review_figures(question_id:str, data:FigureReviewIn, user:User=Depends(require(Role.TEACHER,Role.ADMIN)), db:Session=Depends(get_db)):
-    question = review_question(question_id, user, db)
+def review_figures(question_id:str, data:FigureReviewIn, user:User=Depends(require(Role.TEACHER,Role.ADMIN)), db:Session=Depends(get_db), if_match:str|None=Header(default=None)):
+    question = review_question(question_id, user, db, lock=True)
+    if isinstance(if_match,str):require_revision(question,if_match,[link.taxonomy_node_id for link in db.query(QuestionTaxonomy).filter_by(question_id=question.id)])
     if not data.confirmed:
         raise HTTPException(422,"Confirm that every question and option figure matches the source")
     with source_pdf(question, db) as (document, raw, source, job):
@@ -170,6 +196,7 @@ def review_figures(question_id:str, data:FigureReviewIn, user:User=Depends(requi
         if job:
             job.status=ImportStatus.REVIEW
             job.extraction_meta={**(job.extraction_meta or {}),"phase":"Figure correction awaiting question approval"}
+        record_readiness(question)
         audit(db,user.id,"question.figures_reviewed","question",question.id,{"before":previous,"after":saved})
         db.commit()
         return {"diagrams":saved,"ingestion_issues":question.interaction["ingestion_issues"]}

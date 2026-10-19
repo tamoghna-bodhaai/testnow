@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from .models import Attempt, AttemptEvent, Question, QuestionScope, Response, Test, TestVersion, TestStatus
 from .security import uid
+from .readiness import require_content_valid
 
 CHOICE_KINDS={"single_choice","multiple_choice","assertion_reason"}
 
@@ -19,7 +20,7 @@ def safe_question_kind(kind:object, options:object)->str:
 
 def audit(db:Session, actor:str|None, action:str, entity_type:str, entity_id:str, data:dict|None=None):
     from .models import AuditEvent
-    db.add(AuditEvent(id=uid(),actor_id=actor,action=action,entity_type=entity_type,entity_id=entity_id,data=data or {}))
+    db.add(AuditEvent(id=uid(),actor_id=actor,action=action,entity_type=entity_type,entity_id=entity_id,data=data or {},created_at=datetime.now(timezone.utc)))
 def attempt_event(db:Session, attempt_id:str, event_type:str, data:dict|None=None):
     db.add(AttemptEvent(id=uid(),attempt_id=attempt_id,event_type=event_type,data=data or {}))
 
@@ -57,12 +58,20 @@ def validate_blueprint(blueprint:dict, question_ids:list[str]):
             if group["choose"]<1 or group["choose"]>len(group["question_ids"]):raise HTTPException(422,"Invalid optional-question choice count")
     if len(seen)!=len(set(seen)) or set(seen)!=expected:raise HTTPException(422,"Blueprint sections must contain every selected question exactly once")
 def snapshot_questions(db:Session, ids:list[str], owner_id:str)->list[dict]:
-    found=db.query(Question).filter(Question.id.in_(ids),Question.approved_at.is_not(None)).filter((Question.owner_id==owner_id)|(Question.scope==QuestionScope.GLOBAL)).all()
+    found=db.query(Question).filter(Question.id.in_(ids),Question.approved_at.is_not(None)).filter((Question.owner_id==owner_id)|(Question.scope==QuestionScope.GLOBAL)).populate_existing().with_for_update().all()
     by_id={q.id:q for q in found}
     if len(by_id)!=len(set(ids)):raise HTTPException(422,"Every selected question must be teacher-approved")
     content=[]
     for qid in ids:
-        q=by_id[qid]; kind=safe_question_kind(q.kind,q.options)
+        q=by_id[qid]
+        require_content_valid(q)
+        if q.scope == QuestionScope.GLOBAL and q.bank_id:
+            from .models import ImportJob, QuestionBank
+            bank=db.get(QuestionBank,q.bank_id)
+            job=db.get(ImportJob,q.import_job_id) if q.import_job_id else None
+            if not bank or not bank.is_global or (q.import_job_id and (not job or not job.published_at or (job.extraction_meta or {}).get("delete_requested"))):
+                raise HTTPException(422,"Every selected bank question must belong to a published material")
+        kind=q.kind.value
         content.append({"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":q.options,"answer":None if kind=="subjective" and len(q.options or [])<2 else q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"interaction":q.interaction})
     return content
 def publish(db:Session,test:Test,actor_id:str,question_ids:list[str]):

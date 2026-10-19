@@ -1,16 +1,18 @@
 "use client";
 
-import { PointerEvent, useEffect, useRef, useState } from "react";
+import { PointerEvent, useEffect, useRef, useState, useId } from "react";
+import {useDialogFocus} from "./dialog-focus";
 
 type Figure = { page: number; bbox: number[]; role: string; option_index: number | null; alt: string };
 type Viewport = { page: number; bbox: number[] };
 type Source = {
-  filename: string; source_page: number; stem_markdown: string; original_url?: string;
+  revision?: string; filename: string; source_page: number; stem_markdown: string; original_url?: string;
   conversion_issues?: string[]; visual_intent?: string; focus?: Viewport | null;
   pages: { page: number; width: number; height: number }[]; diagrams: Figure[];
 };
 
-export function FigureEditor({ questionId, options, api, done, onActiveChange }: {
+export function FigureEditor({ questionId, options, api, done, onActiveChange, label = "Adjust detected figure" }: {
+  label?: string;
   questionId: string;
   options: { value?: string }[];
   api: (path: string, options?: RequestInit) => Promise<any>;
@@ -29,6 +31,11 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
   const [showFullPage, setShowFullPage] = useState(false);
   const [choiceCount, setChoiceCount] = useState(4);
   const [choiceKind, setChoiceKind] = useState("single_choice");
+  const triggerContainer=useRef<HTMLElement>(null);
+  const boundsId=useId();
+  const [bounds,setBounds]=useState<string[]>(["0","0","100","100"]);
+  const baseline=useRef("");
+  const figureState=(value:Figure[])=>JSON.stringify(value.map(({page,bbox,role,option_index,alt})=>({page,bbox,role,option_index,alt})));
   const start = useRef<number[] | null>(null);
   const request = useRef<AbortController | null>(null);
   const info = source?.pages.find(p => p.page === page);
@@ -36,11 +43,13 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
     ? source.focus.bbox : info ? [0, 0, info.width, info.height] : [0, 0, 1, 1];
 
   useEffect(() => () => request.current?.abort(), []);
-  const close = () => {
+  const close = (force=false) => {
+    if(!force&&source&&baseline.current!==figureState(figures)&&!window.confirm("Discard unsaved figure adjustments for this source question?"))return;
     request.current?.abort(); request.current = null;
     start.current = null; setDrag(null); setSource(undefined); setConfirmed(false); setError("");
     onActiveChange?.(false);
   };
+  const dialogFocus=useDialogFocus(Boolean(source),()=>close(),()=>triggerContainer.current?.querySelector<HTMLButtonElement>("button")||null);
   const open = async () => {
     request.current?.abort();
     const controller = new AbortController(); request.current = controller;
@@ -52,6 +61,7 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
       setShowFullPage(false);
       setFigures((data.diagrams || []).filter(d => Array.isArray(d.bbox) && d.bbox.length === 4)
         .map(d => ({ ...d, role: d.role || "question", option_index: d.option_index ?? null })));
+      baseline.current=figureState((data.diagrams || []).filter(d=>Array.isArray(d.bbox)&&d.bbox.length===4).map(d=>({...d,role:d.role||"question",option_index:d.option_index??null})));
       onActiveChange?.(true);
     } catch (e: any) {
       if (e?.name !== "AbortError") setError(e.message);
@@ -70,11 +80,13 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
     setOwner(value); setConfirmed(false);
     if (selected >= 0) setFigures(previous => previous.map((f,i) => i === selected ? { ...f, ...owning(value) } : f));
   };
+  useEffect(()=>{const figure=figures[selected];setBounds(figure?figure.bbox.map(String):["0","0",String(Math.min(info?.width||100,100)),String(Math.min(info?.height||100,100))]);},[selected,page]);
+  const applyBounds=()=>{const values=bounds.map(Number);if(!info||values.some(value=>!Number.isFinite(value))||values[0]<0||values[1]<0||values[2]>info.width||values[3]>info.height||values[2]-values[0]<6||values[3]-values[1]<6){setError("Use bounds within the source page with width and height of at least 6 PDF points.");return;}setError("");setConfirmed(false);if(selected>=0)setFigures(current=>current.map((figure,index)=>index===selected?{...figure,page,bbox:values,...owning(owner)}:figure));else{setSelected(figures.length);setFigures(current=>[...current,{page,bbox:values,...owning(owner),alt:"Reviewed source figure"}]);}};
   const save = async () => {
     setBusy(true); setError("");
     try {
-      await api(`/questions/${questionId}/figures`, { method: "PUT", body: JSON.stringify({ diagrams: figures, confirmed }) });
-      close(); await done();
+      await api(`/questions/${questionId}/figures`, { method: "PUT", headers: source?.revision ? { "If-Match": source.revision } : {}, body: JSON.stringify({ diagrams: figures, confirmed }) });
+      close(true); await done();
     } catch (e: any) { setError(e.message); }
     finally { setBusy(false); }
   };
@@ -82,21 +94,22 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
     if (!source) return;
     setBusy(true); setError("");
     try {
-      await api(`/questions/${questionId}/draft`, { method:"PUT", body:JSON.stringify({
+      await api(`/questions/${questionId}/draft`, { method:"PUT", headers: source.revision ? { "If-Match": source.revision } : {}, body:JSON.stringify({
         kind:choiceKind, stem_markdown:source.stem_markdown, answer:null,
         options:Array.from({length:choiceCount},(_,i)=>({value:String.fromCharCode(97+i),markdown:"",requires_diagram:true})),
       }) });
-      close(); await done();
+      close(true); await done();
     } catch (e:any) { setError(e.message); }
     finally { setBusy(false); }
   };
-  return <section className="figure-review">
+  return <section ref={triggerContainer} className="figure-review">
     {!source ? <button type="button" className="secondary-action" disabled={busy} onClick={open}>
-      {busy ? "Opening figure adjustment…" : "Adjust detected figure"}
-    </button> : <div className="figure-editor-drawer" role="dialog" aria-label="Adjust detected figure">
-      <div className="figure-editor-heading"><strong>Adjust figure from {source.filename}</strong><button type="button" className="secondary-action" onClick={close}>Close</button></div>
+      {busy ? "Opening figure adjustment…" : label}
+    </button> : <div ref={dialogFocus} tabIndex={-1} className="figure-editor-drawer" role="dialog" aria-modal="true" aria-label="Adjust detected figure">
+      <div className="figure-editor-heading"><strong>Adjust figure from {source.filename}</strong><button type="button" className="secondary-action" onClick={()=>close()}>Close</button></div>
       {!!source.conversion_issues?.length && <p>Check complex Word graphics against the original document. {source.original_url && <a href={source.original_url} target="_blank" rel="noreferrer">Open original document</a>}</p>}
-      <p>Start with the detected question area. Drag around a complete figure only when the proposed crop needs correction.</p>
+      {error&&<p role="alert" className="diagram-error">{error}</p>}
+      <p>Start with the detected question area. Drag around a complete figure, or use Keyboard crop controls, when the proposed crop needs correction.</p>
       {options.length < 2 && <div className="figure-review-controls">
         <p>For diagram-only choices, add the printed choice count before assigning each crop.</p>
         <label>Choices <select value={choiceCount} onChange={e => setChoiceCount(Number(e.target.value))}>{[2,3,4,5,6,7,8].map(n => <option key={n} value={n}>{n}</option>)}</select></label>
@@ -115,6 +128,7 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
         <button type="button" className="secondary-action" onClick={() => setShowFullPage(value => !value)}>{showFullPage ? "Focus question area" : "View full source page"}</button>
         <button type="button" className="secondary-action" disabled={selected < 0} onClick={() => { setFigures(previous => previous.filter((_,i) => i !== selected)); setSelected(-1); setConfirmed(false); }}>Remove selected</button>
       </div>
+      <details className="keyboard-figure-bounds"><summary>Keyboard crop controls</summary><p id={boundsId}>Enter PDF-point coordinates. This page is {info?.width} × {info?.height} points. Select a stored crop to adjust it, or choose New crop.</p><label>Crop<select value={selected} onChange={event=>{const index=Number(event.target.value);setSelected(index);if(index>=0){const figure=figures[index];setOwner(figure.role==="option"?`option:${figure.option_index}`:figure.role);}}}><option value={-1}>New crop</option>{figures.map((figure,index)=>figure.page===page?<option key={index} value={index}>Crop {index+1} · {figure.role}</option>:null)}</select></label><div className="figure-coordinate-inputs">{["Left (x1)","Top (y1)","Right (x2)","Bottom (y2)"].map((label,index)=><label key={label}>{label}<input type="number" step="any" value={bounds[index]} aria-describedby={boundsId} onChange={event=>setBounds(current=>current.map((value,position)=>position===index?event.target.value:value))}/></label>)}</div><button type="button" className="secondary-action" onClick={applyBounds}>{selected>=0?"Update selected crop bounds":"Add crop from coordinates"}</button></details>
       {info && <svg className="figure-source-canvas" viewBox={`${viewport[0]} ${viewport[1]} ${viewport[2]-viewport[0]} ${viewport[3]-viewport[1]}`}
         aria-label="Source page: drag to select a figure" role="img"
         onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); start.current=point(event); setDrag(null); setSelected(-1); }}
@@ -128,8 +142,8 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange }:
         {drag && <rect x={drag[0]} y={drag[1]} width={drag[2]-drag[0]} height={drag[3]-drag[1]} fill="#f5a62322" stroke="#bd6900" strokeDasharray="4 3" />}
       </svg>}
       <label><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} /> I checked the detected figures and visual choices against the source.</label>
-      <div className="review-buttons"><button type="button" disabled={busy || !confirmed} onClick={save}>{busy ? "Saving…" : "Save figure adjustment"}</button><button type="button" className="secondary-action" onClick={close}>Cancel</button></div>
+      <div className="review-buttons"><button type="button" disabled={busy || !confirmed} onClick={save}>{busy ? "Saving…" : "Save figure adjustment"}</button><button type="button" className="secondary-action" onClick={()=>close()}>Cancel</button></div>
     </div>}
-    {error && <p role="alert" className="diagram-error">{error}</p>}
+    {!source&&error && <p role="alert" className="diagram-error">{error}</p>}
   </section>;
 }

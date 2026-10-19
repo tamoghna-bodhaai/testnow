@@ -26,6 +26,7 @@ from .services import audit
 from .storage import get
 from .import_cleanup import delete_import_records
 from .tasks import normalize_answer
+from .readiness import has_usable_answer, record_readiness
 
 
 ANSWER_KINDS = {
@@ -36,49 +37,6 @@ ANSWER_KINDS = {
     QuestionKind.MATRIX,
     QuestionKind.ASSERTION,
 }
-
-
-def has_usable_answer(kind: QuestionKind, answer: object, options: list) -> bool:
-    """Recognize a real answer, including legacy records without issue flags."""
-    if kind == QuestionKind.SUBJECTIVE or not isinstance(answer, dict):
-        return False
-    if kind in {QuestionKind.SINGLE, QuestionKind.ASSERTION}:
-        value = answer.get("option")
-        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(options)
-    if kind == QuestionKind.MULTIPLE:
-        values = answer.get("options")
-        return (
-            isinstance(values, list)
-            and bool(values)
-            and all(isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(options) for value in values)
-            and len(values) == len(set(values))
-        )
-    if kind in {QuestionKind.NUMERICAL, QuestionKind.INTEGER}:
-        value = answer.get("value")
-        if value is None or isinstance(value, bool) or (isinstance(value, str) and not value.strip()):
-            return False
-        try:
-            number = Decimal(str(value))
-        except (InvalidOperation, TypeError, ValueError):
-            return False
-        if not number.is_finite():
-            return False
-        return kind != QuestionKind.INTEGER or number == number.to_integral_value()
-    if kind == QuestionKind.MATRIX:
-        matches = answer.get("matches")
-        return (
-            isinstance(matches, dict)
-            and bool(matches)
-            and all(
-                str(row).strip()
-                and isinstance(choices, list)
-                and bool(choices)
-                and len(choices) == len(set(map(str, choices)))
-                and all(str(choice).strip() for choice in choices)
-                for row, choices in matches.items()
-            )
-        )
-    return False
 
 
 def missing_generation_fields(question: Question) -> list[str]:
@@ -315,6 +273,9 @@ def _provider_request(payload: dict) -> tuple[dict,str]:
 
 def generate_question(db: Session, question: Question, job: ImportJob, provider=None) -> dict:
     """Generate and validate one result without overwriting populated fields."""
+    db.flush()
+    original_content = json.dumps([question.kind.value, question.stem_markdown, question.options, question.answer,
+                                   question.solution_markdown, question.interaction, question.diagrams], sort_keys=True)
     interaction = dict(question.interaction or {})
     generation = dict(interaction.get("solution_generation") or {})
     requested = list(generation.get("requested_fields") or missing_generation_fields(question))
@@ -323,6 +284,8 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
     requested = [field for field in requested if field in current_missing]
     if not requested:
         return {"status": "skipped", "generated_fields": []}
+    if interaction.get("answer_key_authoritative") and question.answer is not None and not has_usable_answer(question.kind, question.answer, question.options or []):
+        raise ValueError("The trusted source answer key is malformed. Repair it explicitly before generating content")
     taxonomy=[{"kind":node.kind,"name":node.name} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==question.id).order_by(TaxonomyNode.kind,TaxonomyNode.name)]
     content = [{"type": "text", "text": json.dumps({
         "kind": question.kind.value,
@@ -383,6 +346,11 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
     locked_job=db.query(ImportJob).filter_by(id=job.id).with_for_update().one()
     if locked_job.published_at:
         raise ValueError("This source document became live during generation; create a bank revision before changing it")
+    question = db.query(Question).filter_by(id=question.id).populate_existing().with_for_update().one()
+    current_content = json.dumps([question.kind.value, question.stem_markdown, question.options, question.answer,
+                                  question.solution_markdown, question.interaction, question.diagrams], sort_keys=True)
+    if current_content != original_content:
+        raise ValueError("The question changed during generation; the saved content was preserved. Retry generation after review")
     # Both missing fields are committed only after every validation succeeds.
     if "answer" in requested:
         question.answer = generated_answer
@@ -404,6 +372,7 @@ def generate_question(db: Session, question: Question, job: ImportJob, provider=
     }
     question.interaction = {**interaction, "ingestion_issues": issues, "solution_generation": completed}
     question.approved_at = None
+    record_readiness(question)
     return completed
 
 
@@ -455,6 +424,7 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
                 if "solution_generation_failed" not in issues:
                     issues.append("solution_generation_failed")
                 row.interaction = {**interaction, "ingestion_issues": issues, "solution_generation": {**generation, "status": "failed", "error": message[:500], "failed_at": _now()}}
+                record_readiness(row)
                 errors.append({"question_id": row.id, "source_number": row.source_number, "message": message[:300]})
                 failed += 1
                 audit(db, actor_id, "question_solution_generation.failed", "question", row.id, {"run_id": run_id, "error": message[:300]})
@@ -473,6 +443,7 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
                 "failed": failed,
                 "skipped": skipped,
                 "errors": errors[-50:],
+                "error_log": errors,
             })
             db.commit()
         final_status = "completed_with_errors" if failed else "completed"
@@ -516,16 +487,19 @@ def approve_generation(db: Session, job: ImportJob, run_id: str, actor_id: str) 
             "solution_generation": {**generation, "approved_at": now.isoformat(), "approved_by": actor_id},
         }
         # Confirming generated content must not silently waive a separate
-        # extraction, taxonomy, or visual defect.
-        if not remaining_warnings:
+        # extraction or visual defect. Advisory taxonomy findings are retained.
+        readiness = record_readiness(question)
+        if readiness.content_valid:
             question.interaction = {**question.interaction, "reviewed_by": actor_id}
             question.approved_at = now
+            record_readiness(question)
             approved += 1
         overrides.append({"question_id":question.id,"resolved_generation_warnings":[warning for warning in warnings if warning not in remaining_warnings],"remaining_warnings":remaining_warnings})
     state = {**state, "approved": approved, "approved_at": now.isoformat(), "approved_by": actor_id}
     if current.get("run_id")==run_id:current=state
     elif history_index is not None:history[history_index]=state
     job.extraction_meta = {**(job.extraction_meta or {}), "solution_generation": current, "solution_generation_history": history}
+    db.flush()
     remaining = db.query(Question).filter_by(import_job_id=job.id, approved_at=None).first()
     failed_pages = bool((job.extraction_meta or {}).get("failed_pages"))
     if not remaining and not failed_pages:

@@ -15,6 +15,8 @@ from .config import settings
 from .db import SessionLocal
 from .models import ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, SourceDocument, TaxonomyNode
 from .security import uid
+from .readiness import record_readiness
+from .job_state import heartbeat
 from .storage import get, put
 from .import_cleanup import delete_import_records
 from .figures import save_figures, visual_context, mark_scope_conflicts, ground_question_spans, docx_visual_inventory, docx_conversion_issues, requires_source_figure, visual_intent
@@ -51,14 +53,22 @@ def _node(db, bank_id: str, parent_id: str | None, kind: str, name: str) -> Taxo
     # Older concurrent imports therefore left duplicate root subjects behind;
     # selecting one stable row keeps those historic records importable.
     row=db.query(TaxonomyNode).filter_by(bank_id=bank_id,parent_id=parent_id,kind=kind,name=name).order_by(TaxonomyNode.created_at,TaxonomyNode.id).first()
-    if row:return row
+    if row:
+        if row.alias_of_id:
+            target=db.get(TaxonomyNode,row.alias_of_id)
+            if target and target.bank_id==bank_id and target.kind==kind:return target
+        return row
     # Models often vary case, whitespace, ampersands, or punctuation between
     # pages.  Resolve those cosmetic variants to the existing taxonomy node so
     # the bank never grows duplicate chapters/subtopics during a long import.
     canonical=lambda value:re.sub(r"[^a-z0-9]+","",str(value).lower())
     key=canonical(name)
     for candidate in db.query(TaxonomyNode).filter_by(bank_id=bank_id,parent_id=parent_id,kind=kind).order_by(TaxonomyNode.created_at,TaxonomyNode.id):
-        if canonical(candidate.name)==key:return candidate
+        if canonical(candidate.name)==key:
+            if candidate.alias_of_id:
+                target=db.get(TaxonomyNode,candidate.alias_of_id)
+                if target and target.bank_id==bank_id and target.kind==kind:return target
+            return candidate
     row=TaxonomyNode(id=uid(),bank_id=bank_id,parent_id=parent_id,kind=kind,name=name);db.add(row);db.flush();return row
 
 
@@ -134,18 +144,21 @@ def _checkpoint(db, job_id: str, updates: dict) -> tuple[ImportJob, dict]:
     db.expire_all()
     job=db.get(ImportJob,job_id)
     if not job: raise ValueError("Bank import job not found")
-    meta={**dict(job.extraction_meta or {}),**updates}
+    meta={**dict(job.extraction_meta or {}),**updates,"worker_heartbeat_at":heartbeat()}
     job.extraction_meta=meta
     return job,meta
 
 
 def _finish_controlled_import(db, job_id: str, control: str, updates: dict) -> None:
     job,meta=_checkpoint(db,job_id,updates)
+    if meta.get("delete_requested"):control="deleted"
+    elif meta.get("cancel_requested"):control="cancelled"
     if control=="deleted":
         delete_import_records(db,job,meta.get("delete_requested_by"));db.commit();return
     job.status=ImportStatus.FAILED if control=="cancelled" else ImportStatus.UPLOADED
     job.error="Cancelled by administrator" if control=="cancelled" else None
-    job.extraction_meta={**meta,"phase":"Cancelled" if control=="cancelled" else "Paused by administrator"}
+    job.extraction_meta={**meta,"phase":"Cancelled" if control=="cancelled" else "Paused by administrator",
+                         "cancelled_acknowledged_at" if control=="cancelled" else "paused_acknowledged_at":heartbeat()}
     db.commit()
 
 
@@ -187,10 +200,14 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
             item["solution_markdown"]=solution_from_key(number,answer_text)
         answer=_answer_from_solution(item)
         answer_key_authoritative=bool(str(answer_text or "").strip() and answer)
-        issues=_issues(item,answer,diagrams,answer_key_authoritative=answer_key_authoritative);flagged+=bool(issues)
+        issues=_issues(item,answer,diagrams,answer_key_authoritative=answer_key_authoritative)
         chapter=_node(db,bank.id,subject_node.id,"chapter",str(item.get("chapter") or "Unmapped chapter"));topic_name=str(item.get("topic") or "").strip();topic=_node(db,bank.id,chapter.id,"topic",topic_name) if topic_name else None
         interaction={"import_mode":"admin_bank","source_document_id":source.id,"source_filename":source.filename,"source_page":page,"ingestion_issues":issues,"model":settings().openrouter_model,"visual_intent":item.get("visual_intent","none"),"answer_inferred_from_solution":bool(answer and not item.get("answer")),"answer_key_authoritative":answer_key_authoritative,"matrix_items":item.get("matrix_items") or [],"matrix_choices":item.get("matrix_choices") or []}
         q=Question(id=uid(),owner_id=job.owner_id,bank_id=bank.id,scope=QuestionScope.GLOBAL,import_job_id=job.id,source_number=number,source_key=source_key,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=answer,solution_markdown=item.get("solution_markdown"),confidence=item.get("confidence"),source_spans=item.get("source_spans") or [],diagrams=diagrams,interaction=interaction,approved_at=None if issues else datetime.now(timezone.utc))
+        readiness=record_readiness(q)
+        if not readiness.content_valid:q.approved_at=None
+        record_readiness(q)
+        flagged+=bool(issues) or not readiness.content_valid
         try:
             with db.begin_nested():db.add(q);db.flush()
         except IntegrityError:continue
@@ -203,7 +220,7 @@ def _save_questions(db, bank, job, source, subject, rendered, regions, items, se
 def run_bank_import(job_id: str) -> None:
     db=SessionLocal();rendered=None
     try:
-        job=db.get(ImportJob,job_id)
+        job=db.query(ImportJob).filter_by(id=job_id).populate_existing().with_for_update().one_or_none()
         if not job or not job.bank_id:raise ValueError("Bank import job not found")
         bank=db.get(QuestionBank,job.bank_id);source=db.get(SourceDocument,job.question_document_id)
         if not bank or not source:raise ValueError("Bank or source document not found")
@@ -211,12 +228,12 @@ def run_bank_import(job_id: str) -> None:
         # A queued duplicate or worker restart must not revive an explicitly
         # paused material. Only the resume endpoint clears this durable flag.
         if meta.get("pause_requested"):
-            job.status=ImportStatus.UPLOADED;job.extraction_meta={**meta,"phase":"Paused by administrator"};db.commit();return
+            job.status=ImportStatus.UPLOADED;job.extraction_meta={**meta,"phase":"Paused by administrator","paused_acknowledged_at":heartbeat(),"worker_heartbeat_at":heartbeat()};db.commit();return
         if meta.get("delete_requested"):
             _finish_controlled_import(db,job_id,"deleted",{});return
         if meta.get("cancel_requested"):
-            job.status=ImportStatus.FAILED;job.error="Cancelled by administrator";job.extraction_meta={**meta,"phase":"Cancelled"};db.commit();return
-        job.status=ImportStatus.PROCESSING;job.extraction_meta={**meta,"phase":"Reading source"};db.commit()
+            job.status=ImportStatus.FAILED;job.error="Cancelled by administrator";job.extraction_meta={**meta,"phase":"Cancelled","cancelled_acknowledged_at":heartbeat(),"worker_heartbeat_at":heartbeat()};db.commit();return
+        job.status=ImportStatus.PROCESSING;job.extraction_meta={**meta,"phase":"Reading source","worker_heartbeat_at":heartbeat()};db.commit()
         canonical_key=meta.get("canonical_pdf_key")
         conversion_info=dict(meta.get("docx_visual_inventory") or {})
         raw=get(canonical_key) if canonical_key else _pdf_bytes(source,conversion_info)

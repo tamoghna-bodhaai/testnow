@@ -6,6 +6,12 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { FigureEditor } from "./figure-editor";
+import { LatestRequest, bankUrl, readBankLocation } from "./bank-navigation";
+import { reviewUploads, UploadConfig } from "./upload-preflight";
+import { AdminQuestionEditor } from "./question-editor";
+import { QuestionLibrary } from "./question-library";
+import { TeacherSupport } from "./teacher-support";
+import { useDialogFocus } from "./dialog-focus";
 
 type User = {
   id: string;
@@ -30,10 +36,15 @@ type AdminDashboard = {
     submitted_count: number;
   })[];
 };
-type Question = {
+type ReadinessReason = { code: string; field: string; message: string };
+type Readiness = { validator_version: string; content_valid: boolean; reviewed: boolean; publishable: boolean; blocking: ReadinessReason[]; advisory: ReadinessReason[] };
+type ReadinessCounts = { total: number; content_valid: number; publishable: number; blocked: number; needs_review: number; needs_attention: number };
+export type Question = {
+  revision?: string;
   id: string;
   import_job_id?: string;
   source_number?: string;
+  readiness?: Readiness;
   kind: string;
   stem_markdown: string;
   options: any[];
@@ -54,11 +65,15 @@ type ImportJob = {
   id: string;
   status: "uploaded" | "processing" | "review" | "failed" | "approved";
   filename?: string;
+  bank_id?: string;
+  lifecycle?: { state: string; heartbeat_at?: string; last_activity_at?: string; processed?: number; total?: number; unit?: string };
+  errors_total?: number;
   source_id?: string;
   error?: string;
   errors?: { page?: number; end_page?: number; message: string }[];
   question_count?: number;
   approved_count?: number;
+  readiness?: ReadinessCounts;
   generation_eligible_count?: number;
   published?: boolean;
   published_at?: string;
@@ -205,6 +220,7 @@ type Bank = {
   published_count: number;
   import_count: number;
   flagged_count: number;
+  readiness?: ReadinessCounts;
   imports?: ImportJob[];
   questions?: Question[];
 };
@@ -214,8 +230,11 @@ const errorMessage = (detail: unknown) =>
     ? detail.map((item: any) => item.msg || "Invalid request").join(" ")
     : typeof detail === "string"
       ? detail
-      : "Request failed";
+      : detail && typeof detail === "object" && "message" in detail
+        ? String(detail.message)
+        : "Request failed";
 const api = async (path: string, options: RequestInit = {}) => {
+  if ((!options.method || options.method === "GET") && /^\/admin\/question-banks\/[^/]+\/imports\/[^/?]+$/.test(path)) path += "?include_questions=false";
   const r = await fetch(`/api${path}`, {
     ...options,
     credentials: "include",
@@ -226,7 +245,7 @@ const api = async (path: string, options: RequestInit = {}) => {
   });
   if (!r.ok) {
     const body = await r.json().catch(() => ({ detail: "Request failed" }));
-    throw new Error(errorMessage(body.detail));
+    throw Object.assign(new Error(errorMessage(body.detail)), { detail: body.detail, status: r.status });
   }
   return r.status === 204 ? null : r.json();
 };
@@ -295,6 +314,24 @@ const JEE_QUESTION_TYPES = [
   ["assertion_reason", "Assertion reason"],
   ["subjective", "Subjective"],
 ] as const;
+const locationParam = (name: string, fallback = "") => typeof window === "undefined" ? fallback : new URLSearchParams(window.location.search).get(name) || fallback;
+const replaceLocationParams = (values: Record<string,string>) => { const url=new URL(window.location.href);for(const [key,value] of Object.entries(values)){if(value)url.searchParams.set(key,value);else url.searchParams.delete(key);}window.history.replaceState({},"",url.pathname+url.search+url.hash); };
+const questionPublishable = (question: Question) => question.readiness?.publishable ?? (Boolean(question.approved) && !(question.interaction?.ingestion_issues || []).length);
+const questionNeedsAttention = (question: Question) => !questionPublishable(question);
+const questionReadinessLabel = (question: Question) => question.readiness?.content_valid === false ? "Blocked: needs repair" : questionPublishable(question) ? "Ready to publish" : "Awaiting review";
+const readyQuestionCount = (job: ImportJob) => job.readiness?.publishable ?? job.approved_count ?? 0;
+async function publishWithPreview(path: string, scope: string) {
+  const preview = await api(`${path}/publication-preview`);
+  const reasons = Object.entries(preview.blocking_reasons as Record<string, number>).map(([code, count]) => `${code.replaceAll("_", " ")}: ${count}`).join("\n");
+  if (!preview.eligible && !preview.already_published) throw new Error(`No eligible questions in ${scope}. ${preview.blocked} blocked. ${reasons}`);
+  if (!window.confirm(`Publish eligible questions in ${scope}?\n\n${preview.eligible} eligible\n${preview.blocked} blocked\n${preview.already_published} already published${reasons ? `\n\nBlocking reasons (a question may have several):\n${reasons}` : ""}\n\nThe server will revalidate before publishing. Blocked questions remain excluded.`)) return null;
+  return api(`${path}/publish`, { method: "POST" });
+}
+function publicationMessage(result: any) {
+  const publication = result.publication;
+  return publication ? `${publication.published_count} questions published; ${publication.blocked} blocked; ${publication.already_published} already published.${publication.partial ? " Review the blocked questions before releasing them." : ""}` : "Publication completed.";
+}
+
 function Card({
   children,
   className = "",
@@ -332,7 +369,7 @@ function Notice({
   children: React.ReactNode;
   kind?: "info" | "error" | "success";
 }) {
-  return <p className={`notice ${kind}`}>{children}</p>;
+  return <p className={`notice ${kind}`} role={kind === "error" ? "alert" : "status"}>{children}</p>;
 }
 
 export function Portal() {
@@ -340,6 +377,7 @@ export function Portal() {
     [error, setError] = useState(""),
     [view, setView] = useState<
       | "home"
+      | "teacher-detail"
       | "import"
       | "reviews"
       | "builder"
@@ -349,6 +387,7 @@ export function Portal() {
       | "exam"
       | "result"
     >("home"),
+    [supportTeacher,setSupportTeacher]=useState<string|null>(null),
     [tests, setTests] = useState<Test[]>([]),
     [questions, setQuestions] = useState<Question[]>([]),
     [questionCount, setQuestionCount] = useState(0),
@@ -399,6 +438,9 @@ export function Portal() {
     if (version !== sessionVersion.current) return;
     setUser(me);
     if (me.role === "admin") {
+      const teacherPath=window.location.pathname.match(/^\/admin\/teachers\/([^/]+)$/);
+      if(teacherPath){setSupportTeacher(decodeURIComponent(teacherPath[1]));setView("teacher-detail");}
+      else if (window.location.pathname.startsWith("/admin/banks") || readBankLocation(window.location.pathname, window.location.hash)) setView("bank-import");
       setAdmin(await api("/admin/dashboard"));
     } else if (me.role === "teacher") {
       const [loadedTests, loadedQuestions, loadedClasses] = await Promise.all([
@@ -478,7 +520,7 @@ export function Portal() {
               <input name="email" type="email" autoComplete="email" required />
             </div>
             <div>
-              <label>5-digit access code</label>
+              <label htmlFor="teacher-access-code">5-digit access code</label>
               <input
                 name="access_code"
                 inputMode="numeric"
@@ -561,11 +603,12 @@ export function Portal() {
       return false;
     }
   };
+  if (user.role!=="admin" && typeof window!=="undefined" && window.location.pathname.startsWith("/admin/")) return <main className="page"><h1>Administrator access required</h1><p>This support workspace is restricted to administrators.</p><a href="/">Return to your dashboard</a></main>;
   return (
     <main>
       {view !== "exam" && (
         <header>
-          <button className="logo" onClick={() => setView("home")}>
+          <button className="logo" onClick={() => { if(user.role==="admin")window.location.assign("/");else setView("home"); }}>
             Test<span>Now</span>
           </button>
           <nav>
@@ -584,8 +627,8 @@ export function Portal() {
             )}
             {user.role === "admin" && (
               <>
-                <button className={view === "home" ? "active" : ""} onClick={() => setView("home")}>Admin dashboard</button>
-                <button className={view === "bank-import" ? "active" : ""} onClick={() => setView("bank-import")}>
+                <button className={view === "home" ? "active" : ""} onClick={() => window.location.assign("/")}>Admin dashboard</button>
+                <button className={view === "bank-import" ? "active" : ""} onClick={() => {if(view==="teacher-detail")window.location.assign("/admin/banks");else{window.history.pushState({},"","/admin/banks");setView("bank-import");}}}>
                   Question banks
                 </button>
               </>
@@ -702,6 +745,7 @@ export function Portal() {
         />
       )}
       {view === "bank-import" && <QuestionBankManager notify={setMessage} />}
+      {view === "teacher-detail" && user.role === "admin" && supportTeacher && <TeacherSupport teacherId={supportTeacher} api={api}/>}
       {view === "builder" && (
         <Builder
           initialQuestions={questions}
@@ -951,6 +995,7 @@ function AdminHome({
     }
   };
   const toggle = async (teacher: AdminDashboard["teachers"][number]) => {
+    if(!window.confirm(`${teacher.status==="suspended"?"Reactivate":"Suspend"} ${teacher.name} (${teacher.email})? ${teacher.status==="suspended"?"Sign-in will be restored.":"Sign-in will be blocked and existing sessions revoked."} Tests and attempts are preserved.`))return;
     try {
       await api(`/admin/teachers/${teacher.id}`, {
         method: "PUT",
@@ -995,17 +1040,19 @@ function AdminHome({
         <h2>Add teacher</h2>
         <form onSubmit={create} className="stacked-form compact-form">
           <div>
-            <label>Name</label>
-            <input name="name" required />
+            <label htmlFor="teacher-name">Name</label>
+            <input id="teacher-name" name="name" autoComplete="name" required />
           </div>
           <div>
-            <label>Email</label>
-            <input name="email" type="email" required />
+            <label htmlFor="teacher-email">Email</label>
+            <input id="teacher-email" name="email" type="email" autoComplete="email" required />
           </div>
           <div>
-            <label>5-digit access code</label>
+            <label htmlFor="teacher-access-code">5-digit access code</label>
             <input
+              id="teacher-access-code"
               name="access_code"
+              autoComplete="off"
               inputMode="numeric"
               pattern="[0-9]{5}"
               maxLength={5}
@@ -1038,7 +1085,7 @@ function AdminHome({
                 {dashboard.teachers.map((teacher) => (
                   <tr key={teacher.id}>
                     <td>
-                      <b>{teacher.name}</b>
+                      <a href={`/admin/teachers/${encodeURIComponent(teacher.id)}`}>{teacher.name}</a>
                       <small>{teacher.email}</small>
                     </td>
                     <td>
@@ -2740,8 +2787,13 @@ function StudentHome({
   );
 }
 function FolderInput({ name }: { name: string; required?: boolean }) {
+  const [selected, setSelected] = useState<Record<string, string[]>>({});
   return (
-    <div className="file-pickers">
+    <div className="file-pickers" onChange={(event) => {
+      const input = event.target as HTMLInputElement;
+      const key = input.hasAttribute("webkitdirectory") ? "folder" : "files";
+      setSelected((current) => ({ ...current, [key]: Array.from(input.files || []).map((file) => file.webkitRelativePath || file.name) }));
+    }}>
       <label>
         <small>Choose files</small>
         <input name={name} type="file" accept=".pdf,.docx" multiple />
@@ -2761,8 +2813,30 @@ function FolderInput({ name }: { name: string; required?: boolean }) {
           }}
         />
       </label>
+      {Object.values(selected).flat().length > 0 && <ul className="selected-upload-files" aria-label="Selected files" aria-live="polite">{Object.entries(selected).flatMap(([group, files]) => files.map((filename, index) => <li key={`${group}-${index}`}>{filename}</li>))}</ul>}
     </div>
   );
+}
+
+function ImportIssues({ job, stage }: { job: ImportJob; stage: "extraction" | "generation" }) {
+  const [expanded, setExpanded] = useState(false), [page, setPage] = useState(1), [report, setReport] = useState<any>(null), [error, setError] = useState("");
+  const total = stage === "extraction" ? job.errors_total ?? job.errors?.length ?? 0 : job.meta?.solution_generation?.failed ?? job.meta?.solution_generation?.errors?.length ?? 0;
+  useEffect(() => {
+    if (!expanded || !job.bank_id) return;
+    const controller = new AbortController(); setError(""); setReport(null);
+    api(`/admin/question-banks/${job.bank_id}/imports/${job.id}/issues?stage=${stage}&page=${page}&page_size=20`, { signal: controller.signal }).then(setReport).catch((error) => { if (error.name !== "AbortError") setError(error.message); });
+    return () => controller.abort();
+  }, [expanded, job.bank_id, job.id, stage, page, total]);
+  if (!total) return null;
+  const entries = report?.items || [];
+  return <details className="import-error-log" onToggle={(event) => { if (event.target === event.currentTarget) setExpanded(event.currentTarget.open); }}>
+    <summary>{stage === "extraction" ? "Extraction issues" : "Generation failures"} ({total})</summary>
+    {error ? <Notice kind="error">{error}</Notice> : !report ? <p role="status">Loading diagnostics…</p> : <>
+      <p>Showing {entries.length ? (page - 1) * report.page_size + 1 : 0}–{Math.min(page * report.page_size, report.available_total)} of {report.total}. {report.legacy_logs_missing ? `${report.total - report.available_total} older messages were not retained by the previous worker.` : ""}</p>
+      <ul tabIndex={0} aria-label={`${stage} issue details`}>{entries.map((entry: any, index: number) => <li key={`${entry.question_id || entry.page || "job"}-${index}`}>{entry.question_id && <a href={bankUrl({ bankId: job.bank_id!, documentId: job.id, questionId: entry.question_id })}>Question {entry.source_number || entry.question_id}</a>}{entry.page ? ` Page ${entry.page}${entry.end_page && entry.end_page !== entry.page ? `–${entry.end_page}` : ""}: ` : " "}{entry.message}</li>)}</ul>
+      <div className="diagnostic-pagination"><button type="button" className="secondary-action" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous issues</button><button type="button" className="secondary-action" disabled={!report.has_more} onClick={() => setPage(page + 1)}>Next issues</button></div>
+    </>}
+  </details>;
 }
 
 function BankImportStatus({
@@ -2790,7 +2864,16 @@ function BankImportStatus({
   onGenerate: (job: ImportJob) => void;
   onApproveGenerated: (job: ImportJob) => void;
 }) {
-  const groups = (jobs || []).reduce<Record<string, ImportJob[]>>(
+  const [query,setQuery]=useState(()=>locationParam("source_q")), [status,setStatus]=useState(()=>locationParam("source_state","all")), [subjectFilter,setSubjectFilter]=useState(()=>locationParam("source_subject","all")), [sort,setSort]=useState("source"), [order,setOrder]=useState<string[]>([]);
+  const subjects=Array.from(new Set((jobs||[]).map(job=>job.meta?.subject||"Unclassified")));
+  const refreshOrder=(value=sort)=>{
+    setSort(value);
+    const sorted=[...(jobs||[])].sort((a,b)=>value==="filename"?(a.filename||"").localeCompare(b.filename||""):value==="issues"?(b.readiness?.needs_attention||0)-(a.readiness?.needs_attention||0):value==="activity"?String(b.lifecycle?.last_activity_at||"").localeCompare(String(a.lifecycle?.last_activity_at||"")):0);
+    setOrder(sorted.map(job=>job.id));
+  };
+  const visible=(jobs||[]).filter(job=>(job.filename||"").toLowerCase().includes(query.trim().toLowerCase())&&(subjectFilter==="all"||(job.meta?.subject||"Unclassified")===subjectFilter)&&(status==="all"||(status==="attention"?(job.status==="failed"||Boolean(job.readiness?.needs_attention)||Boolean(job.meta?.solution_generation?.failed)||Boolean(job.errors_total)):status==="active"?["queued","running","pause_requested","cancellation_requested"].includes(job.lifecycle?.state||""):job.lifecycle?.state===status)));
+  if(order.length)visible.sort((a,b)=>{const left=order.indexOf(a.id),right=order.indexOf(b.id);return(left<0?order.length:left)-(right<0?order.length:right);});
+  const groups = visible.reduce<Record<string, ImportJob[]>>(
     (all, job) => {
       const subject = job.meta?.subject || "Unclassified";
       (all[subject] ||= []).push(job);
@@ -2799,9 +2882,9 @@ function BankImportStatus({
     {},
   );
   const allJobs = jobs || [],
-    failed = allJobs.filter((job) => job.status === "failed").length,
+    failed = allJobs.filter((job) => job.status === "failed" || Boolean(job.readiness?.needs_attention) || Boolean(job.errors_total) || Boolean(job.meta?.solution_generation?.failed)).length,
     active = allJobs.filter(
-      (job) => job.status === "uploaded" || job.status === "processing",
+      (job) => ["queued", "running", "pause_requested", "cancellation_requested"].includes(job.lifecycle?.state || ""),
     ).length;
   return (
     <Card className="import-dashboard">
@@ -2815,16 +2898,18 @@ function BankImportStatus({
           </p>
         </div>
         <div className="import-summary">
-          <span>
-            <b>{allJobs.length}</b> total
-          </span>
-          <span className={failed ? "needs-action" : ""}>
-            <b>{failed}</b> need attention
-          </span>
-          <span>
-            <b>{active}</b> in progress
-          </span>
+          <button type="button" className="secondary-action" onClick={()=>setStatus("all")}><b>{allJobs.length}</b> documents</button>
+          <button type="button" className="secondary-action" onClick={()=>setStatus("attention")}><b>{failed}</b> documents need attention</button>
+          <button type="button" className="secondary-action" onClick={()=>setStatus("active")}><b>{active}</b> in progress</button>
         </div>
+      </div>
+      <div className="import-monitor-filters">
+        <label>Find source<input type="search" value={query} onChange={event=>{setQuery(event.target.value);replaceLocationParams({source_q:event.target.value});}} placeholder="Filename"/></label>
+        <label>Subject<select value={subjectFilter} onChange={event=>{setSubjectFilter(event.target.value);replaceLocationParams({source_subject:event.target.value});}}><option value="all">All subjects</option>{subjects.map(subject=><option key={subject}>{subject}</option>)}</select></label>
+        <label>State<select value={status} onChange={event=>{setStatus(event.target.value);replaceLocationParams({source_state:event.target.value});}}>{["all","attention","active","queued","running","pause_requested","paused","cancellation_requested","cancelled","completed","failed"].map(value=><option key={value} value={value}>{value.replaceAll("_"," ")}</option>)}</select></label>
+        <label>Order<select value={sort} onChange={event=>refreshOrder(event.target.value)}><option value="source">Source order</option><option value="filename">Filename</option><option value="activity">Last activity</option><option value="issues">Questions needing attention</option></select></label>
+        <button type="button" className="secondary-action" onClick={()=>refreshOrder()}>Refresh ordering</button>
+        <small>{visible.length} matching documents. Status counts can overlap; updates preserve the chosen ordering.</small>
       </div>
       {Object.keys(groups).length ? (
         Object.entries(groups).map(([subject, items]) => (
@@ -2839,9 +2924,9 @@ function BankImportStatus({
               const generation = job.meta?.solution_generation;
               const generationActive = generation?.status === "queued" || generation?.status === "running";
               const generationComplete = generation?.status === "completed" || generation?.status === "completed_with_errors";
-              const paused = Boolean(job.meta?.pause_requested),
-                running =
-                  job.status === "uploaded" || job.status === "processing",
+              const state = job.lifecycle?.state || (job.status === "processing" ? "running" : job.status === "uploaded" ? "queued" : job.status);
+              const paused = state === "paused",
+                running = ["queued", "running", "pause_requested", "cancellation_requested"].includes(state),
                 pageProgress = job.meta?.total_pages
                   ? `${job.meta.processed_pages || 0}/${job.meta.total_pages} pages checked`
                   : "";
@@ -2888,104 +2973,106 @@ function BankImportStatus({
                           {job.error}
                         </p>
                       )}
-                      {job.errors?.length ? <details className="import-error-log">
-                        <summary>Recent extraction issues ({job.errors.length})</summary>
-                        <p>{job.meta?.failed_pages?.length || job.errors.length} source page range{(job.meta?.failed_pages?.length || job.errors.length) === 1 ? "" : "s"} skipped. Questions may be missing from those ranges; extraction is continuing.</p>
-                        <ul>{job.errors.map((error,index)=><li key={`${error.page||"job"}-${index}`}>
-                          {error.page ? error.end_page && error.end_page > error.page ? `Pages ${error.page}–${error.end_page}: ` : `Page ${error.page}: ` : ""}{error.message}
-                        </li>)}</ul>
-                      </details> : null}
+                      <ImportIssues job={job} stage="extraction" />
+                      {job.lifecycle?.heartbeat_at && <small>Worker last active: {fmtDate(job.lifecycle.heartbeat_at)}</small>}
                       {generation && (
                         <div className="generation-progress" aria-live="polite">
-                          <div><span>{generation.phase || "Solution generation"}</span><b>{generation.processed || 0}/{generation.total || 0}</b></div>
+                          <div><span>{generation.phase || "Solution generation"}</span><b>{generation.processed || 0}/{generation.total || 0} questions attempted</b></div>
                           <progress max={Math.max(1, generation.total || 1)} value={generation.processed || 0} />
                           <small>{generation.succeeded || 0} generated · {generation.failed || 0} failed{generation.approved ? ` · ${generation.approved} approved` : ""}</small>
                           {generation.error && <p className="import-error">{generation.error}</p>}
-                          {!!generation.errors?.length && <details className="import-error-log"><summary>Generation failures ({generation.errors.length})</summary><ul>{generation.errors.map((entry,index)=><li key={`${entry.question_id || index}`}>{entry.source_number ? `Question ${entry.source_number}: ` : ""}{entry.message}</li>)}</ul></details>}
+                          <ImportIssues job={job} stage="generation" />
                         </div>
                       )}
                     </div>
                   </div>
                   <div className="import-controls">
                     <span
-                      className={`badge ${job.published ? "published" : job.status}`}
+                      className={`badge ${job.status}`}
                     >
-                      {job.published ? "live" : paused ? "paused" : job.status}
+                      {state.replaceAll("_", " ")}
                     </span>
-                    {failedJob && !job.meta?.cancel_requested && (
-                      <button type="button" onClick={() => onRetry(job)}>
-                        Retry import
-                      </button>
-                    )}
+                    {job.published && <span className="badge published">Published</span>}
                     <button
                       type="button"
-                      className="secondary-action"
+                      className="import-primary-action"
+                      data-import-review={job.id}
                       onClick={() => onInspect(job)}
                     >
                       {job.status === "review" ? "Review" : "Inspect"}
                     </button>
-                    {!job.published && !running && Boolean(job.generation_eligible_count) && !generationActive && (
-                      <button type="button" onClick={() => onGenerate(job)}>
-                        {generation?.status === "failed" || generation?.status === "completed_with_errors" ? "Retry missing generation" : "Generate missing answers & solutions"}
-                      </button>
-                    )}
-                    {!job.published && generationComplete && Boolean(generation?.succeeded) && !generation?.approved_at && (
-                      <button type="button" onClick={() => onApproveGenerated(job)}>Approve all generated</button>
-                    )}
-                    {!job.published && Boolean(job.approved_count) && (
-                      <button type="button" onClick={() => onPublish(job)}>
-                        {job.status === "approved" ? "Confirm & publish" : "Publish extracted questions"}
-                      </button>
-                    )}
-                    {running && !paused && (
-                      <button
-                        type="button"
-                        className="quiet-action"
-                        onClick={() => onPause(job)}
-                      >
-                        Pause
-                      </button>
-                    )}
-                    {paused && (
-                      <button
-                        type="button"
-                        className="quiet-action"
-                        onClick={() => onResume(job)}
-                      >
-                        Resume
-                      </button>
-                    )}
-                    {running && !job.meta?.cancel_requested && (
-                      <button
-                        type="button"
-                        className="icon-danger"
-                        title="Stop import"
-                        aria-label={`Stop ${job.filename || "import"}`}
-                        onClick={() => onCancel(job)}
-                      >
-                        ×
-                      </button>
-                    )}
-                    {canManageStoredOutput && !job.published && (
-                      <button
-                        type="button"
-                        className="secondary-action"
-                        title="Clear this material's extracted questions and run the stored file through ingestion again"
-                        onClick={() => onReextract(job)}
-                      >
-                        Re-extract material
-                      </button>
-                    )}
-                    <button
-                        type="button"
-                        className="text-danger"
-                        title={job.meta?.delete_requested ? "Deletion will complete after the current page batch" : "Delete this source material and every extracted question"}
-                        aria-label={`Delete ${job.filename || "import"}`}
-                        disabled={Boolean(job.meta?.delete_requested)}
-                        onClick={() => onDelete(job)}
-                      >
-                        {job.meta?.delete_requested ? "Deleting…" : "Delete material"}
-                    </button>
+                    <details className="import-secondary-actions">
+                      <summary>More actions</summary>
+                      <div className="import-secondary-action-list">
+                        {failedJob && !job.meta?.cancel_requested && (
+                          <button type="button" onClick={() => onRetry(job)}>
+                            Retry import
+                          </button>
+                        )}
+                        {!job.published && !running && Boolean(job.generation_eligible_count) && !generationActive && (
+                          <button type="button" onClick={() => onGenerate(job)}>
+                            {generation?.status === "failed" || generation?.status === "completed_with_errors" ? "Retry missing generation" : "Generate missing answers & solutions"}
+                          </button>
+                        )}
+                        {!job.published && generationComplete && Boolean(generation?.succeeded) && !generation?.approved_at && (
+                          <button type="button" onClick={() => onApproveGenerated(job)}>Approve all generated</button>
+                        )}
+                        {!job.published && Boolean(readyQuestionCount(job)) && (
+                          <button type="button" onClick={() => onPublish(job)}>
+                            {job.status === "approved" ? "Confirm & publish" : "Publish extracted questions"}
+                          </button>
+                        )}
+                        {["queued", "running"].includes(state) && (
+                          <button
+                            type="button"
+                            className="quiet-action"
+                            onClick={() => onPause(job)}
+                          >
+                            Pause
+                          </button>
+                        )}
+                        {paused && (
+                          <button
+                            type="button"
+                            className="quiet-action"
+                            onClick={() => onResume(job)}
+                          >
+                            Resume
+                          </button>
+                        )}
+                        {["queued", "running", "pause_requested", "paused"].includes(state) && (
+                          <button
+                            type="button"
+                            className="icon-danger"
+                            title="Stop import"
+                            aria-label={`Stop ${job.filename || "import"}`}
+                            onClick={() => onCancel(job)}
+                          >
+                            ×
+                          </button>
+                        )}
+                        {canManageStoredOutput && !job.published && (
+                          <button
+                            type="button"
+                            className="secondary-action"
+                            title="Clear this material's extracted questions and run the stored file through ingestion again"
+                            onClick={() => onReextract(job)}
+                          >
+                            Re-extract material
+                          </button>
+                        )}
+                        <button
+                            type="button"
+                            className="text-danger"
+                            title={job.meta?.delete_requested ? "Deletion will complete after the current page batch" : "Delete this source material and every extracted question"}
+                            aria-label={`Delete ${job.filename || "import"}`}
+                            disabled={Boolean(job.meta?.delete_requested)}
+                            onClick={() => onDelete(job)}
+                          >
+                            {job.meta?.delete_requested ? "Deleting…" : "Delete material"}
+                        </button>
+                      </div>
+                    </details>
                   </div>
                 </article>
               );
@@ -2996,11 +3083,8 @@ function BankImportStatus({
         <div className="empty-imports">
           <span>↑</span>
           <div>
-            <b>No source documents yet</b>
-            <p>
-              Upload a question paper or solutions file to begin building this
-              bank.
-            </p>
+            <b>{allJobs.length ? "No documents match these filters" : "No source documents yet"}</b>
+            <p>{allJobs.length ? "Change the filename, subject or state filter." : "Open Add sources to upload a question document."}</p>
           </div>
         </div>
       )}
@@ -3009,10 +3093,12 @@ function BankImportStatus({
 }
 
 function QuestionBankManager({
-  notify,
+  notify: reportGlobal,
 }: {
   notify: (message: string) => void;
 }) {
+  const [operationMessage,setOperationMessage]=useState("");
+  const notify=(message:string)=>{setOperationMessage(message);reportGlobal(message);};
   const [banks, setBanks] = useState<Bank[]>([]),
     [bankQuery, setBankQuery] = useState(""),
     [bankStatus, setBankStatus] = useState("all"),
@@ -3031,68 +3117,140 @@ function QuestionBankManager({
       loaded: number;
       total: number;
     } | null>(null);
+  const uploadFormRef=useRef<HTMLFormElement>(null);
+  const [uploadConfig,setUploadConfig]=useState<UploadConfig|null>(null), [uploadReview,setUploadReview]=useState<ReturnType<typeof reviewUploads>>([]), [uploadOutcomes,setUploadOutcomes]=useState<any[]>([]);
+  useEffect(()=>{api("/admin/import-config").then(setUploadConfig).catch((error)=>setError(error.message));},[]);
+  const reviewUploadForm=(form:HTMLFormElement)=>{
+    if(!uploadConfig)return;
+    const files=(name:string)=>Array.from(form.querySelectorAll<HTMLInputElement>(`input[name="${name}"][type="file"]`)).flatMap(input=>Array.from(input.files||[]));
+    setUploadReview(reviewUploads(files("question_files"),files("answer_files"),uploadConfig));setUploadOutcomes([]);
+  };
+  const [removedBanks,setRemovedBanks]=useState<Bank[]>([]);
+  const showRemoved=async()=>{try{setRemovedBanks((await api("/admin/question-banks?include_deleted=true")).filter((bank:Bank)=>bank.status==="deleted"));}catch(error:any){setError(error.message);}};
+  const restoreBank=async(bank:Bank)=>{if(!window.confirm(`Restore ${bank.name} (${bank.id}) with its prior visibility? Content readiness remains enforced.`))return;try{await api(`/admin/question-banks/${bank.id}/restore`,{method:"POST"});await load();await showRemoved();notify("Bank restored. Content readiness checks remain in effect.");}catch(error:any){setError(error.message);}};
+  const [workspace,setWorkspace]=useState<"add"|"monitor"|"review">(()=>["add","review"].includes(locationParam("task"))?locationParam("task") as "add"|"review":"monitor");
+  useEffect(()=>{if(uploadConfig&&uploadFormRef.current)reviewUploadForm(uploadFormRef.current);},[uploadConfig,workspace]);
+  const bankRequests = useRef(new LatestRequest()), documentRequests = useRef(new LatestRequest());
+  const activeBank = useRef<string | null>(null), activeDocument = useRef<string | null>(null);
+  const editingQuestionRef=useRef(editingQuestion);editingQuestionRef.current=editingQuestion;
+  const dirtyQuestion = useRef(false), lastUrl = useRef(""), restoreSequence = useRef(0);
+  const [loadingBank, setLoadingBank] = useState(false), [stale, setStale] = useState(false), [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const canLeave = () => !dirtyQuestion.current || window.confirm("Discard unsaved question edits?");
+  const navigateTo = (documentId?: string, questionId?: string, replace = false) => {
+    if (!activeBank.current) return;
+    const url = bankUrl({ bankId: activeBank.current, documentId, questionId }) + window.location.search;
+    window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+    lastUrl.current = url;
+  };
   const load = async () => setBanks(await api("/admin/question-banks"));
-  const open = async (id: string) => {
-    setError("");
-    const changingBank = detail?.id !== id;
-    setDetail(await api(`/admin/question-banks/${id}`));
-    setEditing(false);
-    setEditingQuestion(null);
-    if (changingBank || editingQuestion) {
-      setSelectedImport(null);
-      setSelectedQuestions(null);
+  const open = async (id: string, updateUrl = true) => {
+    const changing = activeBank.current !== id;
+    if (changing && !canLeave()) return;
+    const request = bankRequests.current.start(id);
+    activeBank.current = id;
+    setError(""); setLoadingBank(true); setStale(false);
+    if (changing) {
+      documentRequests.current.cancel(); activeDocument.current = null; dirtyQuestion.current = false;
+      setDetail(null); setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); setFigureRevalidation(null);setFigureEditing(false);
+      if (updateUrl) navigateTo();
     }
+    try {
+      const bank = await api(`/admin/question-banks/${id}`, { signal: request.signal });
+      if (!request.current()) return;
+      setDetail(bank); setLastUpdated(new Date().toISOString()); setEditing(false);
+      return bank;
+    } catch (error: any) {
+      if (request.current() && error.name !== "AbortError") { setError(error.message); setStale(!changing); }
+    } finally { if (request.current()) setLoadingBank(false); }
+  };
+  const restoreLocation = async () => {
+    if (!canLeave()) { window.history.pushState({}, "", lastUrl.current); return; }
+    const location = readBankLocation(window.location.pathname, window.location.hash);
+    if (!location) { documentRequests.current.cancel(); setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); return; }
+    dirtyQuestion.current = false;setFigureEditing(false);
+    if(location.documentId!==activeDocument.current){setSelectedImport(null);setEditingQuestion(null);}
+    const sequence = ++restoreSequence.current;
+    const bank = await open(location.bankId, false);
+    if (!bank || sequence !== restoreSequence.current || activeBank.current !== location.bankId) return;
+    const documentRequest = documentRequests.current.start(`${location.bankId}/${location.documentId || ""}`);
+    activeDocument.current = location.documentId || null;
+    lastUrl.current = window.location.pathname + window.location.search;
+    if (!location.documentId) {
+      setSelectedImport(null);setSelectedQuestions(null);
+      if(location.questionId){setWorkspace("review");try{const question=await api(`/admin/question-banks/${location.bankId}/questions/${location.questionId}`,{signal:documentRequest.signal});if(documentRequest.current())setEditingQuestion(question);}catch(error:any){if(documentRequest.current()&&error.name!=="AbortError")setError(error.message);}}
+      else setEditingQuestion(null);
+      return;
+    }
+    try {
+      const report = await api(`/admin/question-banks/${location.bankId}/imports/${location.documentId}`, { signal: documentRequest.signal });
+      if (!documentRequest.current() || activeBank.current !== location.bankId) return;
+      setSelectedImport(report); setSelectedQuestions(report.questions || []);
+      const selected = location.questionId ? await api(`/admin/question-banks/${location.bankId}/imports/${location.documentId}/questions/${location.questionId}`, { signal: documentRequest.signal }) : null;
+      if (documentRequest.current()) setEditingQuestion(selected);
+    } catch (error: any) { if (documentRequest.current() && error.name !== "AbortError") setError(error.message); }
   };
   useEffect(() => {
-    load().catch((e) => setError(e.message));
+    load().catch((error) => setError(error.message));
+    void restoreLocation();
+    const navigate = () => { void restoreLocation(); };
+    const leaving = (event: BeforeUnloadEvent) => { if (dirtyQuestion.current) { event.preventDefault(); event.returnValue = ""; } };
+    window.addEventListener("popstate", navigate); window.addEventListener("hashchange", navigate); window.addEventListener("beforeunload", leaving);
+    return () => { bankRequests.current.cancel(); documentRequests.current.cancel(); window.removeEventListener("popstate", navigate); window.removeEventListener("hashchange", navigate); window.removeEventListener("beforeunload", leaving); };
   }, []);
   useEffect(() => {
-    const match=window.location.hash.match(/^#bank=([^&]+)&document=(.+)$/);
-    if (!match || detail || selectedImport) return;
-    const bankId=decodeURIComponent(match[1]), documentId=decodeURIComponent(match[2]);
-    Promise.all([api(`/admin/question-banks/${bankId}`),api(`/admin/question-banks/${bankId}/imports/${documentId}`)])
-      .then(([bank,report])=>{setDetail(bank);setSelectedImport(report);setSelectedQuestions(report.questions||[]);})
-      .catch((e)=>setError(e.message));
-  }, [detail,selectedImport]);
-  useEffect(() => {
-    const navigate=()=>{if(!window.location.hash.includes("&document=")){setSelectedImport(null);setSelectedQuestions(null);setEditingQuestion(null);}};
-    window.addEventListener("popstate",navigate);
-    return()=>window.removeEventListener("popstate",navigate);
-  }, []);
-  useEffect(() => {
-    const active = detail?.imports?.some(
-      (job) =>
-        ((job.status === "uploaded" || job.status === "processing") &&
-        !job.meta?.pause_requested) || ["queued", "running"].includes(job.meta?.solution_generation?.status || ""),
-    );
-    if (!detail?.id || !active || figureEditing) return;
-    const timer = window.setInterval(() => {
-      api(`/admin/question-banks/${detail.id}`)
-        .then(setDetail)
-        .catch((e) => setError(e.message));
-      load().catch(() => {});
+    const bankId = detail?.id;
+    const active = detail?.imports?.some((job) => ["queued", "running", "pause_requested", "cancellation_requested"].includes(job.lifecycle?.state || "") || ["queued", "running"].includes(job.meta?.solution_generation?.status || ""));
+    if (!bankId || !active || figureEditing || loadingBank) return;
+    let cancelled = false, inFlight = false;
+    const timer = window.setInterval(async () => {
+      if (inFlight) return; inFlight = true;
+      try {
+        const bank = await api(`/admin/question-banks/${bankId}`);
+        if (!cancelled && activeBank.current === bankId) { setDetail(bank); setStale(false); setLastUpdated(new Date().toISOString()); }
+        const current=editingQuestionRef.current;
+        if(!cancelled&&activeBank.current===bankId&&current&&!dirtyQuestion.current&&["queued","running"].includes(current.interaction?.solution_generation?.status||"")){
+          const refreshed=await api(`/admin/question-banks/${bankId}/questions/${current.id}`);
+          if(!cancelled&&activeBank.current===bankId&&editingQuestionRef.current?.id===current.id&&!dirtyQuestion.current)setEditingQuestion(refreshed);
+        }
+      } catch (error: any) { if (!cancelled && activeBank.current === bankId) { setStale(true); setError(error.message); } }
+      finally { inFlight = false; }
     }, 3000);
-    return () => window.clearInterval(timer);
-  }, [detail?.id, detail?.imports, figureEditing]);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [detail?.id, detail?.imports, figureEditing, loadingBank]);
   useEffect(() => {
-    const generation = selectedImport?.meta?.solution_generation;
-    if (!detail?.id || !selectedImport?.id || !generation || !["queued", "running"].includes(generation.status)) return;
-    const timer = window.setInterval(() => {
-      api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}`)
-        .then((report) => { setSelectedImport(report); setSelectedQuestions(report.questions || []); })
-        .catch((e) => setError(e.message));
+    const bankId = detail?.id, documentId = selectedImport?.id;
+    const active = selectedImport && (["queued", "running", "pause_requested", "cancellation_requested"].includes(selectedImport.lifecycle?.state || "") || ["queued", "running"].includes(selectedImport.meta?.solution_generation?.status || ""));
+    if (!bankId || !documentId || !active || figureEditing) return;
+    let cancelled = false, inFlight = false;
+    const timer = window.setInterval(async () => {
+      if (inFlight) return; inFlight = true;
+      try {
+        const report = await api(`/admin/question-banks/${bankId}/imports/${documentId}`);
+        if (!cancelled && activeBank.current === bankId && activeDocument.current === documentId && !dirtyQuestion.current) { setSelectedImport(report); setSelectedQuestions(report.questions || []); }
+      } catch (error: any) { if (!cancelled && activeDocument.current === documentId) { setStale(true); setError(error.message); } }
+      finally { inFlight = false; }
     }, 3000);
-    return () => window.clearInterval(timer);
-  }, [detail?.id, selectedImport?.id, selectedImport?.meta?.solution_generation?.status]);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [detail?.id, selectedImport?.id, selectedImport?.lifecycle?.state, selectedImport?.meta?.solution_generation?.status, figureEditing]);
   useEffect(() => {
-    if (!detail?.id || !figureRevalidation || !["queued", "running"].includes(figureRevalidation.status)) return;
-    const timer = window.setInterval(() => {
-      api(`/admin/question-banks/${detail.id}/figure-revalidation`).then(setFigureRevalidation).catch((e) => setError(e.message));
-    }, 3000);
-    return () => window.clearInterval(timer);
+    const bankId = detail?.id;
+    if (!bankId || !figureRevalidation || !["queued", "running"].includes(figureRevalidation.status)) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => { api(`/admin/question-banks/${bankId}/figure-revalidation`).then((run) => { if (!cancelled && activeBank.current === bankId) setFigureRevalidation(run); }).catch((error) => { if (!cancelled && activeBank.current === bankId) setError(error.message); }); }, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [detail?.id, figureRevalidation?.status]);
+  const editQuestion = (question: Question | null) => {
+    if (!canLeave()) return;
+    dirtyQuestion.current = false; setFigureEditing(false); setEditingQuestion(question);
+    navigateTo(activeDocument.current || undefined, question?.id);
+  };
+  const closeDocument = () => {
+    if (!canLeave()) return;
+    dirtyQuestion.current = false; setFigureEditing(false); activeDocument.current = null; documentRequests.current.cancel();
+    setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); navigateTo();
+  };
   const revalidateFigures = async () => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true); setError("");
     try {
       const run = await api(`/admin/question-banks/${detail.id}/figure-revalidation`, { method: "POST" });
@@ -3123,7 +3281,7 @@ function QuestionBankManager({
   };
   const saveBank = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     const form = e.currentTarget;
     setBusy(true);
     try {
@@ -3132,7 +3290,7 @@ function QuestionBankManager({
         body: JSON.stringify(Object.fromEntries(new FormData(form))),
       });
       await load();
-      await open(detail.id);
+      if (activeBank.current === detail.id) await open(detail.id);
       notify("Bank details saved.");
     } catch (e: any) {
       setError(e.message);
@@ -3142,18 +3300,21 @@ function QuestionBankManager({
   };
   const upload = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     const form = e.currentTarget;
+    if (!uploadConfig || uploadReview.some(file=>file.errors.length)) { setError("Correct the file validation errors before starting extraction."); return; }
     setBusy(true);
     setUploadProgress({ loaded: 0, total: 0 });
     try {
-      await uploadBankImport(detail.id, bankImportForm(form), (loaded, total) =>
+      const result = await uploadBankImport(detail.id, bankImportForm(form), (loaded, total) =>
         setUploadProgress({ loaded, total }),
       );
-      form.reset();
-      await open(detail.id);
+      setUploadOutcomes(result.outcomes || []);
+      const failed = (result.outcomes || []).some((outcome:any)=>outcome.status==="failed");
+      if (!failed) { form.reset(); setUploadReview([]); setWorkspace("monitor"); }
+      if (activeBank.current === detail.id) await open(detail.id);
       await load();
-      notify("Sources queued for extraction.");
+      notify(failed ? "Some files failed. Successful sources were retained; correct and retry the failed files." : "Sources queued for extraction.");
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -3162,14 +3323,14 @@ function QuestionBankManager({
     }
   };
   const retryImport = async (job: ImportJob) => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true);
     setError("");
     try {
       await api(`/admin/question-banks/${detail.id}/imports/${job.id}/retry`, {
         method: "POST",
       });
-      await open(detail.id);
+      if (activeBank.current === detail.id) await open(detail.id);
       notify(`${job.filename || "Source"} queued for retry.`);
     } catch (e: any) {
       setError(e.message);
@@ -3181,14 +3342,14 @@ function QuestionBankManager({
     job: ImportJob,
     action: "pause" | "resume" | "cancel",
   ) => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true);
     try {
       await api(
         `/admin/question-banks/${detail.id}/imports/${job.id}/${action}`,
         { method: "POST" },
       );
-      await open(detail.id);
+      if (activeBank.current === detail.id) await open(detail.id);
       notify(`${job.filename} ${action} requested.`);
     } catch (e: any) {
       setError(e.message);
@@ -3198,9 +3359,9 @@ function QuestionBankManager({
   };
   const deleteImport = async (job: ImportJob) => {
     if (
-      !detail ||
+      !detail || activeBank.current !== detail.id ||
       !window.confirm(
-        `Remove ${job.filename} and its extracted questions from this bank?`,
+        `Permanently delete ${job.filename} and its extracted questions from ${detail.name}? Assessment references are protected. Recovery requires uploading the original source again.`,
       )
     )
       return;
@@ -3210,7 +3371,7 @@ function QuestionBankManager({
         method: "DELETE",
       });
       setSelectedImport(null);
-      await open(detail.id);
+      if (activeBank.current === detail.id) await open(detail.id);
       await load();
       notify(job.status === "processing" || job.status === "uploaded" ? "Deletion requested. The material will disappear after its current page batch stops." : "Source removed from this bank.");
     } catch (e: any) {
@@ -3221,7 +3382,7 @@ function QuestionBankManager({
   };
   const reextractImport = async (job: ImportJob) => {
     if (
-      !detail ||
+      !detail || activeBank.current !== detail.id ||
       !window.confirm(
         `Re-extract ${job.filename}? Its current extracted questions will be replaced using the same stored source file.`,
       )
@@ -3234,7 +3395,7 @@ function QuestionBankManager({
         method: "POST",
       });
       setSelectedImport(null);
-      await open(detail.id);
+      if (activeBank.current === detail.id) await open(detail.id);
       notify(`${job.filename || "Source"} queued for clean re-extraction.`);
     } catch (e: any) {
       setError(e.message);
@@ -3243,15 +3404,14 @@ function QuestionBankManager({
     }
   };
   const publish = async () => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true);
     try {
-      await api(`/admin/question-banks/${detail.id}/publish`, {
-        method: "POST",
-      });
-      await open(detail.id);
+      const result = await publishWithPreview(`/admin/question-banks/${detail.id}`, detail.name);
+      if (!result) return;
+      if (activeBank.current === detail.id) await open(detail.id);
       await load();
-      notify("Question bank published to teachers.");
+      notify(publicationMessage(result));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -3259,16 +3419,15 @@ function QuestionBankManager({
     }
   };
   const publishImport = async (job: ImportJob) => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true);
     try {
-      await api(
-        `/admin/question-banks/${detail.id}/imports/${job.id}/publish`,
-        { method: "POST" },
-      );
-      await open(detail.id);
+      const result = await publishWithPreview(`/admin/question-banks/${detail.id}/imports/${job.id}`, job.filename || "this source document");
+      if (!result) return;
+      if (activeBank.current === detail.id) await open(detail.id);
       await load();
-      notify(`${job.filename || "Source document"} is now live to teachers.`);
+      if(activeBank.current===detail.id&&activeDocument.current===job.id)setSelectedImport(await api(`/admin/question-banks/${detail.id}/imports/${job.id}`));
+      notify(publicationMessage(result));
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -3276,12 +3435,12 @@ function QuestionBankManager({
     }
   };
   const generateImportSolutions = async (job: ImportJob) => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true); setError("");
     try {
       const state = await api(`/admin/question-banks/${detail.id}/imports/${job.id}/solution-generation`, { method: "POST" });
       setSelectedImport((current) => current?.id === job.id ? { ...current, meta: { ...current.meta, solution_generation: state } } : current);
-      await open(detail.id);
+      if (activeBank.current === detail.id) await open(detail.id);
       notify(`${job.filename || "Source document"} queued for answer and solution generation.`);
     } catch (e: any) { setError(e.message); }
     finally { setBusy(false); }
@@ -3293,13 +3452,13 @@ function QuestionBankManager({
     try {
       const runId = job.meta.solution_generation.run_id;
       const result = await api(`/admin/question-banks/${detail.id}/imports/${job.id}/solution-generation/${runId}/approve`, { method: "POST" });
-      await open(detail.id); await load();
+      if (activeBank.current === detail.id) await open(detail.id); await load();
       notify(`${result.approved_count || 0} generated questions approved.`);
     } catch (e: any) { setError(e.message); }
     finally { setBusy(false); }
   };
   const revision = async () => {
-    if (!detail) return;
+    if (!detail || activeBank.current !== detail.id) return;
     setBusy(true);
     try {
       const bank: Bank = await api(
@@ -3317,8 +3476,8 @@ function QuestionBankManager({
   };
   const remove = async () => {
     if (
-      !detail ||
-      !window.confirm(`Remove ${detail.name} from the question-bank library?`)
+      !detail || activeBank.current !== detail.id ||
+      !window.confirm(`Hide ${detail.name} from the library? Content and assessment history are preserved. Restore it from Removed banks when needed.`)
     )
       return;
     setBusy(true);
@@ -3334,32 +3493,25 @@ function QuestionBankManager({
     }
   };
   const inspectImport = async (job: ImportJob) => {
-    if (!detail) return;
-    setBusy(true);
+    if (!detail || activeBank.current !== detail.id || !canLeave()) return;
+    const bankId = detail.id;
+    const request = documentRequests.current.start(`${bankId}/${job.id}`);
+    activeDocument.current = job.id; dirtyQuestion.current = false; setBusy(true); setError("");
     try {
-      const report = await api(
-        `/admin/question-banks/${detail.id}/imports/${job.id}`,
-      );
-      setSelectedImport(report);
-      setSelectedQuestions(report.questions || []);
-      setEditingQuestion(null);
-      window.history.pushState({},"",`#bank=${encodeURIComponent(detail.id)}&document=${encodeURIComponent(job.id)}`);
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
+      const report = await api(`/admin/question-banks/${bankId}/imports/${job.id}`, { signal: request.signal });
+      if (!request.current() || activeBank.current !== bankId) return;
+      setSelectedImport(report); setSelectedQuestions(report.questions || []); setEditingQuestion(null); navigateTo(job.id);
+    } catch (error: any) { if (request.current() && error.name !== "AbortError") setError(error.message); }
+    finally { if (request.current()) setBusy(false); }
   };
   const finishQuestionReview = async () => {
-    setFigureEditing(false);
-    setEditingQuestion(null);
-    if (!detail) return;
-    await open(detail.id);
-    if (selectedImport) {
-      const report = await api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}`);
-      setSelectedImport(report);
-      setSelectedQuestions(report.questions || []);
-    }
+    dirtyQuestion.current=false;setFigureEditing(false);
+    if(!detail||activeBank.current!==detail.id)return;
+    const questionId=editingQuestion?.id;
+    await open(detail.id,false);
+    if(activeBank.current!==detail.id)return;
+    if(selectedImport){const report=await api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}`);setSelectedImport(report);}
+    if(questionId){const updated=await api(`/admin/question-banks/${detail.id}/questions/${questionId}`);if(activeBank.current===detail.id)setEditingQuestion(updated);}
   };
   const deleteQuestion = async (question: Question) => {
     if (!detail || !selectedImport || !window.confirm(`Delete ${questionNumber(question.source_number)} as an invalid extracted question? This cannot be undone.`)) return;
@@ -3411,6 +3563,7 @@ function QuestionBankManager({
           </form>
         </Card>
         <Card className="bank-navigator">
+          <details><summary onClick={()=>void showRemoved()}>Removed banks and recovery</summary>{removedBanks.length?removedBanks.map(bank=><div key={bank.id}><span>{bank.name}</span><button type="button" className="secondary-action" onClick={()=>void restoreBank(bank)}>Restore {bank.name}</button></div>):<p>No removed banks found.</p>}</details>
           <div className="bank-navigator-header">
             <div className="bank-navigator-title">
               <h2>Banks</h2>
@@ -3443,6 +3596,7 @@ function QuestionBankManager({
                 type="button"
                 className={`bank-choice-row ${detail?.id === bank.id ? "selected" : ""}`}
                 key={bank.id}
+                disabled={busy}
                 onClick={() => open(bank.id)}
               >
                 <span>
@@ -3461,7 +3615,10 @@ function QuestionBankManager({
           </div>
         </Card>
       </div>
-      <section className="bank-detail-workspace">
+      <section className="bank-detail-workspace" aria-busy={loadingBank}>
+          {loadingBank && <Notice>Loading the requested bank…</Notice>}
+          {stale && <Notice kind="error">Refresh failed. Displayed data is stale. <button type="button" className="secondary-action" onClick={() => activeBank.current && open(activeBank.current)}>Retry refresh</button></Notice>}
+          {lastUpdated && detail && <small>Last successful update: {new Date(lastUpdated).toLocaleTimeString()}</small>}
           {detail ? (
             <>
               <Card>
@@ -3516,11 +3673,13 @@ function QuestionBankManager({
                     <button disabled={busy}>Save details</button>
                   </form>
                 )}
-                <p>Each source document stays private until confirmed. Publish all ready materials takes every fully reviewed document live; unfinished documents remain in review.</p>
+                <p>Each source document stays private until confirmed. Preview publication to see eligible, blocked and already published question counts. Only eligible questions become available for new tests.</p>
               </Card>
-              <Card className="bank-upload-card">
+              {detail.readiness && <Notice>Full bank: {detail.readiness.total} questions · {detail.readiness.publishable} ready · {detail.readiness.blocked} with blocking content issues · {detail.readiness.needs_review} awaiting review (counts can overlap). <a href={`/api/admin/question-banks/${detail.id}/readiness-report`} target="_blank" rel="noreferrer">Open nonmutating readiness report</a></Notice>}
+              <nav className="ingestion-task-tabs" aria-label="Bank workspace task">{([['monitor','Monitor imports'],['add','Add sources'],['review','Review library']] as const).map(([value,label])=><button type="button" key={value} className={workspace===value?"active":"secondary-action"} onClick={()=>{if(canLeave()){dirtyQuestion.current=false;setFigureEditing(false);setEditingQuestion(null);setWorkspace(value);replaceLocationParams({task:value});}}}>{label}</button>)}</nav>
+              {workspace === "add" && <Card className="bank-upload-card">
                 <h2>Upload source documents</h2>
-                <form onSubmit={upload} className="stacked-form">
+                <form ref={uploadFormRef} onSubmit={upload} onChange={event=>reviewUploadForm(event.currentTarget)} className="stacked-form">
                   <label>
                     Subject
                     <input name="subject" placeholder="Physics" required />
@@ -3550,12 +3709,15 @@ function QuestionBankManager({
                         : "…"}
                     </small>
                   )}
-                  <button disabled={busy}>
+                  {uploadConfig&&<small>Supported: {uploadConfig.extensions.map(extension=>extension.toUpperCase()).join(", ")} · up to {Math.round(uploadConfig.max_file_bytes/1024/1024)} MB per file. Question documents are required; answer documents are optional. Content duplicates are checked on the server.</small>}
+                  {uploadReview.length>0&&<ul className="upload-preflight" aria-label="Upload validation">{uploadReview.map((file,index)=><li key={`${file.role}-${index}`}><b>{file.filename}</b> · {file.role} · {file.paired?`paired with ${file.paired}`:file.role==="question"?"no separate answer source":"answer source"}{file.duplicate?" · possible duplicate (server verifies content)":""}{file.errors.map(error=><span className="error-text" key={error}> · {error}</span>)}</li>)}</ul>}
+                  {uploadOutcomes.length>0&&<ul className="upload-preflight" aria-label="Per-file upload outcomes">{uploadOutcomes.map((outcome,index)=><li key={index}><b>{outcome.filename}</b> · {outcome.status.replaceAll("_"," ")}{outcome.error?` · ${outcome.error}`:""}</li>)}</ul>}
+                  <button disabled={busy||!uploadConfig||uploadReview.some(file=>file.errors.length)}>
                     {busy ? "Uploading…" : "Upload and start extraction"}
                   </button>
                 </form>
-              </Card>
-              <BankImportStatus
+              </Card>}
+              {workspace === "monitor" && <BankImportStatus
                 jobs={detail.imports}
                 onRetry={retryImport}
                 onPause={(job) => importAction(job, "pause")}
@@ -3567,88 +3729,26 @@ function QuestionBankManager({
                 onPublish={publishImport}
                 onGenerate={generateImportSolutions}
                 onApproveGenerated={approveGeneratedSolutions}
-              />
+              />}
               {selectedImport && (
                 <DocumentImportPage
+                  bankName={detail.name}
+                  feedback={operationMessage}
+                  operationError={error}
                   job={selectedImport}
                   questions={selectedQuestions || []}
                   activeQuestion={editingQuestion}
                   busy={busy}
-                  close={() => { setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); window.history.pushState({},"",window.location.pathname); }}
-                  edit={setEditingQuestion}
+                  close={closeDocument}
+                  edit={editQuestion}
                   deleteQuestion={deleteQuestion}
                   publish={() => publishImport(selectedImport)}
                   generate={() => generateImportSolutions(selectedImport)}
                   approveGenerated={() => approveGeneratedSolutions(selectedImport)}
-                  renderEditor={(question) => <BankQuestionEditor key={question.id} bankId={detail.id} question={question} done={finishQuestionReview} cancel={() => setEditingQuestion(null)} onFigureActive={setFigureEditing} />}
+                  renderEditor={(question) => <BankQuestionEditor key={question.id} bankId={detail.id} question={question} done={finishQuestionReview} cancel={() => editQuestion(null)} onDirtyChange={(dirty) => { dirtyQuestion.current = dirty; }} onFigureActive={setFigureEditing} />}
                 />
               )}
-              <Card>
-                <h2>
-                  {selectedImport
-                    ? `Review: ${selectedImport.filename}`
-                    : "Review and edit questions"}
-                </h2>
-                {selectedImport && (
-                  <button
-                    className="secondary-action"
-                    onClick={() => {
-                      setSelectedImport(null);
-                      setSelectedQuestions(null);
-                    }}
-                  >
-                    Show all documents
-                  </button>
-                )}
-                <p>
-                  {selectedImport
-                    ? `Showing ${visibleQuestions?.length || 0} questions`
-                    : `Showing the latest ${visibleQuestions?.length || 0} of ${detail.question_count} questions`}
-                  {selectedImport ? " from this document" : " from this bank"},
-                  organized by topic. Open a topic to browse its questions.
-                </p>
-                {visibleQuestions?.length ? (
-                  <>
-                    <TopicQuestionBrowser
-                      questions={visibleQuestions}
-                      activeQuestion={editingQuestion}
-                      edit={setEditingQuestion}
-                      renderEditor={(question) => (
-                        <BankQuestionEditor
-                          key={question.id}
-                          bankId={detail.id}
-                          question={question}
-                          done={finishQuestionReview}
-                          cancel={() => { setFigureEditing(false); setEditingQuestion(null); }}
-                          onFigureActive={setFigureEditing}
-                        />
-                      )}
-                    />
-                    <AttentionQuestionQueue
-                      questions={visibleQuestions}
-                      activeQuestion={editingQuestion}
-                      edit={setEditingQuestion}
-                      renderEditor={(question) => (
-                        <BankQuestionEditor
-                          key={question.id}
-                          bankId={detail.id}
-                          question={question}
-                          done={finishQuestionReview}
-                          cancel={() => { setFigureEditing(false); setEditingQuestion(null); }}
-                          onFigureActive={setFigureEditing}
-                        />
-                      )}
-                    />
-                  </>
-                ) : (
-                  <p>
-                    {selectedImport?.status === "failed"
-                      ? selectedImport.error ||
-                        "This source failed before questions could be extracted."
-                      : "Questions will appear after extraction."}
-                  </p>
-                )}
-              </Card>
+              {workspace === "review" && <Card><QuestionLibrary key={detail.id} bankId={detail.id} selectedQuestion={editingQuestion} api={api} edit={editQuestion} renderEditor={question=><BankQuestionEditor key={question.id} bankId={detail.id} question={question} done={finishQuestionReview} cancel={()=>editQuestion(null)} onDirtyChange={dirty=>{dirtyQuestion.current=dirty;}} onFigureActive={setFigureEditing}/>}/></Card>}
             </>
           ) : (
             <Card>Create or select a bank to begin.</Card>
@@ -3658,68 +3758,73 @@ function QuestionBankManager({
   );
 }
 
-function DocumentImportPage({job,questions,activeQuestion,busy,close,edit,deleteQuestion,publish,generate,approveGenerated,renderEditor}:{
-  job:ImportJob; questions:Question[]; activeQuestion:Question|null; busy:boolean; close:()=>void; edit:(question:Question|null)=>void;
+function DocumentImportPage({bankName,feedback,operationError,job,activeQuestion,busy,close,edit,deleteQuestion,publish,generate,approveGenerated,renderEditor}:{
+  bankName:string; feedback?:string; operationError?:string; job:ImportJob; questions:Question[]; activeQuestion:Question|null; busy:boolean; close:()=>void; edit:(question:Question|null)=>void;
   deleteQuestion:(question:Question)=>void; publish:()=>void; generate:()=>void; approveGenerated:()=>void;
   renderEditor:(question:Question)=>React.ReactNode;
 }) {
-  const [filter,setFilter]=useState<"all"|"attention"|"generated"|"published">("all");
-  const generation=job.meta?.solution_generation;
-  const generationActive=generation?.status==="queued"||generation?.status==="running";
-  const issueFor=(question:Question)=>{
-    const generationError=question.interaction?.solution_generation?.error;
-    const keyedWithoutSolution=Boolean(question.interaction?.answer_key_authoritative&&question.answer&&!question.solution_markdown);
-    const staleSolutionError=keyedWithoutSolution&&/solution|multi[- ]step/i.test(String(generationError||""));
-    return (!staleSolutionError&&generationError) || (question.interaction?.ingestion_issues||[]).join(", ");
+  type Filter = "all" | "attention" | "generated" | "published";
+  const params = () => new URLSearchParams(window.location.search);
+  const initialFilter = () => { const value = params().get("filter") || "all"; return ["all","attention","generated","published"].includes(value) ? value as Filter : "all"; };
+  const [filter,setFilter]=useState<Filter>(initialFilter), [page,setPage]=useState(() => Math.max(1,Number(params().get("qpage")) || 1));
+  const [queue,setQueue]=useState<any>(null), [loading,setLoading]=useState(false), [error,setError]=useState(""), [retry,setRetry]=useState(0);
+  const [edge,setEdge]=useState<"first"|"last"|null>(null);
+  const dialogFocus=useDialogFocus(true,close,()=>document.querySelector<HTMLButtonElement>(`[data-import-review="${job.id}"]`));
+  const selectionRequests=useRef(new LatestRequest()), scrollContainer=useRef<HTMLDivElement>(null);
+  const updateLocation=(nextFilter:Filter,nextPage:number)=>{const url=new URL(window.location.href);url.searchParams.set("filter",nextFilter);url.searchParams.set("qpage",String(nextPage));window.history.replaceState({},"",url.pathname+url.search);};
+  const changeFilter=(value:Filter)=>{setFilter(value);setPage(1);updateLocation(value,1);};
+  const changePage=(value:number)=>{setPage(value);updateLocation(filter,value);};
+  const selectQuestion=async(id:string)=>{
+    const request=selectionRequests.current.start(id);setLoading(true);setError("");
+    try {const question=await api(`/admin/question-banks/${job.bank_id}/imports/${job.id}/questions/${id}`,{signal:request.signal});if(request.current())edit(question);}
+    catch(error:any){if(request.current()&&error.name!=="AbortError")setError(error.message);}
+    finally{if(request.current())setLoading(false);}
   };
-  const attention=questions.filter(question=>issueFor(question)||!question.approved);
-  const generated=questions.filter(question=>question.interaction?.solution_generation?.status==="completed");
-  const shown=questions.filter(question=>filter==="all"||filter==="attention"&&attention.includes(question)||filter==="generated"&&generated.includes(question)||filter==="published"&&question.approved);
-  return <div className="document-detail-page" role="dialog" aria-modal="true" aria-label={`Document details for ${job.filename || "source"}`}>
+  useEffect(()=>{
+    const controller=new AbortController();setLoading(true);setError("");
+    api(`/admin/question-banks/${job.bank_id}/imports/${job.id}/questions?review_filter=${filter}&page=${page}&page_size=25`,{signal:controller.signal})
+      .then((result)=>{setQueue(result);if(edge&&result.items.length){void selectQuestion(result.items[edge==="first"?0:result.items.length-1].id);setEdge(null);}})
+      .catch((error)=>{if(error.name!=="AbortError")setError(error.message);}).finally(()=>{if(!controller.signal.aborted)setLoading(false);});
+    return()=>controller.abort();
+  },[job.id,filter,page,job.readiness?.publishable,job.readiness?.needs_attention,retry]);
+  useEffect(()=>{
+    const restore=()=>{setFilter(initialFilter());setPage(Math.max(1,Number(params().get("qpage"))||1));};window.addEventListener("popstate",restore);
+    if(scrollContainer.current)scrollContainer.current.scrollTop=Number(window.sessionStorage.getItem(`document-scroll:${job.id}`)||0);
+    return()=>{selectionRequests.current.cancel();window.removeEventListener("popstate",restore);};
+  },[job.id]);
+  const counts=queue?.counts||{}, items=queue?.items||[], selectedIndex=items.findIndex((item:any)=>item.id===activeQuestion?.id);
+  const move=(direction:number)=>{const next=selectedIndex+direction;if(next>=0&&next<items.length){void selectQuestion(items[next].id);}else if(direction>0&&queue?.has_more){setEdge("first");changePage(page+1);}else if(direction<0&&page>1){setEdge("last");changePage(page-1);}};
+  const generation=job.meta?.solution_generation, generationActive=["queued","running"].includes(generation?.status||"");
+  return <div ref={element=>{scrollContainer.current=element;dialogFocus.current=element;}} tabIndex={-1} onScroll={(event)=>window.sessionStorage.setItem(`document-scroll:${job.id}`,String(event.currentTarget.scrollTop))} className="document-detail-page" role="dialog" aria-modal="true" aria-label={`Review ${job.filename || "source"}`}>
     <div className="document-detail-shell">
       <header className="document-detail-header">
         <button type="button" className="secondary-action" onClick={close}>← Back to documents</button>
-        <div><p className="eyebrow">SOURCE DOCUMENT</p><h1>{job.filename || "Untitled import"}</h1><p>{job.meta?.subject || "Unclassified"} · {job.meta?.phase || job.status}</p></div>
+        <div><p className="eyebrow">{bankName} · SOURCE REVIEW</p><h1>{job.filename}</h1><p>{job.meta?.subject||"Unclassified"} · {job.lifecycle?.state.replaceAll("_"," ")||job.status}</p></div>
         <div className="document-detail-actions">
-          {!job.published && Boolean(job.generation_eligible_count) && !generationActive && <button type="button" className="secondary-action" disabled={busy} onClick={generate}>Generate missing</button>}
-          {!job.published && generation && ["completed","completed_with_errors"].includes(generation.status) && Boolean(generation.succeeded) && !generation.approved_at && <button type="button" className="secondary-action" disabled={busy} onClick={approveGenerated}>Approve generated passes</button>}
-          {!job.published && Boolean(job.approved_count) && <button type="button" disabled={busy} onClick={publish}>Publish {job.approved_count} passed</button>}
-          {job.published && <span className="badge published">Live</span>}
+          {!job.published&&Boolean(job.generation_eligible_count)&&!generationActive&&<button type="button" className="secondary-action" disabled={busy} onClick={generate}>Generate missing</button>}
+          {!job.published&&generation&&["completed","completed_with_errors"].includes(generation.status)&&Boolean(generation.succeeded)&&!generation.approved_at&&<button type="button" className="secondary-action" disabled={busy} onClick={approveGenerated}>Review generated batch</button>}
+          {!job.published&&Boolean(readyQuestionCount(job))&&<button type="button" disabled={busy} onClick={publish}>Preview publication ({readyQuestionCount(job)} ready)</button>}
+          {job.published&&<span className="badge published">Published</span>}
         </div>
       </header>
-      <section className="document-metrics">
-        <span><b>{questions.length}</b><small>questions</small></span><span><b>{job.approved_count || 0}</b><small>passed review</small></span><span className={attention.length?"needs-action":""}><b>{attention.length}</b><small>need attention</small></span><span><b>{generation?.succeeded || 0}</b><small>solutions generated</small></span><span><b>{generation?.failed || 0}</b><small>generation errors</small></span>
-      </section>
-      {(job.errors?.length||generation?.errors?.length) ? <section className="document-issue-summary"><h2>Run issues</h2>{job.errors?.map((entry,index)=><p key={`extract-${index}`}>Extraction{entry.page?` · page ${entry.page}`:""}: {entry.message}</p>)}{generation?.errors?.map((entry,index)=><p key={`generation-${entry.question_id||index}`}>{entry.source_number?`Question ${entry.source_number}`:"Question"}: {entry.message}</p>)}</section>:null}
-      <nav className="document-filters" aria-label="Filter document questions">{([['all',`All ${questions.length}`],['attention',`Needs attention ${attention.length}`],['generated',`Generated ${generated.length}`],['published',`Passed ${job.approved_count||0}`]] as const).map(([value,label])=><button type="button" key={value} className={filter===value?"active":""} onClick={()=>setFilter(value)}>{label}</button>)}</nav>
-      <main className="document-detail-questions">
-        {shown.map(question=><article className={`document-detail-question ${issueFor(question)?"has-issue":""}`} key={question.id}>
-          <header className="document-question-card-header">
-            <div><span className="document-question-number">{questionNumber(question.source_number)}</span><span className="document-question-kind">{question.kind.replaceAll('_',' ')}</span><span className={`document-question-status ${question.approved?"passed":issueFor(question)?"attention":"pending"}`}>{question.approved?"Passed review":issueFor(question)?"Needs attention":"Awaiting review"}</span></div>
-            <div className="document-question-actions"><button type="button" className="secondary-action" onClick={()=>edit(activeQuestion?.id===question.id?null:question)}>{activeQuestion?.id===question.id?"Close editor":"Review question"}</button>{!job.published&&<button type="button" className="text-danger" disabled={busy} onClick={()=>deleteQuestion(question)}>Delete invalid</button>}</div>
-          </header>
-          <div className="document-question-card-body">
-            <Markdown value={question.stem_markdown} className="document-question-stem" />
-            {question.options?.length > 0 && <ol className="document-question-options">{question.options.map((option,index)=><li key={index}><span>{String.fromCharCode(65+index)}</span><Markdown value={optionMarkdown(option)} /></li>)}</ol>}
-            <div className="document-answer-key"><span>Answer key</span><strong>{question.answer?formatQuestionAnswer(question):"Missing"}</strong></div>
-            {(question.solution_markdown||issueFor(question))&&<details className="document-solution"><summary><span>{question.solution_markdown?"Solution":"Solution unavailable"}</span><span className="document-solution-toggle">Show</span></summary><div>{question.solution_markdown?<Markdown value={question.solution_markdown}/>:<p>No solution was generated for this question.</p>}</div></details>}
-            {issueFor(question)&&<p className="document-question-issue"><b>Review note:</b> {issueFor(question).replaceAll('_',' ')}</p>}
-          </div>
-          {activeQuestion?.id===question.id&&renderEditor(question)}
-        </article>)}
-        {!shown.length&&<p className="queue-empty">No questions match this view.</p>}
+      {feedback&&<Notice>{feedback}</Notice>}{operationError&&<Notice kind="error">{operationError}</Notice>}
+      <section className="document-metrics"><span><b>{job.question_count||0}</b><small>questions in source</small></span><span><b>{readyQuestionCount(job)}</b><small>ready</small></span><span><b>{job.readiness?.needs_attention||0}</b><small>need attention</small></span><span><b>{generation?.succeeded||0}</b><small>generated</small></span><span><b>{generation?.failed||0}</b><small>generation failures</small></span></section>
+      <nav className="document-filters" aria-label="Filter document questions">{([['all','All'],['attention','Needs attention'],['generated','Generated'],['published','Ready']] as const).map(([value,label])=><button type="button" key={value} className={filter===value?"active":""} onClick={()=>changeFilter(value)}>{label} {counts[value]||0}</button>)}</nav>
+      <section className="document-issue-summary"><ImportIssues job={job} stage="extraction"/><ImportIssues job={job} stage="generation"/></section>
+      {error&&<Notice kind="error">{error} <button type="button" onClick={()=>setRetry(retry+1)}>Retry</button></Notice>}
+      <main className="bounded-review-workspace" aria-busy={loading}>
+        <aside className="bounded-question-queue" aria-label="Question review queue">
+          <p role="status">{loading?"Loading…":`${queue?.total||0} matching questions · page ${page}`}</p>
+          {items.map((item:any)=><button type="button" key={item.id} disabled={loading} className={`queue-question ${activeQuestion?.id===item.id?"active":""}`} onClick={()=>void selectQuestion(item.id)}><b>{questionNumber(item.source_number)} · {item.kind.replaceAll("_"," ")}</b><span>{item.preview}</span><small>{item.readiness.publishable?"Ready":item.readiness.content_valid?"Awaiting review":"Needs repair"}{item.source_page?` · page ${item.source_page}`:""}</small></button>)}
+          {!loading&&!items.length&&<p>{filter==="all"?"No questions have been extracted yet.":"No questions match this filter."}</p>}
+          <div className="queue-pagination"><button type="button" className="secondary-action" disabled={page===1||loading} onClick={()=>changePage(page-1)}>Previous page</button><button type="button" className="secondary-action" disabled={!queue?.has_more||loading} onClick={()=>changePage(page+1)}>Next page</button></div>
+        </aside>
+        <section className="selected-question-detail" aria-label="Selected question">
+          {activeQuestion?<><div className="selected-question-actions"><span>Question {activeQuestion.source_number||activeQuestion.id}</span><button type="button" className="secondary-action" disabled={loading||(selectedIndex<=0&&page===1)} onClick={()=>move(-1)}>Previous question</button><button type="button" className="secondary-action" disabled={loading||(selectedIndex===items.length-1&&!queue?.has_more)} onClick={()=>move(1)}>Next question</button><button type="button" className="text-danger" disabled={busy} onClick={()=>deleteQuestion(activeQuestion)}>Delete question</button></div>{renderEditor(activeQuestion)}</>:<p>Select a question to inspect its content, source and readiness. Full math content loads only for the selected question.</p>}
+        </section>
       </main>
     </div>
   </div>;
-}
-
-function formatQuestionAnswer(question:Question) {
-  const answer=question.answer;
-  if (answer?.option!==undefined) return `Option ${String.fromCharCode(65+Number(answer.option))}`;
-  if (Array.isArray(answer?.options)) return `Options ${answer.options.map((value:number)=>String.fromCharCode(65+Number(value))).join(", ")}`;
-  if (answer?.value!==undefined) return String(answer.value);
-  if (answer?.matches) return Object.entries(answer.matches).map(([row,columns])=>`${row} → ${(columns as unknown[]).join(", ")}`).join("; ");
-  return JSON.stringify(answer);
 }
 
 function QuestionReviewRow({
@@ -3733,12 +3838,12 @@ function QuestionReviewRow({
   edit: (question: Question) => void;
   renderEditor: (question: Question) => React.ReactNode;
 }) {
-  const issues = question.interaction?.ingestion_issues || [];
+  const issues = question.readiness?.blocking.map((reason) => reason.message) || question.interaction?.ingestion_issues || [];
   return <div className="document-question" key={question.id}>
     <article className="row">
       <div>
         <b>{questionNumber(question.source_number)} · {question.kind}</b>
-        <small>Page {question.interaction?.source_page || "—"} · {issues.length ? `Flagged: ${issues.join(", ")}` : question.approved ? "Reviewed" : "Needs review"}</small>
+        <small>Page {question.interaction?.source_page || "—"} · {issues.length ? `Flagged: ${issues.join(", ")}` : questionReadinessLabel(question)}</small>
       </div>
       <button type="button" className="secondary-action" onClick={() => edit(question)}>
         {activeQuestion?.id === question.id ? "Editing" : "View / edit"}
@@ -3770,14 +3875,14 @@ function TopicQuestionBrowser({
   return (
     <section className="topic-question-browser">
       <div className="question-browser-heading"><div><p className="eyebrow">QUESTION LIBRARY</p><h3>Browse by chapter and topic</h3><p>Topics stay compact until you need to inspect their questions.</p></div><span>{questions.length} questions</span></div>
-      {Object.entries(tree).map(([subject, chapters]) => <details className="taxonomy-subject" key={subject} open><summary><b>{subject}</b><small>{Object.values(chapters).reduce((sum, topics) => sum + Object.values(topics).reduce((count, items) => count + items.length, 0), 0)} questions</small></summary>{Object.entries(chapters).map(([chapter, topics]) => <details className="taxonomy-chapter" key={chapter} open><summary><b>{chapter}</b><small>{Object.values(topics).reduce((sum, items) => sum + items.length, 0)} questions</small></summary>{Object.entries(topics).map(([topic, topicQuestions]) => <details className="taxonomy-topic" key={topic} open={topicQuestions.some((question) => question.id === activeQuestion?.id)}><summary><span><b>{topic}</b><small>{topicQuestions.filter((question) => (question.interaction?.ingestion_issues || []).length || !question.approved).length ? "Needs attention" : "Complete"}</small></span><strong>{topicQuestions.length}</strong></summary><div className="topic-question-list">{topicQuestions.map((question) => <QuestionReviewRow key={question.id} question={question} activeQuestion={activeQuestion} edit={edit} renderEditor={renderEditor} />)}</div></details>)}</details>)}</details>)}
+      {Object.entries(tree).map(([subject, chapters]) => <details className="taxonomy-subject" key={subject} open><summary><b>{subject}</b><small>{Object.values(chapters).reduce((sum, topics) => sum + Object.values(topics).reduce((count, items) => count + items.length, 0), 0)} questions</small></summary>{Object.entries(chapters).map(([chapter, topics]) => <details className="taxonomy-chapter" key={chapter} open><summary><b>{chapter}</b><small>{Object.values(topics).reduce((sum, items) => sum + items.length, 0)} questions</small></summary>{Object.entries(topics).map(([topic, topicQuestions]) => <details className="taxonomy-topic" key={topic} open={topicQuestions.some((question) => question.id === activeQuestion?.id)}><summary><span><b>{topic}</b><small>{topicQuestions.filter(questionNeedsAttention).length ? "Needs attention" : "Complete"}</small></span><strong>{topicQuestions.length}</strong></summary><div className="topic-question-list">{topicQuestions.map((question) => <QuestionReviewRow key={question.id} question={question} activeQuestion={activeQuestion} edit={edit} renderEditor={renderEditor} />)}</div></details>)}</details>)}</details>)}
     </section>
   );
 }
 
 function AttentionQuestionQueue({questions,activeQuestion,edit,renderEditor}:{questions:Question[];activeQuestion:Question|null;edit:(question:Question)=>void;renderEditor:(question:Question)=>React.ReactNode}){
- const attention=questions.filter(question=>(question.interaction?.ingestion_issues||[]).length||!question.approved);
- return <section className="attention-question-queue"><div className="question-browser-heading"><div><p className="eyebrow">REQUIRES REVIEW</p><h3>Questions needing attention</h3><p>Only flagged or unresolved questions appear here.</p></div><span className={attention.length?"needs-attention":""}>{attention.length} items</span></div>{attention.length?<div className="document-question-list">{attention.map(question=><QuestionReviewRow key={question.id} question={question} activeQuestion={activeQuestion} edit={edit} renderEditor={renderEditor}/>)}</div>:<p className="queue-empty">No issues found. All questions are classified and reviewed.</p>}</section>
+ const attention=questions.filter(questionNeedsAttention);
+ return <section className="attention-question-queue"><div className="question-browser-heading"><div><p className="eyebrow">REQUIRES REVIEW</p><h3>Questions needing attention</h3><p>Questions in the loaded library slice that need repair or review appear here.</p></div><span className={attention.length?"needs-attention":""}>{attention.length} items</span></div>{attention.length?<div className="document-question-list">{attention.map(question=><QuestionReviewRow key={question.id} question={question} activeQuestion={activeQuestion} edit={edit} renderEditor={renderEditor}/>)}</div>:<p className="queue-empty">No blocking issues or pending reviews in the loaded questions. Classification and other advisories are shown in each editor.</p>}</section>
 }
 
 function inferredChoiceFromSolution(question: Question) {
@@ -3796,255 +3901,8 @@ function sourceLabel(question: Question) {
   const page = question.interaction?.source_page;
   return page ? `${file} · page ${page}` : file;
 }
-function BankQuestionEditor({
-  bankId,
-  question,
-  done,
-  cancel,
-  onFigureActive,
-}: {
-  bankId: string;
-  question: Question;
-  done: () => Promise<void>;
-  cancel: () => void;
-  onFigureActive?: (active: boolean) => void;
-}) {
-  const [busy, setBusy] = useState(false),
-    [error, setError] = useState(""),
-    [tab, setTab] = useState<"rendered" | "json" | "edit">("rendered");
-  const suggestedAnswer = inferredChoiceFromSolution(question);
-  const generation = question.interaction?.solution_generation;
-  const generationActive = generation?.status === "queued" || generation?.status === "running";
-  const generateMissing = async () => {
-    setBusy(true); setError("");
-    try {
-      await api(`/admin/question-banks/${bankId}/questions/${question.id}/solution-generation`, { method: "POST" });
-      await done();
-    } catch (e: any) { setError(e.message || "Could not queue solution generation."); }
-    finally { setBusy(false); }
-  };
-  const ignoreWarningsAndApprove = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      await api(
-        `/admin/question-banks/${bankId}/questions/${question.id}/resolve?ignore_warnings=true`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            source_number: question.source_number,
-            kind: question.kind,
-            stem_markdown: question.stem_markdown,
-            options: question.options,
-            answer: suggestedAnswer ?? question.answer,
-            solution_markdown: question.solution_markdown || null,
-            scoring: question.scoring || {
-              correct: 4,
-              incorrect: -1,
-              unanswered: 0,
-            },
-            confidence: question.confidence,
-          }),
-        },
-      );
-      await done();
-    } catch (e: any) {
-      setError(e.message || "This question still needs an answer before approval.");
-    } finally {
-      setBusy(false);
-    }
-  };
-  const save = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const form = new FormData(e.currentTarget);
-    const action = (e.nativeEvent as SubmitEvent).submitter?.getAttribute("data-action");
-    const approve = action !== "draft";
-    const ignoreWarnings = action === "ignore-warnings";
-    setBusy(true);
-    setError("");
-    try {
-      const options = JSON.parse(String(form.get("options") || "[]"));
-      const answer = JSON.parse(String(form.get("answer") || "null"));
-      await api(
-        approve ? `/admin/question-banks/${bankId}/questions/${question.id}/resolve${ignoreWarnings ? "?ignore_warnings=true" : ""}` : `/questions/${question.id}/draft`,
-        {
-          method: approve ? "POST" : "PUT",
-          body: JSON.stringify({
-            source_number: question.source_number,
-            kind: form.get("kind"),
-            stem_markdown: form.get("stem_markdown"),
-            options,
-            answer,
-            solution_markdown: form.get("solution_markdown") || null,
-            scoring: question.scoring || {
-              correct: 4,
-              incorrect: -1,
-              unanswered: 0,
-            },
-            confidence: Number(form.get("confidence")) / 100,
-          }),
-        },
-      );
-      await done();
-    } catch (e: any) {
-      setError(e.message || "Check the answer and JSON fields.");
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <article className="review-question bank-question-review">
-      <div className="bank-review-heading">
-        <div>
-          <h3>{questionNumber(question.source_number)} review</h3>
-          <p>
-            <small>Source: {sourceLabel(question)}</small>
-          </p>
-        </div>
-        <span className={`badge ${question.approved ? "approved" : "review"}`}>
-          {question.approved ? "Reviewed" : "Needs review"}
-        </span>
-      </div>
-      {(question.generation_eligible || generation) && (
-        <div className="question-generation-status">
-          <div>
-            <b>{generationActive ? "Generating answer and solution…" : generation?.status === "failed" ? "Generation failed" : generation?.status === "completed" ? "LLM-generated draft ready for review" : `Missing ${(question.generation_missing_fields || []).join(" and ")}`}</b>
-            {generation?.model && <small>Model: {generation.model} · confidence {Math.round((generation.confidence || 0) * 100)}%</small>}
-            {generation?.error && <small className="error-text">{generation.error}</small>}
-          </div>
-          {question.generation_eligible && !generationActive && <button type="button" className="secondary-action" disabled={busy} onClick={generateMissing}>{generation?.status === "failed" ? "Retry generation" : "Generate missing fields"}</button>}
-        </div>
-      )}
-      {error && tab !== "edit" && <Notice kind="error">{error}</Notice>}
-      <nav
-        className="review-tabs"
-        aria-label={`Question ${questionNumber(question.source_number)} view`}
-      >
-        <button
-          type="button"
-          className={tab === "rendered" ? "active" : ""}
-          onClick={() => setTab("rendered")}
-        >
-          Rendered
-        </button>
-        <button
-          type="button"
-          className={tab === "json" ? "active" : ""}
-          onClick={() => setTab("json")}
-        >
-          JSON
-        </button>
-        <button
-          type="button"
-          className={tab === "edit" ? "active" : ""}
-          onClick={() => setTab("edit")}
-        >
-          Edit
-        </button>
-      </nav>
-      {tab === "rendered" && (
-        <div className="bank-rendered-question">
-          <QuestionCard q={question} mode="teacher" />
-          {needsFigureAdjustment(question) && <FigureEditor questionId={question.id} options={question.options} api={api} done={done} onActiveChange={onFigureActive} />}
-          {!!(question.interaction?.ingestion_issues || []).length && (
-            <div className="review-buttons warning-override-action">
-              <button type="button" className="secondary-action" disabled={busy} onClick={ignoreWarningsAndApprove}>
-                {busy ? "Saving…" : "Ignore warnings & approve"}
-              </button>
-              <small>Approves this question for publication and records the warnings in its audit trail.</small>
-            </div>
-          )}
-        </div>
-      )}
-      {tab === "json" && (
-        <div className="bank-json-panel">
-          <p>
-            Exact stored extraction payload. This is read-only; use Edit to
-            correct and approve it.
-          </p>
-          <pre>{JSON.stringify(question, null, 2)}</pre>
-        </div>
-      )}
-      {tab === "edit" && (
-        <form className="stacked-form" onSubmit={save}>
-          <label>
-            Type
-            <select name="kind" defaultValue={question.kind}>
-              {JEE_QUESTION_TYPES.map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Question (Markdown / LaTex)
-            <textarea
-              name="stem_markdown"
-              defaultValue={question.stem_markdown}
-            />
-          </label>
-          <label>
-            Options (JSON)
-            <textarea
-              name="options"
-              defaultValue={JSON.stringify(question.options, null, 2)}
-            />
-          </label>
-          <label>
-            Answer (JSON)
-            <textarea
-              name="answer"
-              defaultValue={JSON.stringify(suggestedAnswer ?? null, null, 2)}
-            />
-          </label>
-          {!question.answer && suggestedAnswer && (
-            <small>
-              The answer key was inferred from the extracted solution. Verify it
-              before saving.
-            </small>
-          )}
-          {!question.answer && !suggestedAnswer && (
-            <small>
-              An answer key is genuinely missing. Add one before approval.
-            </small>
-          )}
-          <label>
-            Solution (Markdown / LaTex)
-            <textarea
-              name="solution_markdown"
-              defaultValue={question.solution_markdown || ""}
-            />
-          </label>
-          <label>
-            Confidence %
-            <input
-              name="confidence"
-              type="number"
-              min="0"
-              max="100"
-              defaultValue={Math.round((question.confidence ?? 0) * 100)}
-            />
-          </label>
-          <div className="review-buttons">
-            <button type="submit" data-action="draft" className="secondary-action" disabled={busy}>Save draft</button>
-            <button type="submit" data-action="approve" disabled={busy}>
-              {busy ? "Saving…" : "Save and approve"}
-            </button>
-            {!!(question.interaction?.ingestion_issues || []).length && (
-              <button type="submit" data-action="ignore-warnings" className="secondary-action" disabled={busy}>
-                Ignore warnings & approve
-              </button>
-            )}
-            <button type="button" className="secondary-action" onClick={cancel}>
-              Cancel
-            </button>
-          </div>
-          {error && <Notice kind="error">{error}</Notice>}
-        </form>
-      )}
-    </article>
-  );
+function BankQuestionEditor({bankId,question,done,cancel,onDirtyChange,onFigureActive}:{bankId:string;question:Question;done:()=>Promise<void>;cancel:()=>void;onDirtyChange?:(dirty:boolean)=>void;onFigureActive?:(active:boolean)=>void}) {
+ return <AdminQuestionEditor bankId={bankId} question={question} api={api} done={done} cancel={cancel} onDirtyChange={onDirtyChange} onFigureActive={onFigureActive} renderQuestion={(value)=><QuestionCard q={value} mode="teacher"/>}/>;
 }
 
 function optionMarkdown(option: any) {
@@ -4580,12 +4438,11 @@ function AdminBankImporter({ notify }: { notify: (message: string) => void }) {
     if (!detail) return;
     setBusy(true);
     try {
-      await api(`/admin/question-banks/${detail.id}/publish`, {
-        method: "POST",
-      });
+      const result = await publishWithPreview(`/admin/question-banks/${detail.id}`, detail.name);
+      if (!result) return;
       await open(detail.id);
       await load();
-      notify("Question bank published to teachers.");
+      notify(publicationMessage(result));
     } catch (e: any) {
       setError(e.message);
     } finally {

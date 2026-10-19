@@ -93,3 +93,36 @@ class StudentCreate(BaseModel):
 class StudentUpdate(BaseModel):
     name:str|None=Field(default=None,min_length=2,max_length=160)
     access_code:str|None=Field(default=None,pattern=r"^\d{5}$")
+
+class AdminQuestionContent(QuestionIn):
+    model_config=ConfigDict(extra="forbid")
+
+class AdminQuestionUpdate(BaseModel):
+    expected_revision:str=Field(min_length=64,max_length=64)
+    content:AdminQuestionContent
+    approve:bool=False
+    taxonomy_ids:list[str]|None=Field(default=None,max_length=3)
+    reason:str=Field(min_length=3,max_length=1000)
+    @field_validator("reason")
+    @classmethod
+    def change_reason(cls,value):
+        value=value.strip()
+        if len(value)<3:raise ValueError("Describe why the question was changed")
+        return value
+
+class SourceRelinkIn(BaseModel):
+    expected_revision:str=Field(min_length=64,max_length=64)
+    source_id:str
+    page:int=Field(ge=1)
+    reason:str=Field(min_length=3,max_length=1000)
+    @field_validator("reason")
+    @classmethod
+    def relink_reason(cls,value):
+        value=value.strip()
+        if len(value)<3:raise ValueError("Describe the source evidence for this link")
+        return value
+
+class TaxonomyAliasIn(BaseModel):
+    source_id:str
+    target_id:str
+    expected_impact:str|None=None

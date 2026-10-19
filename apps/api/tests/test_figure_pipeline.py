@@ -16,7 +16,7 @@ from app.db import Base
 from app.figure_review import review_figures, figure_source, figure_source_page, save_question_draft
 from app.figures import image_regions, vector_regions, extract_figures, mark_scope_conflicts
 from app.figure_repairs import propose_repair, repair_needed, stage_repair
-from app.main import question_media, resolve_bank_question
+from app.main import question_media, resolve_bank_question, publish_bank_import
 from app.models import Attempt, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, Role, SourceDocument, Test as Assessment, TestVersion as AssessmentVersion, User
 from app.schemas import FigureReviewIn, QuestionIn
 from app.services import snapshot_questions
@@ -61,6 +61,8 @@ def test_bank_ingestion_preserves_visual_options_through_test_snapshot(monkeypat
     assert counts==(1,0,0)
     q=db.query(Question).one()
     assert q.kind==QuestionKind.SINGLE and q.approved_at is not None
+    job.status=ImportStatus.REVIEW;db.commit()
+    publish_bank_import(bank.id,job.id,admin,db)
     snapshot=snapshot_questions(db,[q.id],admin.id)[0]
     assert [d["option_index"] for d in snapshot["diagrams"]]==[0,1]
     assert [o["markdown"] for o in snapshot["options"]]==["",""]
@@ -196,7 +198,7 @@ def test_approving_present_questions_does_not_clear_skipped_source_pages():
     q.kind=QuestionKind.SUBJECTIVE;q.options=[];q.diagrams=[];q.interaction={};q.approved_at=None
     job.status=ImportStatus.REVIEW;job.extraction_meta={"failed_pages":[{"page":1,"end_page":2,"error":"provider timeout"}]}
     db.commit()
-    data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=[],answer=None)
+    data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=[],answer=None,solution_markdown="A model answer explains the relevant result.")
     resolve_bank_question(bank.id,q.id,data,user=admin,db=db)
     assert q.approved_at is not None and job.status==ImportStatus.REVIEW
     assert job.extraction_meta["phase"]=="Extraction incomplete: source pages skipped"
@@ -362,17 +364,16 @@ def test_draft_option_reordering_requires_image_ownership_review():
     assert "diagram_option_ownership_uncertain" in q.interaction["ingestion_issues"] and q.approved_at is None
 
 
-def test_admin_can_ignore_a_false_positive_warning_and_approve_with_audit_trail():
+def test_ignore_warnings_cannot_bypass_missing_option_figures():
     db,admin,bank,source,job=setup_db();q=question_record(db)
     q.approved_at=None
     q.interaction={"ingestion_issues":["diagram_unassigned_native_candidate"]}
     db.commit()
     data=QuestionIn(kind=q.kind,stem_markdown=q.stem_markdown,options=q.options,answer=q.answer)
-    resolve_bank_question(bank.id,q.id,data,user=admin,db=db,ignore_warnings=True)
-    assert q.approved_at is not None
-    assert q.interaction["ingestion_issues"]==[]
-    assert q.interaction["ignored_ingestion_issues"]==["diagram_unassigned_native_candidate"]
-    assert q.interaction["warnings_ignored_by"]==admin.id
+    with pytest.raises(HTTPException) as exc:
+        resolve_bank_question(bank.id,q.id,data,user=admin,db=db,ignore_warnings=True)
+    assert exc.value.status_code==422
+    assert q.approved_at is None
 
 
 @pytest.mark.parametrize("message", ["Client error '403 Forbidden'", "404 Not Found", "Server error '500 Internal Server Error'"])

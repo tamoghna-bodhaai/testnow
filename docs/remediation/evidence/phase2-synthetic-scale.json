@@ -1,0 +1,16 @@
+{
+  "fixture": "21,027 synthetic in-memory SQLite questions; 10% legacy null keys",
+  "counts": {
+    "validator_version": "readiness-v1",
+    "total": 21027,
+    "content_valid": 18924,
+    "publishable": 18924,
+    "blocked": 2103,
+    "needs_review": 0,
+    "needs_attention": 2103
+  },
+  "eligible_selection_count": 18924,
+  "readiness_scan_seconds": 0.999,
+  "selection_scan_and_count_seconds": 0.974,
+  "production_qualification": false
+}

@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Index, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
@@ -72,6 +72,7 @@ class TaxonomyNode(Timestamped, Base):
     kind: Mapped[str] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(200))
     code: Mapped[str | None] = mapped_column(String(120))
+    alias_of_id: Mapped[str | None] = mapped_column(ForeignKey("taxonomy_nodes.id"), index=True)
     __table_args__=(UniqueConstraint("bank_id", "parent_id", "kind", "name", name="uq_taxonomy_node_path"),)
 class Question(Timestamped, Base):
     __tablename__="questions"
@@ -91,7 +92,9 @@ class Question(Timestamped, Base):
     diagrams: Mapped[list] = mapped_column(JSON, default=list); source_spans: Mapped[list] = mapped_column(JSON, default=list)
     interaction: Mapped[dict] = mapped_column(JSON, default=dict)
     confidence: Mapped[float | None] = mapped_column(); approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    __table_args__=(UniqueConstraint("bank_id", "source_key", name="uq_question_bank_source_key"),)
+    __table_args__=(UniqueConstraint("bank_id", "source_key", name="uq_question_bank_source_key"),
+                    Index("ix_questions_bank_review","bank_id","created_at","id"),
+                    Index("ix_questions_import_review","import_job_id","created_at","id"))
 class QuestionTaxonomy(Base):
     __tablename__="question_taxonomies"
     question_id: Mapped[str] = mapped_column(ForeignKey("questions.id", ondelete="CASCADE"), primary_key=True)

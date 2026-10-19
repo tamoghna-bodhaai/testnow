@@ -1,0 +1,33 @@
+{
+  "profileEdited": true,
+  "recoveryMasked": true,
+  "recoveryPreservedSuspension": true,
+  "reactivationExplicit": true,
+  "attemptInspection": true,
+  "widths": [
+    {
+      "viewport": 390,
+      "scrollWidth": 390
+    },
+    {
+      "viewport": 768,
+      "scrollWidth": 753
+    },
+    {
+      "viewport": 1024,
+      "scrollWidth": 1009
+    },
+    {
+      "viewport": 1280,
+      "scrollWidth": 1265
+    }
+  ],
+  "teacherLabels": true,
+  "backgroundInert": true,
+  "shiftTabContained": true,
+  "tabContained": true,
+  "keyboardCropCreated": true,
+  "nestedFocusRestored": true,
+  "outerFocusRestored": true,
+  "backgroundRestored": true
+}

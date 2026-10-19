@@ -1,0 +1,27 @@
+{
+  "publicationPreview": "Publish eligible questions in Phase 2 readiness fixture?\n\n1 eligible\n1 blocked\n0 already published\n\nBlocking reasons (a question may have several):\ninvalid answer: 1\n\nThe server will revalidate before publishing. Blocked questions remain excluded.",
+  "toast": "1 questions published; 1 blocked; 0 already published. Review the blocked questions before releasing them.",
+  "widths": [
+    {
+      "viewport": 390,
+      "scrollWidth": 390
+    },
+    {
+      "viewport": 768,
+      "scrollWidth": 753
+    },
+    {
+      "viewport": 1024,
+      "scrollWidth": 1009
+    },
+    {
+      "viewport": 1280,
+      "scrollWidth": 1265
+    }
+  ],
+  "editor": "Blocked: needs repair\nSave a valid answer matching this question type and its available options.\nAdvisories (4)",
+  "phoneEditor": {
+    "viewport": 390,
+    "scrollWidth": 390
+  }
+}

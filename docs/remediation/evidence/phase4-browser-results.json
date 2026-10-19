@@ -1,0 +1,28 @@
+{
+  "defaultTask": "Monitor imports",
+  "filenameSearch": true,
+  "invalidUploadBlocked": true,
+  "sourceQuestions": 179,
+  "initialQueueCount": 25,
+  "initialFullCards": 0,
+  "selectedFullCards": 1,
+  "queuePage": "2",
+  "widths": [
+    {
+      "viewport": 390,
+      "sourceScrollWidth": 390
+    },
+    {
+      "viewport": 768,
+      "sourceScrollWidth": 738
+    },
+    {
+      "viewport": 1024,
+      "sourceScrollWidth": 994
+    },
+    {
+      "viewport": 1280,
+      "sourceScrollWidth": 1250
+    }
+  ]
+}

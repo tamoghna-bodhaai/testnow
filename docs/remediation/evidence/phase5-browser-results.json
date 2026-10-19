@@ -1,0 +1,28 @@
+{
+  "olderOrphanFound": true,
+  "sourceRelinked": true,
+  "numericAnswerRepaired": "0",
+  "taxonomyCount": 3,
+  "staleSaveBlocked": true,
+  "localDraftPreserved": "1",
+  "sourceViewer": true,
+  "widths": [
+    {
+      "viewport": 390,
+      "scrollWidth": 390
+    },
+    {
+      "viewport": 768,
+      "scrollWidth": 753
+    },
+    {
+      "viewport": 1024,
+      "scrollWidth": 1009
+    },
+    {
+      "viewport": 1280,
+      "scrollWidth": 1265
+    }
+  ],
+  "choiceRepairWithoutJson": true
+}

@@ -412,7 +412,10 @@ def extract_import(self, job_id:str):
           if owned_page not in range(start+1,end+1) or (number,owned_page) in numbers: continue
           numbers.add((number,owned_page));kind=QuestionKind(item["kind"])
           diagrams,visual_issues=save_figures(item,rendered,native_regions,f"diagrams/{job.id}/{owned_page}-{number}",put)
-          db.add(Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item.get("solution_markdown"),confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams,interaction={"ingestion_issues":preflight_issues+visual_issues,"source_document_id":doc.id,"visual_intent":item.get("visual_intent","none"),"matrix_items":item.get("matrix_items") or [],"matrix_choices":item.get("matrix_choices") or []}))
+          question=Question(id=uid(),owner_id=job.owner_id,import_job_id=job.id,source_number=number,kind=kind,stem_markdown=item["stem_markdown"],options=item["options"],answer=item["answer"],solution_markdown=item.get("solution_markdown"),confidence=item["confidence"],source_spans=item["source_spans"],diagrams=diagrams,interaction={"ingestion_issues":preflight_issues+visual_issues,"source_document_id":doc.id,"visual_intent":item.get("visual_intent","none"),"matrix_items":item.get("matrix_items") or [],"matrix_choices":item.get("matrix_choices") or []})
+          from .readiness import record_readiness
+          record_readiness(question)
+          db.add(question)
         job.extraction_meta={**meta,"phase":f"Saved pages {start+1}-{end} of {page_count}","processed_pages":end,"total_pages":page_count,"question_count":len(numbers),"skipped_count":int(meta.get("skipped_count") or 0)+skipped,"failed_pages":failed_pages};meta=dict(job.extraction_meta);db.commit()
       phase="Ready for review" if not failed_pages else f"Extraction incomplete — {len(failed_pages)} source page range(s) need re-extraction"
       job.status=ImportStatus.REVIEW; job.extraction_meta={**meta,"model":settings().openrouter_model,"paper_title":paper_title,"processed_pages":page_count,"total_pages":page_count,"question_count":len(numbers),"failed_pages":failed_pages,"phase":phase};db.commit()

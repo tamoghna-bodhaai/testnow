@@ -1,0 +1,94 @@
+{
+  "environment": "Disposable SQLite, memory storage/queue seams, Chrome headless and Next development server; not production qualification",
+  "checks": {
+    "monitorDefault": true,
+    "rapidSwitch": true,
+    "failedSelectionClearsControls": true,
+    "boundedInitialCards": true,
+    "pagination": true,
+    "zoomEquivalentReflow": true,
+    "structuredMcq": true,
+    "publicationBlockedNullAnswer": true,
+    "recoveryPreservesSuspension": true,
+    "supportContext": true
+  },
+  "widths": [
+    {
+      "viewport": 390,
+      "scrollWidth": 390
+    },
+    {
+      "viewport": 599,
+      "scrollWidth": 584
+    },
+    {
+      "viewport": 600,
+      "scrollWidth": 585
+    },
+    {
+      "viewport": 601,
+      "scrollWidth": 586
+    },
+    {
+      "viewport": 767,
+      "scrollWidth": 752
+    },
+    {
+      "viewport": 768,
+      "scrollWidth": 753
+    },
+    {
+      "viewport": 769,
+      "scrollWidth": 754
+    },
+    {
+      "viewport": 849,
+      "scrollWidth": 834
+    },
+    {
+      "viewport": 850,
+      "scrollWidth": 835
+    },
+    {
+      "viewport": 851,
+      "scrollWidth": 836
+    },
+    {
+      "viewport": 899,
+      "scrollWidth": 884
+    },
+    {
+      "viewport": 900,
+      "scrollWidth": 885
+    },
+    {
+      "viewport": 901,
+      "scrollWidth": 886
+    },
+    {
+      "viewport": 1024,
+      "scrollWidth": 1009
+    },
+    {
+      "viewport": 1100,
+      "scrollWidth": 1085
+    },
+    {
+      "viewport": 1280,
+      "scrollWidth": 1265
+    }
+  ],
+  "performance": {
+    "cycles": 5,
+    "heapBefore": 29073076,
+    "heapAfter": 27171696,
+    "domNodesBefore": 2026,
+    "domNodesAfter": 1197,
+    "longTasks": {
+      "count": 0,
+      "max": 0
+    },
+    "qualification": "Short local development-server trace; no production memory/performance guarantee"
+  },
+  "zoomMethod": "640 CSS px at 2x device scale, equivalent reflow space for 1280 px at 200%; native browser zoom/assistive technology remain manual gates"
+}
