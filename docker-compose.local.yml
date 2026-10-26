@@ -1,0 +1,42 @@
+services:
+  redis:
+    ports: !reset []
+
+  api:
+    volumes:
+      - ./apps/api:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg://testnow:testnow@postgres:5432/testnow_local
+      LOCAL_DEMO_MODE: "true"
+      SEED_DEMO_DATA: "true"
+
+  worker:
+    volumes:
+      - ./apps/api:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg://testnow:testnow@postgres:5432/testnow_local
+
+  scheduler:
+    volumes:
+      - ./apps/api:/app
+    environment:
+      DATABASE_URL: postgresql+psycopg://testnow:testnow@postgres:5432/testnow_local
+
+  web:
+    image: node:20-alpine
+    working_dir: /app
+    # Dependencies live in the named volume below; avoid reinstalling them on
+    # every container restart so the local server is available immediately.
+    command: npm --workspace @testnow/web run dev -- --hostname 0.0.0.0
+    environment:
+      API_INTERNAL_URL: http://api:8000
+    volumes:
+      - .:/app
+      - testnow_web_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  testnow_web_node_modules:

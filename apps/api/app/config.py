@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     openrouter_max_output_tokens: int = 16_384
     cors_origins: str = "http://localhost:3000"
     seed_demo_data: bool = False
+    local_demo_mode: bool = False
     super_admin_email: str = "utils@bodhaai.tech"
     super_admin_access_code: str | None = None
 

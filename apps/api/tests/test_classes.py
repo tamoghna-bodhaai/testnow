@@ -172,6 +172,7 @@ def test_teacher_can_create_and_publish_a_test_from_one_approved_pdf():
     assert saved.published_version_id is not None
     version=db.get(AssessmentVersion,saved.published_version_id)
     assert [item["id"] for item in version.content["questions"]]==["q1","q2","q3","q10"]
+    assert all(item.get("skill") for item in version.content["questions"])
     assert version.content["delivery_blueprint"]["instructions"]=="Use the supplied worksheet."
     assert version.content["delivery_blueprint"]["sections"][0]["title"]=="Worksheet 1"
 

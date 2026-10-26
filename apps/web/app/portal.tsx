@@ -12,6 +12,7 @@ import { AdminQuestionEditor } from "./question-editor";
 import { QuestionLibrary } from "./question-library";
 import { TeacherSupport } from "./teacher-support";
 import { useDialogFocus } from "./dialog-focus";
+import { AppConfirmHost, confirmApp } from "./app-confirm";
 
 type User = {
   id: string;
@@ -21,6 +22,17 @@ type User = {
   status?: "active" | "suspended" | "pending_code";
   last_login_at?: string;
 };
+type WorkspaceView =
+  | "home"
+  | "teacher-detail"
+  | "import"
+  | "reviews"
+  | "builder"
+  | "classes"
+  | "bank-import"
+  | "test-detail"
+  | "exam"
+  | "result";
 type AdminDashboard = {
   summary: {
     teachers: number;
@@ -149,6 +161,131 @@ type Test = {
     cancellation_reason?: string;
   } | null;
 };
+
+function LandingPage({ onSignIn }: { onSignIn: () => void }) {
+  return (
+    <main className="landing-page">
+      <header className="landing-nav">
+        <button className="landing-brand" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })} aria-label="TestNow home">
+          Test<span>Now</span>
+        </button>
+        <button className="landing-signin" onClick={onSignIn}>Sign in</button>
+      </header>
+
+      <section className="landing-hero" aria-labelledby="landing-title">
+        <div className="landing-copy">
+          <p className="landing-eyebrow">ASSESSMENTS, MADE CLEAR</p>
+          <h1 id="landing-title">Turn question banks into <em>better learning.</em></h1>
+          <p className="landing-intro">Create and organise question banks, build assessments in minutes, and understand learner performance—so you can teach with confidence.</p>
+          <button className="landing-primary" onClick={onSignIn}>Sign in to continue <span aria-hidden="true">→</span></button>
+        </div>
+
+        <section className="product-preview" aria-label="TestNow platform preview">
+          <div className="preview-topbar">
+            <b>TestNow</b>
+            <div><span>Class 10A</span><span className="preview-avatar">JS</span></div>
+          </div>
+          <div className="preview-content">
+            <aside className="preview-sidebar" aria-label="Platform sections">
+              <b className="preview-active">Overview</b><b>Question bank</b><b>Assessments</b><b>Results</b><b>Students</b>
+            </aside>
+            <div className="preview-main">
+              <div className="preview-stats">
+                <PreviewStat label="Questions" value="1,248" accent="gold" />
+                <PreviewStat label="Assessments" value="36" accent="indigo" />
+                <PreviewStat label="Students" value="180" accent="teal" />
+              </div>
+              <div className="preview-panels">
+                <section className="preview-panel">
+                  <div className="preview-heading"><b>Question bank coverage</b><span>View all →</span></div>
+                  <ProgressRow label="Algebra" value="92%" progress="92" tone="teal" />
+                  <ProgressRow label="Geometry" value="78%" progress="78" tone="indigo" />
+                  <ProgressRow label="Number systems" value="65%" progress="65" tone="sky" />
+                  <ProgressRow label="Data & probability" value="54%" progress="54" tone="sky" />
+                </section>
+                <section className="preview-panel preview-chart">
+                  <div className="preview-heading"><b>Class proficiency</b><span>Last 4 weeks</span></div>
+                  <div className="bars" aria-label="Class proficiency chart"><i style={{height:"46%"}}/><i style={{height:"67%"}}/><i style={{height:"82%"}}/><i style={{height:"56%"}}/></div>
+                  <div className="bar-labels"><span>Algebra</span><span>Geometry</span><span>Number</span><span>Data</span></div>
+                </section>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section className="landing-proof" aria-label="TestNow capabilities">
+        <div><b>Question banks</b><span>Organise and reuse high-quality questions by topic, standard, or skill.</span></div>
+        <div><b>Build assessments</b><span>Create quizzes, tests, and practice sets in minutes.</span></div>
+        <div><b>Understand performance</b><span>See class and individual insights to inform your next steps.</span></div>
+      </section>
+
+      <section className="landing-features" aria-labelledby="features-title">
+        <div className="feature-intro">
+          <p className="landing-eyebrow">ONE WORKSPACE, END TO END</p>
+          <h2 id="features-title">From paper to practical insight.</h2>
+          <p>TestNow brings the work before, during, and after an assessment into one clear workflow for teachers and students.</p>
+        </div>
+
+        <article className="feature-row upload-feature">
+          <div className="feature-copy">
+            <p className="feature-number">01 / QUESTION BANKS</p>
+            <h3>Upload a paper. Start with what you already have.</h3>
+            <p>Bring in existing question papers and turn them into structured, reusable questions. Review the content, organise it by subject and topic, then keep building your bank over time.</p>
+            <ul><li>Direct paper and document upload</li><li>Review questions before publishing</li><li>Organise by subject, chapter, and topic</li></ul>
+          </div>
+          <div className="feature-preview upload-preview" aria-label="Question paper upload preview">
+            <div className="upload-file"><span>Physics_unit-test.pdf</span><b>Ready to review</b></div>
+            <div className="upload-progress"><i /><span>Reading questions and options</span><b>84%</b></div>
+            <div className="upload-questions"><b>Q14</b><p>A body is projected at 30° with a speed of 20 m s⁻¹. Its maximum height is</p><span>Physics · Motion in a plane</span></div>
+            <div className="upload-tags"><span>MCQ</span><span>Grade 11</span><span>Needs review</span></div>
+          </div>
+        </article>
+
+        <article className="feature-row builder-feature">
+          <div className="feature-preview blueprint-preview" aria-label="Assessment creation preview">
+            <div className="blueprint-top"><b>New assessment</b><span>Save draft</span></div>
+            <div className="blueprint-fields"><div><small>Title</small><b>Algebra unit test</b></div><div><small>Class</small><b>Class 10A</b></div></div>
+            <div className="blueprint-summary"><span>12 questions</span><span>60 marks</span><span>45 minutes</span></div>
+            <ol><li><b>01</b><span>Linear equations</span><em>5 marks</em></li><li><b>02</b><span>Quadratic graphs</span><em>5 marks</em></li><li><b>03</b><span>Data interpretation</span><em>5 marks</em></li></ol>
+          </div>
+          <div className="feature-copy">
+            <p className="feature-number">02 / TEST CREATION</p>
+            <h3>Build the right test without rebuilding the work.</h3>
+            <p>Select questions from your bank, set the marks and duration, and assign the assessment to the right class. Drafts stay editable until you are ready to publish.</p>
+            <ul><li>Mix questions across your own bank</li><li>Set timing, marks, and availability</li><li>Assign to one class or many</li></ul>
+          </div>
+        </article>
+
+        <article className="feature-row cbt-feature">
+          <div className="feature-copy">
+            <p className="feature-number">03 / SECURE CBT DELIVERY</p>
+            <h3>Give students a focused test-day experience.</h3>
+            <p>Standard CBT controls make the assessment familiar and clear: an always-visible timer, question palette, saved answers, review flags, and a deliberate submit flow.</p>
+            <ul><li>Timer and question navigation</li><li>Answered, flagged, and unanswered states</li><li>Clear save and submit controls</li></ul>
+          </div>
+          <div className="feature-preview cbt-preview" aria-label="Computer-based test preview">
+            <div className="cbt-top"><b>Algebra unit test</b><span>00:28:17</span><button type="button">Submit test</button></div>
+            <div className="cbt-body"><aside><b>Question 14</b><span>Answered 10</span><span>Not answered 2</span><div>{Array.from({length: 10}, (_, index) => <i className={index === 3 ? "active" : index < 7 ? "answered" : ""} key={index}>{index + 11}</i>)}</div></aside><section><small>MATHEMATICS · ALGEBRA</small><h4>Which equation has exactly one solution for x?</h4><button type="button" className="chosen">A&nbsp;&nbsp; 2(x − 3) = 2x − 6</button><button type="button">B&nbsp;&nbsp; 4x + 5 = 4x + 1</button><button type="button">C&nbsp;&nbsp; 3(x + 2) = 3x + 6</button></section></div>
+          </div>
+        </article>
+
+        <section className="results-callout">
+          <div><p className="landing-eyebrow">AFTER THE TEST</p><h2>Know what to teach next.</h2><p>Results become a clear picture of class progress: what learners understood, where they struggled, and which topics deserve attention before the next assessment.</p></div>
+          <div className="result-metrics"><span><b>78%</b>average score</span><span><b>12</b>questions to revisit</span><span><b>4</b>topics needing support</span></div>
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function PreviewStat({ label, value, accent }: { label: string; value: string; accent: string }) {
+  return <div className={`preview-stat ${accent}`}><span>{label}</span><b>{value}</b><small>↑ this term</small></div>;
+}
+
+function ProgressRow({ label, value, progress, tone }: { label: string; value: string; progress: string; tone: string }) {
+  return <div className="progress-row"><span>{label}</span><div><i className={tone} style={{ width: `${progress}%` }} /></div><b>{value}</b></div>;
+}
 type Analytics = {
   summary: {
     assigned: number;
@@ -324,7 +461,7 @@ async function publishWithPreview(path: string, scope: string) {
   const preview = await api(`${path}/publication-preview`);
   const reasons = Object.entries(preview.blocking_reasons as Record<string, number>).map(([code, count]) => `${code.replaceAll("_", " ")}: ${count}`).join("\n");
   if (!preview.eligible && !preview.already_published) throw new Error(`No eligible questions in ${scope}. ${preview.blocked} blocked. ${reasons}`);
-  if (!window.confirm(`Publish eligible questions in ${scope}?\n\n${preview.eligible} eligible\n${preview.blocked} blocked\n${preview.already_published} already published${reasons ? `\n\nBlocking reasons (a question may have several):\n${reasons}` : ""}\n\nThe server will revalidate before publishing. Blocked questions remain excluded.`)) return null;
+  if (!await confirmApp(`Publish eligible questions in ${scope}?\n\n${preview.eligible} eligible\n${preview.blocked} blocked\n${preview.already_published} already published${reasons ? `\n\nBlocking reasons (a question may have several):\n${reasons}` : ""}\n\nThe server will revalidate before publishing. Blocked questions remain excluded.`)) return null;
   return api(`${path}/publish`, { method: "POST" });
 }
 function publicationMessage(result: any) {
@@ -374,19 +511,9 @@ function Notice({
 
 export function Portal() {
   const [user, setUser] = useState<User | null>(null),
+    [showLanding, setShowLanding] = useState(true),
     [error, setError] = useState(""),
-    [view, setView] = useState<
-      | "home"
-      | "teacher-detail"
-      | "import"
-      | "reviews"
-      | "builder"
-      | "classes"
-      | "bank-import"
-      | "test-detail"
-      | "exam"
-      | "result"
-    >("home"),
+    [view, setView] = useState<WorkspaceView>("home"),
     [supportTeacher,setSupportTeacher]=useState<string|null>(null),
     [tests, setTests] = useState<Test[]>([]),
     [questions, setQuestions] = useState<Question[]>([]),
@@ -400,6 +527,7 @@ export function Portal() {
     [builderImportId, setBuilderImportId] = useState<string | null>(null),
     [openAssignmentAfterCreate, setOpenAssignmentAfterCreate] = useState(false),
     [attempt, setAttempt] = useState<any>(null),
+    [pendingTest, setPendingTest] = useState<Test | null>(null),
     [index, setIndex] = useState(0),
     [message, setMessage] = useState("");
   const previousJobs = useRef<Map<string, string>>(new Map()),
@@ -493,13 +621,15 @@ export function Portal() {
       });
       await load(x);
     } catch (e: any) {
-      setError(e.message);
+      setMessage(e.message);
     }
   };
+  if (!user && showLanding) return <LandingPage onSignIn={() => setShowLanding(false)} />;
   if (!user)
     return (
       <main className="auth">
-        <div className="brand">
+        <div className="brand auth-brand">
+          <button className="auth-back" onClick={() => setShowLanding(true)}>← Back to TestNow</button>
           <b>TestNow</b>
           <span>SECURE CBT DELIVERY</span>
           <h1>Assessment, delivered with confidence.</h1>
@@ -509,19 +639,20 @@ export function Portal() {
           <h2>Sign in</h2>
           <form onSubmit={login} className="stacked-form">
             <div>
-              <label>I am a</label>
-              <select name="role" defaultValue="student">
+              <label htmlFor="login-role">I am a</label>
+              <select id="login-role" name="role" defaultValue="student">
                 <option value="student">Student</option>
                 <option value="teacher">Teacher</option>
               </select>
             </div>
             <div>
-              <label>Email</label>
-              <input name="email" type="email" autoComplete="email" required />
+              <label htmlFor="login-email">Email</label>
+              <input id="login-email" name="email" type="email" autoComplete="email" required />
             </div>
             <div>
-              <label htmlFor="teacher-access-code">5-digit access code</label>
+              <label htmlFor="login-access-code">5-digit access code</label>
               <input
+                id="login-access-code"
                 name="access_code"
                 inputMode="numeric"
                 pattern="[0-9]{5}"
@@ -545,6 +676,7 @@ export function Portal() {
     await api("/auth/logout", { method: "POST" });
     setUser(null);
     setView("home");
+    setShowLanding(true);
   };
   const openTest = (id: string, assignment = false) => {
     setSelectedTestId(id);
@@ -603,40 +735,46 @@ export function Portal() {
       return false;
     }
   };
+  if (pendingTest && !attempt)
+    return (
+      <ExamStartGate
+        test={pendingTest}
+        cancel={() => setPendingTest(null)}
+        start={async () => {
+          try {
+            const created = await api(`/tests/${pendingTest.id}/attempts`, { method: "POST" });
+            setPendingTest(null);
+            setAttempt(created);
+            setIndex(0);
+            setView("exam");
+          } catch (e: any) {
+            setMessage(e.message);
+            throw e;
+          }
+        }}
+      />
+    );
   if (user.role!=="admin" && typeof window!=="undefined" && window.location.pathname.startsWith("/admin/")) return <main className="page"><h1>Administrator access required</h1><p>This support workspace is restricted to administrators.</p><a href="/">Return to your dashboard</a></main>;
   return (
-    <main>
+    <main className="application-shell">
+      <AppConfirmHost />
       {view !== "exam" && (
-        <header>
-          <button className="logo" onClick={() => { if(user.role==="admin")window.location.assign("/");else setView("home"); }}>
-            Test<span>Now</span>
-          </button>
-          <nav>
-            {user.role === "teacher" && (
-              <>
-                <button className={view === "home" ? "active" : ""} onClick={() => setView("home")}>Dashboard</button>
-                <button className={view === "classes" ? "active" : ""} onClick={() => setView("classes")}>
-                  Class / batch
-                </button>
-                <button className={view === "import" ? "active" : ""} onClick={() => setView("import")}>Import paper</button>
-                <button className={view === "reviews" ? "active" : ""} onClick={() => setView("reviews")}>
-                  Review papers
-                </button>
-                <button className={view === "builder" ? "active" : ""} onClick={() => { setBuilderImportId(null); setView("builder"); }}>Build test</button>
-              </>
-            )}
-            {user.role === "admin" && (
-              <>
-                <button className={view === "home" ? "active" : ""} onClick={() => window.location.assign("/")}>Admin dashboard</button>
-                <button className={view === "bank-import" ? "active" : ""} onClick={() => {if(view==="teacher-detail")window.location.assign("/admin/banks");else{window.history.pushState({},"","/admin/banks");setView("bank-import");}}}>
-                  Question banks
-                </button>
-              </>
-            )}
-            <button onClick={logout}>Sign out</button>
-          </nav>
-        </header>
+        <WorkspaceSidebar
+          user={user}
+          view={view}
+          navigate={(next) => {
+            if (next === "builder") setBuilderImportId(null);
+            if (next === "bank-import") {
+              if (view === "teacher-detail") { window.location.assign("/admin/banks"); return; }
+              window.history.pushState({}, "", "/admin/banks");
+            }
+            setView(next);
+          }}
+          home={() => { if (user.role === "admin") window.location.assign("/"); else setView("home"); }}
+          logout={logout}
+        />
       )}
+      <section className={view === "exam" ? "exam-shell" : "workspace-content"}>
       {message && <div className="toast">{message}</div>}
       {view === "home" &&
         (user.role === "student" ? (
@@ -645,15 +783,8 @@ export function Portal() {
             tests={tests}
             classes={studentClasses}
             start={async (id) => {
-              try {
-                setAttempt(
-                  await api(`/tests/${id}/attempts`, { method: "POST" }),
-                );
-                setIndex(0);
-                setView("exam");
-              } catch (e: any) {
-                setMessage(e.message);
-              }
+              const test = tests.find((item) => item.id === id);
+              if (test) setPendingTest(test);
             }}
             viewResult={(id) => {
               setAttempt({ id });
@@ -805,8 +936,43 @@ export function Portal() {
         />
       )}
       {view === "result" && attempt && <Result attempt={attempt} />}
+      </section>
     </main>
   );
+}
+
+function WorkspaceSidebar({ user, view, navigate, home, logout }: {
+  user: User;
+  view: WorkspaceView;
+  navigate: (view: WorkspaceView) => void;
+  home: () => void;
+  logout: () => void;
+}) {
+  const teacherItems: { view: WorkspaceView; label: string; detail: string }[] = [
+    { view: "home", label: "Dashboard", detail: "Your teaching overview" },
+    { view: "classes", label: "Classes & batches", detail: "Students and rosters" },
+    { view: "import", label: "Import papers", detail: "Add source material" },
+    { view: "reviews", label: "Review papers", detail: "Prepare questions" },
+    { view: "builder", label: "Build assessment", detail: "Create and assign tests" },
+  ];
+  const adminItems: { view: WorkspaceView; label: string; detail: string }[] = [
+    { view: "home", label: "Admin dashboard", detail: "Platform overview" },
+    { view: "bank-import", label: "Question banks", detail: "Manage shared content" },
+  ];
+  const studentItems: { view: WorkspaceView; label: string; detail: string }[] = [
+    { view: "home", label: "My assessments", detail: "Upcoming and completed tests" },
+  ];
+  const items = user.role === "teacher" ? teacherItems : user.role === "admin" ? adminItems : studentItems;
+  const initials = user.name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "TN";
+  return <aside className="workspace-sidebar" aria-label="Application navigation">
+    <button className="workspace-brand" onClick={home} aria-label="TestNow dashboard">Test<span>Now</span></button>
+    <div className="workspace-context"><span className="workspace-avatar" aria-hidden="true">{initials}</span><div><b>{user.name}</b><small>{user.role === "teacher" ? "Teacher workspace" : user.role === "admin" ? "Administrator" : "Student workspace"}</small></div></div>
+    <nav className="workspace-nav" aria-label="Workspace sections">
+      <p>Workspace</p>
+      {items.map((item) => <button type="button" key={item.view} className={view === item.view ? "active" : ""} onClick={() => navigate(item.view)}><b>{item.label}</b><small>{item.detail}</small></button>)}
+    </nav>
+    <div className="workspace-sidebar-footer"><button type="button" className="sidebar-signout" onClick={logout}>Sign out</button></div>
+  </aside>;
 }
 
 function ImportSummary({ job, open }: { job: ImportJob; open: () => void }) {
@@ -839,6 +1005,11 @@ function ImportSummary({ job, open }: { job: ImportJob; open: () => void }) {
     </article>
   );
 }
+function OverviewChart({title, description, rows}: {title:string; description:string; rows:{label:string;value:number}[]}) {
+  const maximum = Math.max(1, ...rows.map(row => row.value));
+  return <section className="card overview-chart"><h2>{title}</h2><p>{description}</p>{rows.length ? <div className="overview-chart-rows">{rows.map((row,index) => <div className="overview-chart-row" key={`${row.label}-${index}`}><span>{row.label}</span><meter min={0} max={maximum} value={row.value} aria-label={`${row.label}: ${row.value}`}/><b>{row.value.toLocaleString()}</b></div>)}</div> : <p>No data yet. Your activity will appear here.</p>}</section>;
+}
+
 function TeacherHome({
   tests,
   questionCount,
@@ -861,8 +1032,9 @@ function TeacherHome({
   const actionable = jobs.filter((job) => job.status !== "approved"),
     students = classes.reduce((total, item) => total + item.student_count, 0),
     published = tests.filter((test) => test.status === "published").length;
+  const [error, setError] = useState("");
   const deleteTest = async (test: Test) => {
-    if (!window.confirm(`Delete “${test.title}”? This cannot be undone.`)) return;
+    if (!await confirmApp(`Delete “${test.title}”? This cannot be undone.`)) return;
     try {
       await api(`/tests/${test.id}`, { method: "DELETE" });
       onTestDeleted(test.id);
@@ -870,13 +1042,18 @@ function TeacherHome({
       // unrelated question-library failure cannot report it as unsuccessful.
       void Promise.resolve(refresh()).catch(() => {});
     } catch (e: any) {
-      window.alert(e.message);
+      setError(e.message);
     }
   };
   return (
     <div className="page">
       <p className="eyebrow">TEACHER WORKSPACE</p>
       <h1>Assessment control centre</h1>
+      <div className="role-overview">
+        <OverviewChart title="Assessment pipeline" description="Current assessments by publication status" rows={['draft','published','archived'].map(status=>({label:status,value:tests.filter(test=>test.status===status).length}))}/>
+        <OverviewChart title="Class enrolment" description="Student enrolments across your classes and batches" rows={classes.map(item=>({label:item.name,value:item.student_count}))}/>
+      </div>
+      {error && <Notice kind="error">{error}</Notice>}
       <div className="stats">
         <Card>
           <b>{classes.length}</b>
@@ -995,7 +1172,7 @@ function AdminHome({
     }
   };
   const toggle = async (teacher: AdminDashboard["teachers"][number]) => {
-    if(!window.confirm(`${teacher.status==="suspended"?"Reactivate":"Suspend"} ${teacher.name} (${teacher.email})? ${teacher.status==="suspended"?"Sign-in will be restored.":"Sign-in will be blocked and existing sessions revoked."} Tests and attempts are preserved.`))return;
+    if(!await confirmApp(`${teacher.status==="suspended"?"Reactivate":"Suspend"} ${teacher.name} (${teacher.email})? ${teacher.status==="suspended"?"Sign-in will be restored.":"Sign-in will be blocked and existing sessions revoked."} Tests and attempts are preserved.`))return;
     try {
       await api(`/admin/teachers/${teacher.id}`, {
         method: "PUT",
@@ -1017,6 +1194,10 @@ function AdminHome({
     <div className="page">
       <p className="eyebrow">SUPER ADMIN</p>
       <h1>Teacher and platform management</h1>
+      <div className="role-overview">
+        <OverviewChart title="Teacher access" description="Current account status across the platform" rows={[{label:'Active',value:dashboard.summary.active_teachers},{label:'Suspended',value:dashboard.summary.suspended_teachers},{label:'Awaiting access',value:Math.max(0,dashboard.summary.teachers-dashboard.summary.active_teachers-dashboard.summary.suspended_teachers)}]}/>
+        <OverviewChart title="Assessment participation" description="Attempts recorded across all teacher accounts" rows={[{label:'Total attempts',value:dashboard.teachers.reduce((sum,item)=>sum+item.attempt_count,0)},{label:'Submitted',value:dashboard.teachers.reduce((sum,item)=>sum+item.submitted_count,0)},{label:'Assessments',value:dashboard.teachers.reduce((sum,item)=>sum+item.test_count,0)}]}/>
+      </div>
       {error && <Notice kind="error">{error}</Notice>}
       <div className="stats">
         <Card>
@@ -1222,8 +1403,8 @@ function ClassesScreen({
             <h2>Create class / batch</h2>
             <form onSubmit={create} className="stacked-form">
               <div>
-                <label>Name</label>
-                <input name="name" placeholder="e.g. Physics 12A" required />
+                <label htmlFor="class-name">Name</label>
+                <input id="class-name" name="name" placeholder="e.g. Physics 12A" required />
               </div>
               <div>
                 <label>
@@ -1267,16 +1448,17 @@ function ClassesScreen({
               <form onSubmit={addStudent} className="stacked-form compact-form">
                 <h3>Add or update student</h3>
                 <div>
-                  <label>Name</label>
-                  <input name="name" required />
+                  <label htmlFor="student-name">Name</label>
+                  <input id="student-name" name="name" required />
                 </div>
                 <div>
-                  <label>Email</label>
-                  <input name="email" type="email" required />
+                  <label htmlFor="student-email">Email</label>
+                  <input id="student-email" name="email" type="email" required />
                 </div>
                 <div>
-                  <label>5-digit access code</label>
+                  <label htmlFor="student-access-code">5-digit access code</label>
                   <input
+                    id="student-access-code"
                     name="access_code"
                     inputMode="numeric"
                     pattern="[0-9]{5}"
@@ -1314,6 +1496,7 @@ function ClassesScreen({
                         className="text-danger"
                         onClick={async () => {
                           if (!detail) return;
+                          if (!await confirmApp(`Remove ${student.name} from ${detail.name}? Their account and assessment history will be preserved.`)) return;
                           await api(
                             `/classes/${detail.id}/members/${student.id}`,
                             { method: "DELETE" },
@@ -1407,7 +1590,7 @@ function TestDetail({
     }
   };
   const deleteCurrentTest = async () => {
-    if (!window.confirm(`Delete “${test.title}”? This cannot be undone.`)) return;
+    if (!await confirmApp(`Delete “${test.title}”? This cannot be undone.`)) return;
     setDeleting(true);
     setError("");
     try {
@@ -1504,7 +1687,9 @@ function TestDetail({
             assessment.
           </p>
           {test.questions?.map((q) => (
-            <QuestionCard key={q.id} q={q} mode="teacher" />
+            <div key={q.id}>
+              <QuestionCard q={q} mode="teacher" />
+            </div>
           ))}
         </Card>
       )}
@@ -1545,11 +1730,11 @@ function TestDetail({
           </form>
         </Card>
       )}
-      {tab === "analytics" && <AnalyticsPanel analytics={analytics} />}
+      {tab === "analytics" && <AnalyticsPanel analytics={analytics} testId={test.id} />}
     </div>
   );
 }
-function AnalyticsPanel({ analytics }: { analytics: Analytics | null }) {
+function AnalyticsPanel({ analytics, testId }: { analytics: Analytics | null; testId:string }) {
   if (!analytics) return <Card>Loading analytics…</Card>;
   return (
     <>
@@ -1580,6 +1765,7 @@ function AnalyticsPanel({ analytics }: { analytics: Analytics | null }) {
           <span>Integrity flags</span>
         </Card>
       </div>
+      <TeacherDiagnostics testId={testId} />
       <Card>
         <div className="section-heading">
           <div>
@@ -1706,7 +1892,7 @@ function ImportScreen({
   };
   const active = job?.status === "uploaded" || job?.status === "processing";
   const deleteImport = async (item: ImportJob) => {
-    if (!window.confirm(`Delete “${item.meta?.paper_title || item.filename || "this import"}”?`)) return;
+    if (!await confirmApp(`Delete “${item.meta?.paper_title || item.filename || "this import"}”?`)) return;
     setDeletingId(item.id);
     setError("");
     try {
@@ -1861,6 +2047,17 @@ function ImportReview({
   useEffect(() => setQuestionIndex(0), [job.id]);
   const reviewQuestions = job.questions || [],
     currentQuestion = reviewQuestions[questionIndex];
+  useEffect(() => {
+    setQuestionIndex((index) => Math.min(index, Math.max(0, reviewQuestions.length - 1)));
+  }, [reviewQuestions.length]);
+  const moveToQuestion = (nextIndex: number) => {
+    setQuestionIndex(nextIndex);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const questionDeleted = () => {
+    setQuestionIndex((index) => Math.max(0, Math.min(index, reviewQuestions.length - 2)));
+    void refresh();
+  };
   const reextract = async () => {
     setBusy(true);
     try {
@@ -1933,21 +2130,24 @@ function ImportReview({
         </Card>
       ) : currentQuestion ? (
         <>
-          <div className="review-question-context">
-            <span>Question {questionIndex + 1} of {reviewQuestions.length}</span>
-            <span>{currentQuestion.kind.replaceAll("_", " ")}</span>
+          <div className="review-navigation" aria-label="Question navigation">
+            <div className="review-question-context">
+              <span>Question {questionIndex + 1} of {reviewQuestions.length}</span>
+              <span>{currentQuestion.kind.replaceAll("_", " ")}</span>
+            </div>
+            <div className="review-pagination">
+              <button type="button" className="secondary-action" disabled={!questionIndex} onClick={() => moveToQuestion(questionIndex - 1)}>Previous</button>
+              <span>{questionIndex + 1} / {reviewQuestions.length}</span>
+              <button type="button" className="secondary-action" disabled={questionIndex === reviewQuestions.length - 1} onClick={() => moveToQuestion(questionIndex + 1)}>Next question</button>
+            </div>
           </div>
           <ReviewQuestion
             key={currentQuestion.id}
             jobId={job.id}
             question={currentQuestion}
             onChanged={refresh}
+            onDeleted={questionDeleted}
           />
-          <div className="review-pagination">
-            <button type="button" className="secondary-action" disabled={!questionIndex} onClick={() => setQuestionIndex((index) => index - 1)}>Previous</button>
-            <span>{questionIndex + 1} / {reviewQuestions.length}</span>
-            <button type="button" className="secondary-action" disabled={questionIndex === reviewQuestions.length - 1} onClick={() => setQuestionIndex((index) => index + 1)}>Next question</button>
-          </div>
         </>
       ) : (
         <Card><p>No extracted questions are ready to review yet.</p></Card>
@@ -1973,10 +2173,12 @@ function ReviewQuestion({
   jobId,
   question,
   onChanged,
+  onDeleted,
 }: {
   jobId: string;
   question: Question;
   onChanged: () => void;
+  onDeleted: () => void;
 }) {
   const multiple = question.kind === "multiple_choice",
     written = ["numerical", "integer", "subjective"].includes(question.kind),
@@ -2033,11 +2235,37 @@ function ReviewQuestion({
           : [...current, index].sort((a: number, b: number) => a - b)
         : [index],
     );
+  const ignoreWarningAndApprove = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/teacher/imports/${jobId}/questions/${question.id}/ignore-warnings`, { method: "POST" });
+      await onChanged();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const deleteQuestion = async () => {
+    if (!await confirmApp("Delete this extracted question? This cannot be undone.")) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/teacher/imports/${jobId}/questions/${question.id}`, { method: "DELETE" });
+      onDeleted();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const hasWarnings = (question.interaction?.ingestion_issues || []).length > 0;
   return (
     <Card className="review-question">
       <QuestionCard q={question} mode="teacher" />
       {needsFigureAdjustment(question) && <FigureEditor questionId={question.id} options={question.options} api={api} done={onChanged} />}
-      {(question.interaction?.ingestion_issues || []).length > 0 && <Notice kind="error">
+      {hasWarnings && <Notice kind="error">
         Needs review: {question.interaction.ingestion_issues.join(", ")}
       </Notice>}
       {!question.approved && (
@@ -2097,10 +2325,18 @@ function ReviewQuestion({
             <button type="button" onClick={() => save(true)} disabled={busy}>
               {busy ? "Saving…" : "Approve question"}
             </button>
+            {hasWarnings && <button type="button" className="secondary-action" onClick={ignoreWarningAndApprove} disabled={busy}>
+              Ignore all warnings & approve
+            </button>}
           </div>
           {error && <Notice kind="error">{error}</Notice>}
         </div>
       )}
+      <div className="review-question-actions">
+        <button type="button" className="text-danger" onClick={deleteQuestion} disabled={busy}>
+          Delete question
+        </button>
+      </div>
     </Card>
   );
 }
@@ -2123,7 +2359,7 @@ function Builder({
     [banks, setBanks] = useState<any[]>([]),
     [bankId, setBankId] = useState(""),
     [nodes, setNodes] = useState<any[]>([]),
-    [source, setSource] = useState<"bank" | "mine">("bank"),
+    [source, setSource] = useState<"bank" | "mine">("mine"),
     [paperId, setPaperId] = useState(initialImportId || ""),
     [includeWholePaper, setIncludeWholePaper] = useState(!!initialImportId),
     [sourceJobs, setSourceJobs] = useState<ImportJob[]>(imports),
@@ -2353,30 +2589,8 @@ function Builder({
           </div>
         </Card>
         <Card className="builder-library">
-          <h2>
-            {source === "bank"
-              ? `${activeBank?.name || "Global"} global question bank`
-              : activePaper
-                ? `Approved questions from ${activePaper.meta?.paper_title || activePaper.filename || "selected paper"}`
-                : "Your approved questions"}
-          </h2>
-          <div className="stacked-form compact-form">
-            <label>
-              Question source
-              <select
-                value={source}
-                onChange={(e) => {
-                  setSource(e.target.value as "bank" | "mine");
-                  setPage(1);
-                  setSelected([]);
-                }}
-              >
-                <option value="bank" disabled={!bankId}>
-                  Global bank
-                </option>
-                <option value="mine">My approved questions</option>
-              </select>
-            </label>
+          <h2>{activePaper ? `Approved questions from ${activePaper.meta?.paper_title || activePaper.filename || "selected paper"}` : "Your approved questions"}</h2>
+          <div className="stacked-form compact-form builder-source-controls">
             {source === "bank" && (
               <>
                 <label>
@@ -2483,7 +2697,7 @@ function Builder({
                     setSelected([]);
                   }}
                 >
-                  <option value="">All approved papers (manual selection)</option>
+                  <option value="">All approved PDFs</option>
                   {sourceImports.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.meta?.paper_title || item.filename || "Imported paper"} ({item.approved_count})
@@ -2560,7 +2774,7 @@ function Builder({
           </div>
           <div className="builder-selection-summary">
             <span><small>Questions</small><b>{directPaperMode ? activePaper.approved_count : selected.length}</b></span>
-            <span><small>Source</small><b>{source === "bank" ? "Bank" : directPaperMode ? "One PDF" : "Mine"}</b></span>
+            <span><small>Source PDF</small><b>{activePaper ? activePaper.meta?.paper_title || activePaper.filename || "Selected PDF" : "Multiple PDFs"}</b></span>
           </div>
           <div className="builder-selection-list">
             {directPaperMode ? (
@@ -2583,7 +2797,7 @@ function Builder({
                   return <span key={id}><b>{questionNumber(question?.source_number || String(index + 1))}</b><button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button></span>;
                 })}</div>
               </details>
-            </> : <p>Add questions from the library to build your test.</p>}
+            </> : <p className="builder-selection-empty">Add questions from the library to build your test.</p>}
           </div>
           <button className="builder-selection-submit" disabled={directPaperMode ? !(activePaper.approved_count || mine.total) : !selected.length}>
             {directPaperMode
@@ -2680,7 +2894,7 @@ function StudentHome({
           <Card>
             <span className="stat-icon pending">◷</span>
             <b>{pending}</b>
-            <span>Pending tests</span>
+            <span>Still to complete</span>
           </Card>
           <Card>
             <span className="stat-icon progress">↗</span>
@@ -2689,6 +2903,19 @@ function StudentHome({
           </Card>
         </div>
       </section>
+      {tests.some((test) => test.availability === "available" && test.latest_attempt?.status !== "submitted") && (
+        <Card className="student-next-step">
+          <div>
+            <p className="eyebrow">NEXT UP</p>
+            <h2>{tests.find((test) => test.latest_attempt?.status === "in_progress")?.title || tests.find((test) => test.availability === "available")?.title}</h2>
+            <p>{tests.find((test) => test.latest_attempt?.status === "in_progress") ? "You have an assessment in progress. Resume when you are ready." : "This assessment is available now. Check the duration before you begin."}</p>
+          </div>
+          <button onClick={() => start((tests.find((test) => test.latest_attempt?.status === "in_progress") || tests.find((test) => test.availability === "available"))!.id)}>
+            {tests.some((test) => test.latest_attempt?.status === "in_progress") ? "Resume assessment" : "Review & start"}
+          </button>
+        </Card>
+      )}
+      <StudentProgress />
       <div className="assessment-heading">
         <div>
           <p className="eyebrow">MY ASSESSMENTS</p>
@@ -2698,7 +2925,7 @@ function StudentHome({
       </div>
       <div className="cards student-test-cards">
         {tests.length ? (
-          tests.map((t) => {
+          [...tests].sort((a, b) => Number(b.latest_attempt?.status === "in_progress") - Number(a.latest_attempt?.status === "in_progress") || Number(b.availability === "available") - Number(a.availability === "available")).map((t) => {
             const latest = t.latest_attempt;
             const submitted = latest?.status === "submitted";
             const cancelled = latest?.status === "cancelled";
@@ -3127,7 +3354,7 @@ function QuestionBankManager({
   };
   const [removedBanks,setRemovedBanks]=useState<Bank[]>([]);
   const showRemoved=async()=>{try{setRemovedBanks((await api("/admin/question-banks?include_deleted=true")).filter((bank:Bank)=>bank.status==="deleted"));}catch(error:any){setError(error.message);}};
-  const restoreBank=async(bank:Bank)=>{if(!window.confirm(`Restore ${bank.name} (${bank.id}) with its prior visibility? Content readiness remains enforced.`))return;try{await api(`/admin/question-banks/${bank.id}/restore`,{method:"POST"});await load();await showRemoved();notify("Bank restored. Content readiness checks remain in effect.");}catch(error:any){setError(error.message);}};
+  const restoreBank=async(bank:Bank)=>{if(!await confirmApp(`Restore ${bank.name} (${bank.id}) with its prior visibility? Content readiness remains enforced.`))return;try{await api(`/admin/question-banks/${bank.id}/restore`,{method:"POST"});await load();await showRemoved();notify("Bank restored. Content readiness checks remain in effect.");}catch(error:any){setError(error.message);}};
   const [workspace,setWorkspace]=useState<"add"|"monitor"|"review">(()=>["add","review"].includes(locationParam("task"))?locationParam("task") as "add"|"review":"monitor");
   useEffect(()=>{if(uploadConfig&&uploadFormRef.current)reviewUploadForm(uploadFormRef.current);},[uploadConfig,workspace]);
   const bankRequests = useRef(new LatestRequest()), documentRequests = useRef(new LatestRequest());
@@ -3135,7 +3362,7 @@ function QuestionBankManager({
   const editingQuestionRef=useRef(editingQuestion);editingQuestionRef.current=editingQuestion;
   const dirtyQuestion = useRef(false), lastUrl = useRef(""), restoreSequence = useRef(0);
   const [loadingBank, setLoadingBank] = useState(false), [stale, setStale] = useState(false), [lastUpdated, setLastUpdated] = useState<string | null>(null);
-  const canLeave = () => !dirtyQuestion.current || window.confirm("Discard unsaved question edits?");
+  const canLeave = () => !dirtyQuestion.current ? Promise.resolve(true) : confirmApp("Discard unsaved question edits?");
   const navigateTo = (documentId?: string, questionId?: string, replace = false) => {
     if (!activeBank.current) return;
     const url = bankUrl({ bankId: activeBank.current, documentId, questionId }) + window.location.search;
@@ -3145,7 +3372,7 @@ function QuestionBankManager({
   const load = async () => setBanks(await api("/admin/question-banks"));
   const open = async (id: string, updateUrl = true) => {
     const changing = activeBank.current !== id;
-    if (changing && !canLeave()) return;
+    if (changing && !await canLeave()) return;
     const request = bankRequests.current.start(id);
     activeBank.current = id;
     setError(""); setLoadingBank(true); setStale(false);
@@ -3164,7 +3391,7 @@ function QuestionBankManager({
     } finally { if (request.current()) setLoadingBank(false); }
   };
   const restoreLocation = async () => {
-    if (!canLeave()) { window.history.pushState({}, "", lastUrl.current); return; }
+    if (!await canLeave()) { window.history.pushState({}, "", lastUrl.current); return; }
     const location = readBankLocation(window.location.pathname, window.location.hash);
     if (!location) { documentRequests.current.cancel(); setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); return; }
     dirtyQuestion.current = false;setFigureEditing(false);
@@ -3239,13 +3466,13 @@ function QuestionBankManager({
     const timer = window.setInterval(() => { api(`/admin/question-banks/${bankId}/figure-revalidation`).then((run) => { if (!cancelled && activeBank.current === bankId) setFigureRevalidation(run); }).catch((error) => { if (!cancelled && activeBank.current === bankId) setError(error.message); }); }, 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [detail?.id, figureRevalidation?.status]);
-  const editQuestion = (question: Question | null) => {
-    if (!canLeave()) return;
+  const editQuestion = async (question: Question | null) => {
+    if (!await canLeave()) return;
     dirtyQuestion.current = false; setFigureEditing(false); setEditingQuestion(question);
     navigateTo(activeDocument.current || undefined, question?.id);
   };
-  const closeDocument = () => {
-    if (!canLeave()) return;
+  const closeDocument = async () => {
+    if (!await canLeave()) return;
     dirtyQuestion.current = false; setFigureEditing(false); activeDocument.current = null; documentRequests.current.cancel();
     setSelectedImport(null); setSelectedQuestions(null); setEditingQuestion(null); navigateTo();
   };
@@ -3360,7 +3587,7 @@ function QuestionBankManager({
   const deleteImport = async (job: ImportJob) => {
     if (
       !detail || activeBank.current !== detail.id ||
-      !window.confirm(
+      !await confirmApp(
         `Permanently delete ${job.filename} and its extracted questions from ${detail.name}? Assessment references are protected. Recovery requires uploading the original source again.`,
       )
     )
@@ -3383,7 +3610,7 @@ function QuestionBankManager({
   const reextractImport = async (job: ImportJob) => {
     if (
       !detail || activeBank.current !== detail.id ||
-      !window.confirm(
+      !await confirmApp(
         `Re-extract ${job.filename}? Its current extracted questions will be replaced using the same stored source file.`,
       )
     )
@@ -3447,7 +3674,7 @@ function QuestionBankManager({
   };
   const approveGeneratedSolutions = async (job: ImportJob) => {
     if (!detail || !job.meta?.solution_generation?.run_id) return;
-    if (!window.confirm("Approve every successfully generated question in this run? Questions with separate extraction, taxonomy, or visual issues will stay in review.")) return;
+    if (!await confirmApp("Approve every successfully generated question in this run? Questions with separate extraction, taxonomy, or visual issues will stay in review.")) return;
     setBusy(true); setError("");
     try {
       const runId = job.meta.solution_generation.run_id;
@@ -3477,7 +3704,7 @@ function QuestionBankManager({
   const remove = async () => {
     if (
       !detail || activeBank.current !== detail.id ||
-      !window.confirm(`Hide ${detail.name} from the library? Content and assessment history are preserved. Restore it from Removed banks when needed.`)
+      !await confirmApp(`Hide ${detail.name} from the library? Content and assessment history are preserved. Restore it from Removed banks when needed.`)
     )
       return;
     setBusy(true);
@@ -3493,7 +3720,7 @@ function QuestionBankManager({
     }
   };
   const inspectImport = async (job: ImportJob) => {
-    if (!detail || activeBank.current !== detail.id || !canLeave()) return;
+    if (!detail || activeBank.current !== detail.id || !await canLeave()) return;
     const bankId = detail.id;
     const request = documentRequests.current.start(`${bankId}/${job.id}`);
     activeDocument.current = job.id; dirtyQuestion.current = false; setBusy(true); setError("");
@@ -3514,7 +3741,7 @@ function QuestionBankManager({
     if(questionId){const updated=await api(`/admin/question-banks/${detail.id}/questions/${questionId}`);if(activeBank.current===detail.id)setEditingQuestion(updated);}
   };
   const deleteQuestion = async (question: Question) => {
-    if (!detail || !selectedImport || !window.confirm(`Delete ${questionNumber(question.source_number)} as an invalid extracted question? This cannot be undone.`)) return;
+    if (!detail || !selectedImport || !await confirmApp(`Delete ${questionNumber(question.source_number)} as an invalid extracted question? This cannot be undone.`)) return;
     setBusy(true); setError("");
     try {
       await api(`/admin/question-banks/${detail.id}/imports/${selectedImport.id}/questions/${question.id}`, { method: "DELETE" });
@@ -3610,7 +3837,10 @@ function QuestionBankManager({
               </button>
             ))}
             {!visibleBanks.length && (
-              <p className="bank-list-empty">No banks match this filter.</p>
+              <div className="bank-list-empty">
+                <b>{banks.length ? "No banks match this filter." : "Start your first question bank."}</b>
+                <p>{banks.length ? "Try a different name or status." : "Create a draft, add a source document, then review and publish questions when they are ready."}</p>
+              </div>
             )}
           </div>
         </Card>
@@ -3676,7 +3906,7 @@ function QuestionBankManager({
                 <p>Each source document stays private until confirmed. Preview publication to see eligible, blocked and already published question counts. Only eligible questions become available for new tests.</p>
               </Card>
               {detail.readiness && <Notice>Full bank: {detail.readiness.total} questions · {detail.readiness.publishable} ready · {detail.readiness.blocked} with blocking content issues · {detail.readiness.needs_review} awaiting review (counts can overlap). <a href={`/api/admin/question-banks/${detail.id}/readiness-report`} target="_blank" rel="noreferrer">Open nonmutating readiness report</a></Notice>}
-              <nav className="ingestion-task-tabs" aria-label="Bank workspace task">{([['monitor','Monitor imports'],['add','Add sources'],['review','Review library']] as const).map(([value,label])=><button type="button" key={value} className={workspace===value?"active":"secondary-action"} onClick={()=>{if(canLeave()){dirtyQuestion.current=false;setFigureEditing(false);setEditingQuestion(null);setWorkspace(value);replaceLocationParams({task:value});}}}>{label}</button>)}</nav>
+              <nav className="ingestion-task-tabs" aria-label="Bank workspace task">{([['monitor','Monitor imports'],['add','Add sources'],['review','Review library']] as const).map(([value,label])=><button type="button" key={value} className={workspace===value?"active":"secondary-action"} onClick={async()=>{if(await canLeave()){dirtyQuestion.current=false;setFigureEditing(false);setEditingQuestion(null);setWorkspace(value);replaceLocationParams({task:value});}}}>{label}</button>)}</nav>
               {workspace === "add" && <Card className="bank-upload-card">
                 <h2>Upload source documents</h2>
                 <form ref={uploadFormRef} onSubmit={upload} onChange={event=>reviewUploadForm(event.currentTarget)} className="stacked-form">
@@ -4044,6 +4274,24 @@ function QuestionCard({
     </article>
   );
 }
+function ExamStartGate({ test, start, cancel }: { test: Test; start: () => Promise<void>; cancel: () => void }) {
+  const [starting, setStarting] = useState(false), [error, setError] = useState("");
+  const begin = async () => {
+    setError("");
+    setStarting(true);
+    try {
+      if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
+      await start();
+    } catch {
+      if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
+      setError("We couldn't start the secure attempt. Allow fullscreen, check your connection, and try again.");
+    } finally {
+      setStarting(false);
+    }
+  };
+  return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">READY TO BEGIN</p><h1>Review before your timed attempt starts</h1><p><b>{test.title}</b> · {test.question_count} questions · {Math.ceil(test.duration_seconds / 60)} minutes</p><ul><li>Your timer begins only after you continue below.</li><li>Fullscreen keeps the assessment focused and enables integrity monitoring.</li><li>Leaving fullscreen, changing apps, or hiding the page may flag or cancel the attempt.</li></ul>{error && <Notice kind="error">{error}</Notice>}<div className="exam-intro-actions"><button className="secondary-action" onClick={cancel} disabled={starting}>Back to assessments</button><button onClick={() => void begin()} disabled={starting}>{starting ? "Starting secure attempt…" : "Start secure attempt"}</button></div></div></main>;
+}
+
 function Exam({
   attempt,
   index,
@@ -4062,7 +4310,7 @@ function Exam({
   returnHome: () => Promise<void>;
 }) {
   const blueprint = attempt.delivery_blueprint || { instructions: "Read every question carefully. Use Save & Next to record an answer.", sections: [{ id: "general", title: "General", question_ids: attempt.questions.map((question: any) => question.id) }] },
-    [started, setStarted] = useState(false),
+    [started, setStarted] = useState(() => Boolean(document.fullscreenElement)),
     [sectionId, setSectionId] = useState(blueprint.sections[0]?.id || "general"),
     [paletteOpen, setPaletteOpen] = useState(false),
     [submitReview, setSubmitReview] = useState(false),
@@ -4080,7 +4328,8 @@ function Exam({
     integrityTriggered = useRef(false),
     fullscreenEngaged = useRef(false),
     fullscreenRequestPending = useRef(false),
-    mounted = useRef(true);
+    mounted = useRef(true),
+    focusRef = useRef<{questionId:string;started:number;token:string}|null>(null);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
@@ -4092,6 +4341,18 @@ function Exam({
   const left = Math.max(0, new Date(attempt.ends_at).getTime() - now);
   useEffect(() => { setDraft(r.answer ?? null); setDraftReview(!!r.marked_for_review); setSaveError(""); }, [q.id, r.answer, r.marked_for_review]);
   useEffect(() => { if (started) void api(`/attempts/${attempt.id}/questions/${q.id}/visit`, { method: "POST" }); }, [attempt.id, q.id, started]);
+  const flushFocus=()=>{
+    const interval=focusRef.current;
+    if(!interval)return Promise.resolve();
+    focusRef.current=null;
+    const duration=Math.min(900000,Math.max(0,Math.round(performance.now()-interval.started)));
+    return api(`/attempts/${attempt.id}/questions/${interval.questionId}/focus-interval`,{method:"POST",body:JSON.stringify({interval_id:interval.token,duration_ms:duration})}).catch(()=>{});
+  };
+  useEffect(()=>{
+    if(!started)return;
+    focusRef.current={questionId:q.id,started:performance.now(),token:crypto.randomUUID()};
+    return ()=>{void flushFocus()};
+  },[attempt.id,q.id,started]);
   useEffect(() => {
     const closeOnEscape=(event:KeyboardEvent) => { if (event.key === "Escape") { setPaletteOpen(false); setSubmitReview(false); } };
     window.addEventListener("keydown",closeOnEscape);
@@ -4165,6 +4426,7 @@ function Exam({
   };
   const finishNormally = async () => {
     integrityTriggered.current = true;
+    await flushFocus();
     if (draftChanged) {
       setSaving(true);
       setSaveError("");
@@ -4213,7 +4475,7 @@ function Exam({
       if (!ok) setSaveError("Could not save this option. Check your connection and try again.");
     }
   };
-  if (!started) return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">SECURE CBT</p><h1>Your secure attempt has started</h1><p>{blueprint.instructions}</p><ul><li>The server timer is already running and integrity monitoring is active.</li><li>Keep this exam visible and in fullscreen until you submit.</li><li>Changing tabs, switching apps, hiding the page, or leaving fullscreen immediately cancels and flags the attempt.</li><li>On iPhone and iPad, app and tab switching is monitored even when browser fullscreen is unavailable.</li></ul>{startError && <Notice kind="error">{startError}</Notice>}<button onClick={startExam}>Continue in secure fullscreen</button></div></main>;
+  if (!started) return <main className="exam-intro"><div className="exam-intro-card"><p className="eyebrow">SECURE CBT</p><h1>Continue your secure attempt</h1><p>{blueprint.instructions}</p><ul><li>Your timer is running because this is a resumed attempt.</li><li>Keep this exam visible and in fullscreen until you submit.</li><li>Changing tabs, switching apps, hiding the page, or leaving fullscreen immediately cancels and flags the attempt.</li></ul>{startError && <Notice kind="error">{startError}</Notice>}<button onClick={startExam}>Continue in secure fullscreen</button></div></main>;
   return (
     <div className="exam">
       <header>
@@ -4336,6 +4598,65 @@ function Exam({
     </div>
   );
 }
+type DiagnosticQuestion = { id:string; number:number; stem_markdown?:string; test_id:string; attempt_id:string; student_id?:string; subject:string; chapter:string; topic:string; skill:string; outcome:string; timing?:{seconds:number;visits:number}; possible_misconception?:string };
+type DiagnosticGroup = { label:string; chapter:string; topic:string; question_count:number; evidence_count:number; student_count:number; correct:number; incorrect:number; unanswered:number; finding:string; confidence:string; questions:{id:string;number:number;test_id:string;attempt_id:string;student_id?:string;outcome:string}[] };
+type DiagnosticData = { questions?:DiagnosticQuestion[]; skills?:DiagnosticGroup[]; topics?:DiagnosticGroup[]; attempts?:{attempt_id:string;test_id:string;test_title?:string;submitted_at:string;questions:DiagnosticQuestion[]}[] };
+const diagnosticKey=(group:DiagnosticGroup)=>`${group.chapter}:${group.topic}:${group.label}`;
+function OutcomeBar({correct,incorrect,unanswered}:{correct:number;incorrect:number;unanswered:number}){
+  const total=correct+incorrect+unanswered;
+  return <div className="diagnostic-outcome-bar" role="img" aria-label={`${correct} correct, ${incorrect} incorrect, ${unanswered} unanswered`}>
+    {total>0&&<><span className="is-correct" style={{width:`${correct/total*100}%`}}/><span className="is-incorrect" style={{width:`${incorrect/total*100}%`}}/><span className="is-unanswered" style={{width:`${unanswered/total*100}%`}}/></>}
+  </div>
+}
+function TimingChart({questions,onSelect}:{questions:DiagnosticQuestion[];onSelect?:(q:DiagnosticQuestion)=>void}){
+  const timed=[...questions].filter(q=>q.timing).sort((a,b)=>(b.timing?.seconds||0)-(a.timing?.seconds||0)).slice(0,7);
+  if(!timed.length)return <p className="diagnostic-empty">Question focus time was not captured for this test.</p>;
+  const max=Math.max(...timed.map(q=>q.timing?.seconds||0),1);
+  return <div className="diagnostic-time-chart" aria-label="Questions with most focus time">{timed.map(q=><button type="button" key={`${q.attempt_id}:${q.id}`} onClick={()=>onSelect?.(q)} className="diagnostic-time-row"><span>Q{q.number}</span><span className="diagnostic-time-track"><i style={{width:`${Math.max(3,(q.timing?.seconds||0)/max*100)}%`}} className={q.outcome}/></span><b>{Math.round(q.timing?.seconds||0)}s</b></button>)}</div>
+}
+function DiagnosticSummary({data,title="Learning diagnostics"}:{data?:DiagnosticData;title?:string}) {
+  const [selectedKey,setSelectedKey]=useState("");
+  if (!data) return null;
+  const questions=data.questions || data.attempts?.flatMap(item=>item.questions) || [];
+  const skills=data.skills||[];
+  const selected=skills.find(group=>diagnosticKey(group)===selectedKey)||skills[0];
+  const relevant=selected?questions.filter(q=>q.skill===selected.label&&q.chapter===selected.chapter&&q.topic===selected.topic):questions;
+  const counts={correct:questions.filter(q=>q.outcome==="correct").length,incorrect:questions.filter(q=>q.outcome==="incorrect").length,unanswered:questions.filter(q=>q.outcome==="unanswered").length};
+  const weak=skills.filter(group=>group.incorrect+group.unanswered>group.correct).length;
+  const selectQuestion=(question:DiagnosticQuestion)=>{const group=skills.find(item=>item.label===question.skill&&item.chapter===question.chapter&&item.topic===question.topic);if(group)setSelectedKey(diagnosticKey(group))};
+  return <Card className="diagnostic-panel diagnostic-dashboard">
+    <div className="diagnostic-heading"><div><p className="eyebrow">LEARNING DIAGNOSTICS</p><h2>{title}</h2><p>Explore the skills behind your result, then inspect the exact questions.</p></div><span className="diagnostic-sample">{questions.length} questions analysed</span></div>
+    <div className="diagnostic-overview"><div><strong>{counts.correct}</strong><span>Correct</span></div><div><strong>{counts.incorrect}</strong><span>Incorrect</span></div><div><strong>{counts.unanswered}</strong><span>Unanswered</span></div><div><strong>{weak}</strong><span>Skills to revisit</span></div></div>
+    <OutcomeBar {...counts}/><div className="diagnostic-legend"><span><i className="is-correct"/>Correct</span><span><i className="is-incorrect"/>Incorrect</span><span><i className="is-unanswered"/>Unanswered</span></div>
+    {!!data.attempts?.length&&<div className="diagnostic-history"><b>Test history</b>{data.attempts.map(item=><span key={item.attempt_id}>{item.test_title||"Assessment"} · {fmtDate(item.submitted_at)} · {item.questions.filter(q=>q.outcome==="correct").length}/{item.questions.length} correct</span>)}</div>}
+    <div className="diagnostic-viz-grid"><section><div className="diagnostic-section-title"><h3>Skill breakdown</h3><small>Select a skill to see its evidence</small></div><div className="diagnostic-skills-chart">{skills.length?skills.map(group=><button type="button" key={diagnosticKey(group)} aria-pressed={diagnosticKey(group)===diagnosticKey(selected)} className={diagnosticKey(group)===diagnosticKey(selected)?"selected":""} onClick={()=>setSelectedKey(diagnosticKey(group))}><span><b>{group.label}</b><small>{group.chapter} · {group.evidence_count} questions</small></span><span className="diagnostic-skill-score">{group.correct}/{group.evidence_count}</span><OutcomeBar correct={group.correct} incorrect={group.incorrect} unanswered={group.unanswered}/></button>):<p className="diagnostic-empty">Skill labels are being prepared for this test.</p>}</div></section>
+    <section><div className="diagnostic-section-title"><h3>Where time went</h3><small>Top focused questions</small></div><TimingChart questions={questions} onSelect={selectQuestion}/><div className="diagnostic-time-legend">Bar colour shows the answer outcome. Time alone does not diagnose a gap.</div></section></div>
+    <section className="diagnostic-evidence"><div className="diagnostic-section-title"><h3>{selected?selected.label:"Question evidence"}</h3><small>{selected?`${selected.finding} · ${selected.confidence} · ${selected.evidence_count} questions`:"Choose a skill above"}</small></div><div className="diagnostic-evidence-list">{relevant.map(q=><article key={`${q.attempt_id}:${q.id}`}><div className="diagnostic-evidence-head"><b>Question {q.number}</b><span className={`diagnostic-status ${q.outcome}`}>{q.outcome}</span><small>{q.timing?`${Math.round(q.timing.seconds)}s focused · ${q.timing.visits} visit${q.timing.visits===1?"":"s"}`:"Time unavailable"}</small></div>{q.stem_markdown&&<Markdown value={q.stem_markdown} className="diagnostic-question-math"/>}{q.possible_misconception&&<p>Possible misconception: {q.possible_misconception}</p>}{data.questions&&<a href={`#result-question-${q.number}`}>Review answer and solution →</a>}</article>)}</div></section>
+    <p className="diagnostic-footnote">Skill findings are based on these answers, with limited evidence labelled. Missing timing is shown as unavailable.</p>
+  </Card>
+}
+function StudentProgress(){
+  const [data,setData]=useState<DiagnosticData|null>(null);
+  useEffect(()=>{api("/student/diagnostics").then(setData).catch(()=>setData(null))},[]);
+  if(!data?.attempts?.length)return null;
+  return <DiagnosticSummary data={data} title="Progress across tests"/>;
+}
+function TeacherDiagnostics({testId}:{testId:string}){
+  const [data,setData]=useState<any>(null),[classId,setClassId]=useState(""),[student,setStudent]=useState<any>(null),[error,setError]=useState(""),[selectedKey,setSelectedKey]=useState("");
+  useEffect(()=>{setData(null);setStudent(null);api(`/tests/${testId}/diagnostics${classId?`?class_id=${encodeURIComponent(classId)}`:""}`).then(setData).catch((e:Error)=>setError(e.message))},[testId,classId]);
+  const openStudent=(id:string)=>{setError("");api(`/teacher/students/${id}/diagnostics`).then(setStudent).catch((e:Error)=>setError(e.message))};
+  const skills:DiagnosticGroup[]=data?.skills||[];
+  const selected=skills.find(group=>diagnosticKey(group)===selectedKey)||skills[0];
+  const studentRows:any[]=data?.students||[];
+  const completed=data?.student_count||0;
+  return <Card className="diagnostic-panel diagnostic-dashboard teacher-diagnostic-dashboard"><div className="diagnostic-heading"><div><p className="eyebrow">BATCH DIAGNOSTICS</p><h2>Where this batch needs attention</h2><p>Compare skills, then open a student to see their questions and progress.</p></div><label>Batch <select value={classId} onChange={e=>setClassId(e.target.value)}><option value="">All assigned students</option>{data?.batches?.map((batch:any)=><option key={batch.id} value={batch.id}>{batch.name}</option>)}</select></label></div>
+    {error&&<Notice kind="error">{error}</Notice>}{!data?<p>Loading diagnostics…</p>:<><div className="diagnostic-batch-kpis"><div><strong>{completed}</strong><span>Completed students</span></div><div><strong>{skills.length}</strong><span>Skills assessed</span></div><div><strong>{skills.filter(group=>group.incorrect+group.unanswered>group.correct).length}</strong><span>Skills needing review</span></div></div>
+    <div className="diagnostic-viz-grid"><section><div className="diagnostic-section-title"><h3>Skill distribution</h3><small>Correct / incorrect / unanswered responses</small></div><div className="diagnostic-skills-chart">{skills.map(group=><button type="button" key={diagnosticKey(group)} className={selected&&diagnosticKey(group)===diagnosticKey(selected)?"selected":""} aria-pressed={selected&&diagnosticKey(group)===diagnosticKey(selected)} onClick={()=>setSelectedKey(diagnosticKey(group))}><span><b>{group.label}</b><small>{group.student_count} {group.student_count===1?"student":"students"} · {group.question_count} {group.question_count===1?"question":"questions"}</small></span><span className="diagnostic-skill-score">{group.correct}/{group.evidence_count}</span><OutcomeBar correct={group.correct} incorrect={group.incorrect} unanswered={group.unanswered}/></button>)}</div></section>
+    <section><div className="diagnostic-section-title"><h3>Students in selected skill</h3><small>Select a student for their finer picture</small></div><div className="diagnostic-heatmap">{studentRows.length?studentRows.map(row=>{const skill=row.skills.find((item:DiagnosticGroup)=>selected&&diagnosticKey(item)===diagnosticKey(selected));return <button type="button" key={row.student.id} onClick={()=>openStudent(row.student.id)}><b>{row.student.name}</b><span>{selected?.label||"Skill"}</span>{skill?<><OutcomeBar correct={skill.correct} incorrect={skill.incorrect} unanswered={skill.unanswered}/><strong>{skill.correct}/{skill.evidence_count} correct</strong></>:<small>No questions in this skill</small>}</button>}):<p className="diagnostic-empty">No submitted student attempts yet.</p>}</div></section></div>
+    {selected&&<div className="diagnostic-batch-evidence"><h3>{selected.label} · question coverage</h3><p>{selected.student_count} {selected.student_count===1?"student":"students"} · {selected.question_count} distinct {selected.question_count===1?"question":"questions"} · {selected.incorrect} incorrect {selected.incorrect===1?"response":"responses"}. Select a student above to inspect their answers.</p><div className="diagnostic-question-chips">{[...new Set(selected.questions.map(q=>q.number))].sort((a,b)=>a-b).map(number=><span key={number}>Q{number}</span>)}</div></div>}</>}
+    {student&&<div className="diagnostic-student-detail"><button className="secondary-action" onClick={()=>setStudent(null)}>Close student detail</button><DiagnosticSummary data={student} title={`${student.student.name} · progress across tests`}/></div>}
+  </Card>
+}
 function Result({ attempt }: { attempt: any }) {
   const [data, setData] = useState<any>();
   useEffect(() => {
@@ -4355,9 +4676,10 @@ function Result({ attempt }: { attempt: any }) {
     <div className="page">
       <h1>Score: {data.attempt.score}</h1>
       <Card><b>Total time taken</b><p>{fmtDuration(data.attempt.duration_seconds)}</p></Card>
+      <DiagnosticSummary data={data.diagnostics} />
       {data.questions.map(
-        (q: Question & { response: any; correct: boolean; points: number }, index: number) => (
-          <Card key={q.id}>
+        (q: Question & { response: any; correct: boolean; points: number; }, index: number) => (
+          <section key={q.id} id={`result-question-${index+1}`}><Card>
             <QuestionCard
               q={q}
               mode="student-result"
@@ -4369,9 +4691,9 @@ function Result({ attempt }: { attempt: any }) {
               {q.response?.option !== undefined
                 ? `Option ${String.fromCharCode(65 + q.response.option)}`
                 : "No response"}{" "}
-              · {q.correct ? "Correct" : "Incorrect"} · {q.points} marks
+              · {q.response==null ? "Unanswered" : q.correct ? "Correct" : "Incorrect"} · {q.points} marks
             </p>
-          </Card>
+          </Card></section>
         ),
       )}
     </div>

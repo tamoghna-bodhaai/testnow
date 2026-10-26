@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import csv, io, logging, re
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import String, cast, exists, func, or_
@@ -23,6 +23,7 @@ from .publication import publication_plan
 from .job_state import extraction_state, lifecycle_view, heartbeat
 from .question_library import question_page
 from .question_revisions import question_revision, require_revision
+from .diagnostics import attempt_diagnostics, classify_skills, progress, summarize
 
 app=FastAPI(title="TestNow API",version="1.0.0")
 def as_utc(value:datetime)->datetime:
@@ -40,9 +41,10 @@ app.add_middleware(CORSMiddleware,allow_origins=settings().cors_origins.split(",
 @app.on_event("startup")
 def startup():
     # Alembic is the production migration authority; this supports a clean local first boot.
-    if "localhost" in settings().database_url or settings().database_url.startswith("sqlite"):
+    local_database = "localhost" in settings().database_url or settings().database_url.startswith("sqlite")
+    if local_database or settings().local_demo_mode:
         Base.metadata.create_all(engine)
-    production=not ("localhost" in settings().database_url or settings().database_url.startswith("sqlite"))
+    production = not (local_database or settings().local_demo_mode)
     if production and settings().seed_demo_data:
         raise RuntimeError("SEED_DEMO_DATA must be false in production")
     if settings().seed_demo_data:
@@ -942,6 +944,54 @@ def approve_question(job_id:str,question_id:str,user:User=Depends(require(Role.T
         job.status=ImportStatus.REVIEW if incomplete else ImportStatus.APPROVED
         job.extraction_meta={**(job.extraction_meta or {}),"phase":"Extraction incomplete: source pages skipped" if incomplete else "Review complete"}
     db.commit();return question_view(q)
+
+@app.post("/teacher/imports/{job_id}/questions/{question_id}/ignore-warnings")
+def ignore_import_question_warnings(job_id:str,question_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    """Record a teacher's decision to accept extraction warnings and approve the question."""
+    q=db.get(Question,question_id);job=db.get(ImportJob,job_id)
+    if not job or not q or q.import_job_id!=job.id or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Question not found")
+    if q.approved_at:raise HTTPException(409,"Question is already approved")
+    warnings=list((q.interaction or {}).get("ingestion_issues", []))
+    if not warnings:raise HTTPException(409,"This question has no warnings to ignore")
+    interaction={**(q.interaction or {}),"ignored_ingestion_issues":warnings,"warnings_ignored_by":user.id,"warnings_ignored_at":datetime.now(timezone.utc).isoformat(),"ingestion_issues":[]}
+    q.interaction=interaction
+    # Validation must run after the extraction warnings have been waived.  The
+    # previous order re-raised the very warning this endpoint was asked to
+    # ignore, so the teacher could never complete the action.
+    require_content_valid(q)
+    q.confidence=min(1.0,max(0.0,float(q.confidence))) if q.confidence is not None else 0.0
+    q.approved_at=datetime.now(timezone.utc)
+    record_readiness(q)
+    audit(db,user.id,"question.warnings_ignored","question",q.id,{"warnings":warnings,"import_job_id":job.id})
+    db.flush()
+    pending=db.query(Question).filter_by(import_job_id=job.id,approved_at=None).first()
+    if not pending:
+        incomplete=bool((job.extraction_meta or {}).get("failed_pages"))
+        job.status=ImportStatus.REVIEW if incomplete else ImportStatus.APPROVED
+        job.extraction_meta={**(job.extraction_meta or {}),"phase":"Extraction incomplete: source pages skipped" if incomplete else "Review complete"}
+    db.commit();return question_view(q)
+
+@app.delete("/teacher/imports/{job_id}/questions/{question_id}",status_code=204)
+def delete_import_question(job_id:str,question_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    """Discard one extracted question without deleting the source document."""
+    job=db.query(ImportJob).filter_by(id=job_id).with_for_update().one_or_none();q=db.get(Question,question_id)
+    if not job or not q or q.import_job_id!=job.id or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Question not found")
+    if job.published_at:raise HTTPException(409,"A published import question cannot be deleted")
+    if job.status in {ImportStatus.UPLOADED,ImportStatus.PROCESSING}:raise HTTPException(409,"Wait for extraction to finish before deleting a question")
+    ensure_unreferenced_questions(db,[q.id])
+    db.query(QuestionTaxonomy).filter_by(question_id=q.id).delete(synchronize_session=False)
+    source_number=q.source_number
+    db.delete(q)
+    db.flush()
+    remaining=db.query(Question).filter_by(import_job_id=job.id).all()
+    flagged=sum(1 for row in remaining if (row.interaction or {}).get("ingestion_issues"))
+    job.extraction_meta={**(job.extraction_meta or {}),"question_count":len(remaining),"flagged_count":flagged}
+    if remaining and all(row.approved_at for row in remaining):
+        incomplete=bool((job.extraction_meta or {}).get("failed_pages"))
+        job.status=ImportStatus.REVIEW if incomplete else ImportStatus.APPROVED
+        job.extraction_meta={**(job.extraction_meta or {}),"phase":"Extraction incomplete: source pages skipped" if incomplete else "Review complete"}
+    audit(db,user.id,"question.deleted_as_invalid","question",question_id,{"import_job_id":job.id,"source_number":source_number})
+    db.commit()
 def import_view(job:ImportJob,db:Session|None=None):
     source=db.get(SourceDocument,job.question_document_id) if db else None
     questions=db.query(Question).filter_by(import_job_id=job.id) if db else None
@@ -1265,6 +1315,9 @@ def create_test_record(data:TestCreate|ImportTestCreate,question_ids:list[str],u
     draft=TestVersion(id=uid(),test_id=test.id,ordinal=1,content={"questions":selected,"duration_seconds":duration_seconds,"results_policy":data.results_policy,"delivery_blueprint":data.delivery_blueprint})
     db.add(draft)
     if publish_now:
+        skill_labels=classify_skills(draft.content["questions"])
+        for question in draft.content["questions"]:
+            question["skill"]=skill_labels[question["id"]]
         published=TestVersion(id=uid(),test_id=test.id,ordinal=2,content=draft.content,published_at=datetime.now(timezone.utc))
         db.add(published);test.status=TestStatus.PUBLISHED;test.published_version_id=published.id
         audit(db,user.id,"test.published","test",test.id,{"version":published.ordinal,"source":"approved_import"})
@@ -1326,7 +1379,11 @@ def publish_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN))
     # Make a separately immutable snapshot for delivery.
     content=draft.content
     for question in content.get("questions",[]):require_content_valid(question)
-    v=TestVersion(id=uid(),test_id=t.id,ordinal=draft.ordinal+1,content=content,published_at=datetime.now(timezone.utc));db.add(v);t.status=TestStatus.PUBLISHED;t.published_version_id=v.id;audit(db,user.id,"test.published","test",t.id,{"version":v.ordinal});db.commit();return test_view(t,db)
+    skill_labels=classify_skills(content["questions"])
+    for question in content["questions"]:
+        question["skill"]=skill_labels[question["id"]]
+    v=TestVersion(id=uid(),test_id=t.id,ordinal=draft.ordinal+1,content=content,published_at=datetime.now(timezone.utc));db.add(v);db.flush()
+    t.status=TestStatus.PUBLISHED;t.published_version_id=v.id;audit(db,user.id,"test.published","test",t.id,{"version":v.ordinal});db.commit();return test_view(t,db)
 @app.post("/tests/{test_id}/enrolments",status_code=201)
 def enrol(test_id:str,data:EnrolIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     t=db.get(Test,test_id);student=db.query(User).filter_by(email=data.email.lower(),role=Role.STUDENT).first()
@@ -1424,6 +1481,45 @@ def test_analytics(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN
     batches=[{"classroom":{"id":class_id,"name":class_names[class_id]},**aggregate(members,class_id)} for class_id,members in class_memberships.items()]
     db.commit()
     return {"test_id":test.id,"summary":summary,"batches":batches,"students":rows}
+
+@app.get("/tests/{test_id}/diagnostics")
+def teacher_test_diagnostics(test_id:str,class_id:str|None=None,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    test=test_for_owner(test_id,user,db)
+    classes=assigned_classrooms(test,db)
+    if class_id and class_id not in {row.id for row in classes}:raise HTTPException(404,"Batch not found")
+    attempts=db.query(Attempt).filter_by(test_id=test_id).order_by(Attempt.started_at.desc()).all()
+    latest={}
+    for attempt in attempts:
+        if attempt.submitted_at and not attempt.cancelled_at and attempt.student_id not in latest:
+            latest[attempt.student_id]=attempt
+    membership={row.student_id for row in db.query(ClassMembership).filter_by(class_id=class_id).all()} if class_id else set(latest)
+    selected=[attempt for sid,attempt in latest.items() if sid in membership or (class_id and any(str(c.get("id"))==class_id for c in attempt.cohort_classes or []))]
+    students={row.id:row for row in db.query(User).filter(User.id.in_([a.student_id for a in selected])).all()} if selected else {}
+    evidence=[];student_rows=[]
+    for attempt in selected:
+        diagnosis=attempt_diagnostics(db,attempt)
+        for question in diagnosis["questions"]:evidence.append({**question,"student_id":attempt.student_id})
+        student_rows.append({"student":{"id":attempt.student_id,"name":students[attempt.student_id].name},"attempt_id":attempt.id,"skills":diagnosis["skills"],"questions":diagnosis["questions"]})
+    return {"test_id":test_id,"class_id":class_id,"batches":[{"id":row.id,"name":row.name} for row in classes],"student_count":len(selected),"skills":summarize(evidence,"skill"),"topics":summarize(evidence,"topic"),"students":student_rows}
+
+@app.get("/teacher/students/{student_id}/diagnostics")
+def teacher_student_diagnostics(student_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
+    if user.role!=Role.ADMIN and not teacher_owns_student(user,student_id,db) and not db.query(Attempt).join(Test,Test.id==Attempt.test_id).filter(Attempt.student_id==student_id,Test.owner_id==user.id).first():raise HTTPException(404,"Student not found")
+    student=db.get(User,student_id)
+    if not student or student.role!=Role.STUDENT:raise HTTPException(404,"Student not found")
+    attempts=db.query(Attempt).filter_by(student_id=student_id).order_by(Attempt.started_at.desc()).all()
+    if user.role!=Role.ADMIN:attempts=[a for a in attempts if (test:=db.get(Test,a.test_id)) and test.owner_id==user.id]
+    return {"student":{"id":student.id,"name":student.name},**progress(db,attempts)}
+
+@app.get("/student/diagnostics")
+def student_diagnostics(user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
+    attempts=db.query(Attempt).filter_by(student_id=user.id).order_by(Attempt.started_at.desc()).all()
+    attempts=[a for a in attempts if a.submitted_at and not a.cancelled_at and result_released(db.get(Test,a.test_id))]
+    return progress(db,attempts)
+
+def result_released(test:Test)->bool:
+    policy=test.results_policy or {};release=policy.get("release_at")
+    return policy.get("mode")=="immediate" or bool(release and datetime.now(timezone.utc)>=datetime.fromisoformat(release.replace("Z","+00:00")))
 def test_view(t:Test,db:Session,include=False):
     v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids),"assigned_class_names":[c.name for c in classes]}
     if include:
@@ -1511,6 +1607,20 @@ def visit_question(attempt_id:str,question_id:str,user:User=Depends(require(Role
     if not response: db.add(AnswerResponse(attempt_id=a.id,question_id=question_id,answer=None,marked_for_review=False,visited_at=datetime.now(timezone.utc)))
     elif not response.visited_at: response.visited_at=datetime.now(timezone.utc)
     attempt_event(db,a.id,"question_visited",{"question_id":question_id});db.commit();return {"ok":True}
+
+@app.post("/attempts/{attempt_id}/questions/{question_id}/focus-interval")
+def question_focus_interval(attempt_id:str,question_id:str,data:dict=Body(...),user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
+    attempt=db.get(Attempt,attempt_id)
+    if not attempt or attempt.student_id!=user.id or attempt.cancelled_at:raise HTTPException(404,"Attempt not found")
+    if attempt.submitted_at and datetime.now(timezone.utc)-as_utc(attempt.submitted_at)>timedelta(seconds=30):raise HTTPException(409,"Attempt timing is closed")
+    version=db.get(TestVersion,attempt.version_id)
+    if question_id not in {q["id"] for q in version.content["questions"]}:raise HTTPException(422,"Question is not part of this attempt")
+    token=data.get("interval_id");duration=data.get("duration_ms")
+    if not isinstance(token,str) or not re.fullmatch(r"[A-Za-z0-9-]{8,80}",token) or isinstance(duration,bool) or not isinstance(duration,(int,float)) or not 0<=duration<=900000:raise HTTPException(422,"Invalid focus interval")
+    if not db.query(AttemptEvent).filter_by(attempt_id=attempt_id,event_type="question_focus_interval").filter(AttemptEvent.data["interval_id"].as_string()==token).first():
+        attempt_event(db,attempt_id,"question_focus_interval",{"question_id":question_id,"interval_id":token,"duration_ms":round(duration)})
+        db.commit()
+    return {"ok":True}
 @app.post("/attempts/{attempt_id}/submit")
 def submit(attempt_id:str,data:SubmitIn,user:User=Depends(require(Role.STUDENT)),db:Session=Depends(get_db)):
     a=db.query(Attempt).filter_by(id=attempt_id).with_for_update().first()
@@ -1538,7 +1648,8 @@ def result(attempt_id:str,user:User=Depends(require(Role.STUDENT)),db:Session=De
     if a.cancelled_at:raise HTTPException(403,"Cancelled attempts do not have a student result")
     test=db.get(Test,a.test_id); policy=test.results_policy; release=policy.get("release_at")
     if policy.get("mode")!="immediate" and (not release or datetime.now(timezone.utc)<datetime.fromisoformat(release.replace("Z","+00:00"))):raise HTTPException(403,"Results have not been released")
-    responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};_,items=score(db.get(TestVersion,a.version_id).content,responses);return {"attempt":attempt_view(a,db),"questions":items}
+    responses={r.question_id:r.answer for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)};version=db.get(TestVersion,a.version_id);_,items=score(version.content,responses)
+    return {"attempt":attempt_view(a,db),"questions":items,"diagnostics":attempt_diagnostics(db,a)}
 def attempt_view(a:Attempt,db:Session):
     v=db.get(TestVersion,a.version_id)
     resp={r.question_id:{"answer":r.answer,"marked_for_review":r.marked_for_review,"visited_at":r.visited_at} for r in db.query(AnswerResponse).filter_by(attempt_id=a.id)}

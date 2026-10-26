@@ -2,6 +2,7 @@
 
 import { PointerEvent, useEffect, useRef, useState, useId } from "react";
 import {useDialogFocus} from "./dialog-focus";
+import {confirmApp} from "./app-confirm";
 
 type Figure = { page: number; bbox: number[]; role: string; option_index: number | null; alt: string };
 type Viewport = { page: number; bbox: number[] };
@@ -43,13 +44,13 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange, l
     ? source.focus.bbox : info ? [0, 0, info.width, info.height] : [0, 0, 1, 1];
 
   useEffect(() => () => request.current?.abort(), []);
-  const close = (force=false) => {
-    if(!force&&source&&baseline.current!==figureState(figures)&&!window.confirm("Discard unsaved figure adjustments for this source question?"))return;
+  const close = async (force=false) => {
+    if(!force&&source&&baseline.current!==figureState(figures)&&!await confirmApp("Discard unsaved figure adjustments for this source question?"))return;
     request.current?.abort(); request.current = null;
     start.current = null; setDrag(null); setSource(undefined); setConfirmed(false); setError("");
     onActiveChange?.(false);
   };
-  const dialogFocus=useDialogFocus(Boolean(source),()=>close(),()=>triggerContainer.current?.querySelector<HTMLButtonElement>("button")||null);
+  const dialogFocus=useDialogFocus(Boolean(source),()=>void close(),()=>triggerContainer.current?.querySelector<HTMLButtonElement>("button")||null);
   const open = async () => {
     request.current?.abort();
     const controller = new AbortController(); request.current = controller;
@@ -86,7 +87,7 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange, l
     setBusy(true); setError("");
     try {
       await api(`/questions/${questionId}/figures`, { method: "PUT", headers: source?.revision ? { "If-Match": source.revision } : {}, body: JSON.stringify({ diagrams: figures, confirmed }) });
-      close(true); await done();
+      await close(true); await done();
     } catch (e: any) { setError(e.message); }
     finally { setBusy(false); }
   };
@@ -98,15 +99,15 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange, l
         kind:choiceKind, stem_markdown:source.stem_markdown, answer:null,
         options:Array.from({length:choiceCount},(_,i)=>({value:String.fromCharCode(97+i),markdown:"",requires_diagram:true})),
       }) });
-      close(true); await done();
+      await close(true); await done();
     } catch (e:any) { setError(e.message); }
     finally { setBusy(false); }
   };
   return <section ref={triggerContainer} className="figure-review">
     {!source ? <button type="button" className="secondary-action" disabled={busy} onClick={open}>
       {busy ? "Opening figure adjustment…" : label}
-    </button> : <div ref={dialogFocus} tabIndex={-1} className="figure-editor-drawer" role="dialog" aria-modal="true" aria-label="Adjust detected figure">
-      <div className="figure-editor-heading"><strong>Adjust figure from {source.filename}</strong><button type="button" className="secondary-action" onClick={()=>close()}>Close</button></div>
+    </button> : <div ref={dialogFocus} tabIndex={-1} className="figure-editor-drawer" role="dialog" aria-modal="true" aria-labelledby="figure-editor-title">
+      <div className="figure-editor-heading"><strong id="figure-editor-title">Adjust figure from {source.filename}</strong><button type="button" className="secondary-action" onClick={()=>void close()}>Close</button></div>
       {!!source.conversion_issues?.length && <p>Check complex Word graphics against the original document. {source.original_url && <a href={source.original_url} target="_blank" rel="noreferrer">Open original document</a>}</p>}
       {error&&<p role="alert" className="diagram-error">{error}</p>}
       <p>Start with the detected question area. Drag around a complete figure, or use Keyboard crop controls, when the proposed crop needs correction.</p>
@@ -142,7 +143,7 @@ export function FigureEditor({ questionId, options, api, done, onActiveChange, l
         {drag && <rect x={drag[0]} y={drag[1]} width={drag[2]-drag[0]} height={drag[3]-drag[1]} fill="#f5a62322" stroke="#bd6900" strokeDasharray="4 3" />}
       </svg>}
       <label><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} /> I checked the detected figures and visual choices against the source.</label>
-      <div className="review-buttons"><button type="button" disabled={busy || !confirmed} onClick={save}>{busy ? "Saving…" : "Save figure adjustment"}</button><button type="button" className="secondary-action" onClick={()=>close()}>Cancel</button></div>
+      <div className="review-buttons"><button type="button" disabled={busy || !confirmed} onClick={save}>{busy ? "Saving…" : "Save figure adjustment"}</button><button type="button" className="secondary-action" onClick={()=>void close()}>Cancel</button></div>
     </div>}
     {!source&&error && <p role="alert" className="diagram-error">{error}</p>}
   </section>;

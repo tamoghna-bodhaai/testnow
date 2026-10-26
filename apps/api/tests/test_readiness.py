@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
-from app.main import app, bank_readiness_report, bank_question_counts, bank_questions, import_view, publish_bank_import, publish_question_bank, preview_bank_import, question_view, resolve_bank_question, approve_question, publish_test
+from app.main import app, bank_readiness_report, bank_question_counts, bank_questions, import_view, publish_bank_import, publish_question_bank, preview_bank_import, question_view, resolve_bank_question, approve_question, ignore_import_question_warnings, publish_test
 from app.figure_review import save_question_draft
 from app.models import AuditEvent, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, Role, SourceDocument, Test as Assessment, TestVersion as Version, User
 from app.readiness import VALIDATOR_VERSION, validate_question
@@ -177,6 +177,19 @@ def test_approval_rejects_placeholder_and_null_answers_at_both_boundaries(db):
     assert db.get(Question,question.id).approved_at is None
 
 
+def test_ignore_warnings_waives_the_selected_extraction_warnings_before_validation(db):
+    question=add_question(db,interaction={"ingestion_issues":["diagram_scanned_source_review"]})
+    question.approved_at=None
+    db.commit()
+
+    result=ignore_import_question_warnings("job",question.id,db.get(User,"admin"),db)
+
+    assert result["approved"] is True
+    assert question.approved_at is not None
+    assert question.interaction["ingestion_issues"]==[]
+    assert question.interaction["ignored_ingestion_issues"]==["diagram_scanned_source_review"]
+
+
 def test_shared_validator_allows_incomplete_draft_and_invalidates_approval(db):
     question=add_question(db)
     result=save_question_draft(question.id,QuestionIn(**content(answer=None)),db.get(User,"admin"),db)
@@ -213,6 +226,18 @@ def test_invalid_saved_test_draft_cannot_be_newly_published(db):
     db.add_all([assessment,version]);db.commit()
     with pytest.raises(HTTPException):publish_test(assessment.id,db.get(User,"admin"),db)
     assert db.query(Version).count()==1 and not assessment.published_version_id
+
+
+def test_publishing_stamps_the_snapshot_with_its_skill_label(db,monkeypatch):
+    assessment=Assessment(id="assessment",owner_id="admin",title="Draft test",subject="Math",duration_seconds=60)
+    version=Version(id="version",test_id=assessment.id,ordinal=1,content={"questions":[content(id="q")]})
+    db.add_all([assessment,version]);db.commit()
+    monkeypatch.setattr("app.main.classify_skills",lambda questions:{"q":"Adding whole numbers"})
+
+    publish_test(assessment.id,db.get(User,"admin"),db)
+
+    published=db.get(Version,assessment.published_version_id)
+    assert published.content["questions"][0]["skill"]=="Adding whole numbers"
 
 
 def test_preview_and_publication_http_contract_and_permissions(db):

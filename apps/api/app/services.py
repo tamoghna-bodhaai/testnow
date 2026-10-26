@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import re
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from .models import Attempt, AttemptEvent, Question, QuestionScope, Response, Test, TestVersion, TestStatus
+from .models import Attempt, AttemptEvent, Question, QuestionScope, QuestionTaxonomy, TaxonomyNode, Response, Test, TestVersion, TestStatus
 from .security import uid
 from .readiness import require_content_valid
 
@@ -72,10 +72,15 @@ def snapshot_questions(db:Session, ids:list[str], owner_id:str)->list[dict]:
             if not bank or not bank.is_global or (q.import_job_id and (not job or not job.published_at or (job.extraction_meta or {}).get("delete_requested"))):
                 raise HTTPException(422,"Every selected bank question must belong to a published material")
         kind=q.kind.value
-        content.append({"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":q.options,"answer":None if kind=="subjective" and len(q.options or [])<2 else q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"interaction":q.interaction})
+        taxonomy=[{"kind":node.kind,"name":node.name,"code":node.code} for node in db.query(TaxonomyNode).join(QuestionTaxonomy,QuestionTaxonomy.taxonomy_node_id==TaxonomyNode.id).filter(QuestionTaxonomy.question_id==q.id).all()]
+        content.append({"id":q.id,"source_number":q.source_number,"kind":kind,"stem_markdown":q.stem_markdown,"options":q.options,"answer":None if kind=="subjective" and len(q.options or [])<2 else q.answer,"solution_markdown":q.solution_markdown,"scoring":q.scoring,"diagrams":q.diagrams,"interaction":q.interaction,"taxonomy":taxonomy})
     return content
 def publish(db:Session,test:Test,actor_id:str,question_ids:list[str]):
     content={"questions":snapshot_questions(db,question_ids,test.owner_id),"duration_seconds":test.duration_seconds,"results_policy":test.results_policy}
+    from .diagnostics import classify_skills
+    skill_labels=classify_skills(content["questions"])
+    for question in content["questions"]:
+        question["skill"]=skill_labels[question["id"]]
     number=(db.query(TestVersion).filter_by(test_id=test.id).count()+1); version=TestVersion(id=uid(),test_id=test.id,ordinal=number,content=content,published_at=datetime.now(timezone.utc))
     db.add(version); test.status=TestStatus.PUBLISHED; test.published_version_id=version.id; audit(db,actor_id,"test.published","test",test.id,{"version":number}); db.commit(); return version
 def ensure_live(test:Test):
