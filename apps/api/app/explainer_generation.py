@@ -16,6 +16,7 @@ from typing import Literal
 from .config import settings
 from .db import SessionLocal
 from .explainer_math import sample_function, sample_region
+from .explainer_text import narration_text
 from .models import ExplainerRevision, TestVersion
 from .storage import client as storage_client, get, put
 from .tasks import celery_app
@@ -62,7 +63,7 @@ class Visual(BaseModel):
     def safe_visual(self):
         if self.type in {"text", "math"} and not self.content.strip():
             raise ValueError("Visual text is required")
-        if self.type == "math" and re.search(r"\\(?:input|include|write|read|open|catcode|usepackage|immediate|special|def|newcommand)\b", self.content, re.I):
+        if self.type in {"text", "math"} and re.search(r"\\(?:input|include|write|read|open|catcode|usepackage|immediate|special|def|newcommand)\b", self.content, re.I):
             raise ValueError("Unsupported TeX command")
         if self.type == "polyline" and (len(self.points) < 2 or any(len(p) != 2 or not all(isinstance(v, (int, float)) and -1000 <= v <= 1000 for v in p) for p in self.points)):
             raise ValueError("Invalid polyline")
@@ -94,6 +95,8 @@ class ScenePlan(BaseModel):
 
     @model_validator(mode="after")
     def function_graphs_use_equations(self):
+        if re.search(r"\\(?:input|include|write|read|open|catcode|usepackage|immediate|special|def|newcommand)\b", self.heading, re.I):
+            raise ValueError("Unsupported TeX command")
         if self.beats:
             if self.narration or self.objects:
                 raise ValueError("A scene must use either beats or legacy narration and objects")
@@ -206,7 +209,7 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
               "the renderer places these in a separate annotation area, ignoring their x and y. "
               "Use at most three short annotations per graph scene. Give functions mathematically correct expressions and domains from the source solution. "
               "Use bright cyan, yellow, green, or coral for highlighted math/curves and white for ordinary equations; the optional color field can match an equation to its curve. "
-              "Keep text concise and legible. Use clear Indian English, explaining the relevant concept, worked steps, and answer at a natural pace. "
+              "Write narration as spoken words without LaTeX delimiters or commands. Keep text concise and legible. Use clear Indian English, explaining the relevant concept, worked steps, and answer at a natural pace. "
               "Function expressions contain arithmetic only; never include Python code, imports, or arbitrary LaTeX commands. Return only JSON.")
     user_content = [{"type": "text", "text": json.dumps(prompt)}]
     for diagram in (question.get("diagrams") or [])[:2]:
@@ -312,7 +315,7 @@ def render_video(spec: dict, work: Path, *, progress=None, cancel_check=None) ->
             if progress:
                 progress("narrating", f"Recording scene {index + 1} of {len(spec['scenes'])}, step {beat_index + 1}")
             audio = work / f"scene-{index}-step-{beat_index}.mp3"
-            speech(beat["narration"], audio)
+            speech(narration_text(beat["narration"]), audio)
             if cancel_check:
                 cancel_check()
             audio_files.append(audio)

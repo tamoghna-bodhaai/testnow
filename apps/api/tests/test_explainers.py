@@ -354,3 +354,15 @@ def test_generation_rejected_after_publication(records):
         generate_explainer(test.id, "q1", GenerateExplainerIn(), teacher, db)
     assert exc.value.status_code == 409
     assert "already been published" in exc.value.detail
+
+
+def test_mixed_latex_visuals_and_narration():
+    from app.explainer_text import split_math, narration_text
+    label = r"Total mass $M = 800\text{ kg} + 200\text{ kg} = 1000\text{ kg}$"
+    assert split_math(label) == [(False, "Total mass "), (True, r"M = 800\text{ kg} + 200\text{ kg} = 1000\text{ kg}")]
+    assert narration_text(label) == "Total mass M = 800 kg + 200 kg = 1000 kg"
+    assert narration_text(r"force $F$ equal to \(P=42\text{ kW}\)") == "force F equal to P=42 kW"
+    assert narration_text(r"$\frac{1}{2} \times x^{2}$") == "(1)/(2) × x^2"
+    assert split_math(r"$$x^2$$") == [(True, "x^2")]
+    with pytest.raises(ValueError):
+        Visual(type="text", content=r"Label $\input{/etc/passwd}$")

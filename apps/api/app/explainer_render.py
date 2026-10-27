@@ -6,6 +6,7 @@ from pathlib import Path
 from manim import *
 from app.explainer_captions import caption_cues, caption_markup
 from app.explainer_math import sample_function, sample_region
+from app.explainer_text import split_math, narration_text
 
 BLACK = "#000000"
 WHITE_INK = "#FFFFFF"
@@ -109,6 +110,20 @@ def graph_region(item, axes):
                    stroke_opacity=0, fill_color=ink(item, PALETTE["green"]), fill_opacity=0.48).set_z_index(-2)
 
 
+def mixed_text(content, color, font_size=34):
+    """Render prose and inline math together, preserving their visual order."""
+    segments = split_math(content)
+    if not any(is_math for is_math, _ in segments):
+        return Text(narration_text(content), font=SERIF, font_size=font_size, color=color)
+    parts = []
+    for is_math, value in segments:
+        if is_math:
+            parts.append(MathTex(value, font_size=font_size, color=color))
+        elif value.strip():
+            parts.append(Text(value.strip(), font=SERIF, font_size=font_size, color=color))
+    return VGroup(*parts).arrange(RIGHT, buff=0.12, aligned_edge=DOWN)
+
+
 def scene_body(items):
     marks = [item for item in items if item["type"] in ("dot", "circle", "line", "arrow", "polyline", "function")]
     regions = [item for item in items if item["type"] == "region"]
@@ -139,9 +154,14 @@ def scene_body(items):
         annotations = []
         for i, item in enumerate(notes):
             color = ink(item, WHITE_INK)
-            annotation = (MathTex(item["content"], font_size=44, color=color)
-                          if item["type"] == "math" else
-                          Text(item["content"], font=SERIF, font_size=34, color=color))
+            content = item["content"]
+            segments = split_math(content)
+            if item["type"] == "math":
+                if len(segments) == 1 and segments[0][0]:
+                    content = segments[0][1]
+                annotation = MathTex(content, font_size=44, color=color)
+            else:
+                annotation = mixed_text(content, color)
             annotations.append(fit(annotation, width, 1.15))
         stack = VGroup(*annotations).arrange(DOWN, buff=0.38, aligned_edge=LEFT)
         fit(stack, width, 4.5 if has_graph else 4.6)
@@ -168,7 +188,7 @@ def visual_animation(item, mob):
 
 def caption_sequence(narration, duration, hold_last=False):
     animations = []
-    cues = caption_cues(narration, duration)
+    cues = caption_cues(narration_text(narration), duration)
     captions = []
     for content, _ in cues:
         label = fit(MarkupText(caption_markup(content), font="DejaVu Sans", font_size=26,
@@ -202,8 +222,7 @@ class Explainer(Scene):
             if isinstance(timing, (int, float)):
                 timing = [timing]
             items = [item for beat in beats for item in beat["objects"]]
-            heading = fit(Text(scene["heading"], font=SERIF, font_size=46,
-                               color=WHITE_INK), 12.2, 0.7).move_to(UP * 3.28)
+            heading = fit(mixed_text(scene["heading"], WHITE_INK, font_size=46), 12.2, 0.7).move_to(UP * 3.28)
             rule = Line(LEFT * 6.1 + UP * 2.72, RIGHT * 6.1 + UP * 2.72,
                         color=BLUE_INK, stroke_width=2)
             body = scene_body(items)
