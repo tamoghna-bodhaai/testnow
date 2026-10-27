@@ -1,6 +1,6 @@
 # Railway production topology
 
-Create one Railway project with seven services:
+Create one Railway project with eight services:
 
 1. `web`: root directory `.`, Dockerfile `apps/web/Dockerfile`, public domain, `API_INTERNAL_URL=http://api.railway.internal:8000`.
 2. `api`: root directory `apps/api`, Dockerfile `Dockerfile`, private only, healthcheck `/ready`, pre-deploy command `alembic upgrade head`.
@@ -9,6 +9,7 @@ Create one Railway project with seven services:
 5. Railway PostgreSQL, expose its `DATABASE_URL` to API, worker, and scheduler.
 6. Railway Redis, expose its `REDIS_URL` to API, worker, and scheduler.
 7. Railway S3-compatible bucket, expose endpoint/bucket/access credentials to API, worker, and scheduler.
+8. `explainer-worker`: root directory `apps/api`, Dockerfile `Dockerfile.render`, private only. It consumes only the `explainers` Celery queue at concurrency 1. Give it database, Redis, S3, and OpenRouter credentials. Configure `EXPLAINER_MODEL`, `EXPLAINER_TTS_MODEL`, and `EXPLAINER_TTS_VOICE` together when changing providers.
 
 Set `SUPER_ADMIN_ACCESS_CODE` (exactly five digits), `OPENROUTER_API_KEY`, all S3 keys, and error-monitoring DSNs as sealed variables. `SUPER_ADMIN_ACCESS_CODE` bootstraps `utils@bodhaai.tech` exactly once; it is never returned by the API. Keep `SEED_DEMO_DATA=false` in production (the API refuses to start otherwise), and set `MAX_PDF_PAGES` / `MAX_RENDERED_PDF_BYTES` to safe limits for your worker capacity. Point a custom domain at `web`; do not publish the API or worker. Configure a production alert for API readiness failure, Redis failure, Celery task failure, and import jobs remaining `processing` for more than ten minutes.
 

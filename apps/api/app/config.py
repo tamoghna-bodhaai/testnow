@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     max_pdf_pages: int = 5_000
     max_rendered_pdf_bytes: int = 200_000_000
     openrouter_max_output_tokens: int = 16_384
+    explainer_model: str = "google/gemini-3.1-flash-lite"
+    explainer_tts_model: str = "mistralai/voxtral-mini-tts-3-0"
+    explainer_tts_voice: str = "voice_3153"
     cors_origins: str = "http://localhost:3000"
     seed_demo_data: bool = False
     local_demo_mode: bool = False

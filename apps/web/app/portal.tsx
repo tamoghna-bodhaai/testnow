@@ -1524,6 +1524,100 @@ function ClassesScreen({
   );
 }
 
+type ExplainerRevision = { id: string; question_id: string; status: string; progress_message?: string; feedback?: string; error?: string; created_at: string; published_at?: string; preview_url?: string };
+type ExplainerList = { questions: { id: string; source_number?: string; stem_markdown: string; has_solution: boolean; suggested: boolean }[]; revisions: ExplainerRevision[] };
+const explainerStages = ["queued", "planning", "narrating", "rendering", "finalizing"];
+const explainerStageLabels: Record<string, string> = { queued: "Formulating", planning: "Formulating", narrating: "Narrating", rendering: "Building", finalizing: "Finalizing", ready: "Ready", failed: "Failed", cancelled: "Cancelled" };
+const explainerAnimatedStages = ["Formulating", "Narrating", "Building", "Finalizing"];
+const explainerStageIndex: Record<string, number> = { queued: 0, planning: 0, narrating: 1, rendering: 2, finalizing: 3 };
+
+function ExplainerRevisionDetails({ row, questionLabel, busy, publish, cancel }: { row: ExplainerRevision; questionLabel: string; busy: string; publish: (revisionId: string) => Promise<void>; cancel: (revisionId: string) => Promise<void> }) {
+  const active = explainerStages.includes(row.status);
+  return <>
+    <div><b>{row.published_at ? "Published" : "Draft"}</b><span className={`badge ${row.status}`}>{active ? "In progress" : explainerStageLabels[row.status] || row.status}</span><small>{fmtDate(row.created_at)}</small></div>
+    {active && <div className="explainer-progress">
+      <div className="explainer-stage-window" aria-hidden="true"><div className="explainer-stage-track" style={{ transform: `translateY(-${explainerStageIndex[row.status] * 2.5}rem)` }}>{explainerAnimatedStages.map(stage => <div className="explainer-stage-item" key={stage}><span>{stage}</span><span className="explainer-dots"><i /><i /><i /></span></div>)}</div></div>
+      <span className="explainer-status-accessible" role="status" aria-live="polite">{explainerStageLabels[row.status]}. {row.progress_message || "Generation in progress"}</span>
+      {row.progress_message && row.status !== "queued" && <p className="explainer-stage-detail">{row.progress_message}</p>}
+      <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void cancel(row.id)}>{busy === row.id ? "Cancelling…" : "Cancel generation"}</button>
+    </div>}
+    {row.status === "cancelled" && <p>Generation cancelled. You can start a new draft.</p>}
+    {row.feedback && <p>Feedback: {row.feedback}</p>}
+    {row.error && <p role="alert">Generation failed: {row.error}</p>}
+    {row.preview_url && <><video controls preload="metadata" src={row.preview_url} aria-label={`Explainer preview for ${questionLabel}`} /><button className="secondary-action" disabled={Boolean(busy) || Boolean(row.published_at)} onClick={() => void publish(row.id)}>{row.published_at ? "Published to students" : "Publish this version"}</button></>}
+  </>;
+}
+
+function ExplainerHistoryDialog({ question, index, revisions, busy, publish, cancel, close }: { question: ExplainerList["questions"][number]; index: number; revisions: ExplainerRevision[]; busy: string; publish: (revisionId: string) => Promise<void>; cancel: (revisionId: string) => Promise<void>; close: () => void }) {
+  const dialogFocus = useDialogFocus(true, close, () => document.querySelector<HTMLButtonElement>(`[data-explainer-history="${question.id}"]`));
+  const questionLabel = `question ${question.source_number || index + 1}`;
+  return <div className="explainer-history-backdrop" role="dialog" aria-modal="true" aria-labelledby={`explainer-history-title-${question.id}`} ref={dialogFocus} tabIndex={-1}>
+    <section className="explainer-history-dialog">
+      <div className="explainer-history-heading"><div><p className="eyebrow">GENERATION HISTORY</p><h2 id={`explainer-history-title-${question.id}`}>Question {question.source_number || index + 1}</h2><p>{revisions.length} generation{revisions.length === 1 ? "" : "s"}, newest first.</p></div><button type="button" className="secondary-action" onClick={close}>Close history</button></div>
+      <div className="explainer-history-list">{revisions.map((row, revisionIndex) => <article className="explainer-revision" key={row.id}><p className="explainer-version-label">{revisionIndex === 0 ? "Latest version" : `Version ${revisions.length - revisionIndex}`}</p><ExplainerRevisionDetails row={row} questionLabel={questionLabel} busy={busy} publish={publish} cancel={cancel} /></article>)}</div>
+    </section>
+  </div>;
+}
+
+function TestExplainers({ test }: { test: Test }) {
+  const [data, setData] = useState<ExplainerList | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const [feedback, setFeedback] = useState<Record<string, string>>({});
+  const [historyQuestionId, setHistoryQuestionId] = useState<string | null>(null);
+  const load = async () => { try { setData(await api(`/tests/${test.id}/explainers`)); setError(""); } catch (e: any) { setError(e.message); } };
+  useEffect(() => { void load(); }, [test.id, test.status]);
+  useEffect(() => {
+    if (!data?.revisions.some(row => explainerStages.includes(row.status))) return;
+    const timer = window.setInterval(() => { void load(); }, 3000);
+    return () => window.clearInterval(timer);
+  }, [data, test.id]);
+  const generate = async (questionId: string, override: boolean) => {
+    setBusy(questionId); setError("");
+    try {
+      await api(`/tests/${test.id}/explainers/${questionId}/generate`, { method: "POST", body: JSON.stringify({ feedback: feedback[questionId] || "", override_suggestion: override }) });
+      setFeedback(current => ({ ...current, [questionId]: "" }));
+      await load();
+    } catch (e: any) { setError(e.message); }
+    finally { setBusy(""); }
+  };
+  const publish = async (revisionId: string) => {
+    setBusy(revisionId); setError("");
+    try { await api(`/tests/${test.id}/explainers/${revisionId}/publish`, { method: "POST" }); await load(); }
+    catch (e: any) { setError(e.message); }
+    finally { setBusy(""); }
+  };
+  const cancel = async (revisionId: string) => {
+    setBusy(revisionId); setError("");
+    try { await api(`/tests/${test.id}/explainers/${revisionId}/cancel`, { method: "POST" }); await load(); }
+    catch (e: any) { await load(); setError(e.message); }
+    finally { setBusy(""); }
+  };
+  const historyQuestionIndex = data?.questions.findIndex(question => question.id === historyQuestionId) ?? -1;
+  const historyQuestion = historyQuestionIndex >= 0 ? data?.questions[historyQuestionIndex] : null;
+  const historyRevisions = historyQuestion ? data?.revisions.filter(row => row.question_id === historyQuestion.id) || [] : [];
+  return <><Card className="explainer-workspace">
+    <div className="explainer-heading"><div><h2>Question explainers</h2><p>Generate a short visual lesson, review it, then publish the version students should see with their results.</p></div><button className="secondary-action" onClick={() => void load()}>Refresh</button></div>
+    {error && <Notice kind="error">{error}</Notice>}
+    {!data ? <p>Loading explainers…</p> : !data.questions.length ? <p>Publish this assessment to generate explainers from its saved questions.</p> : data.questions.map((question, index) => {
+      const revisions = data.revisions.filter(row => row.question_id === question.id);
+      const active = revisions.some(row => explainerStages.includes(row.status));
+      const latest = revisions[0];
+      return <section className="explainer-question" key={question.id}>
+        <div className="explainer-question-heading"><div><h3>Question {question.source_number || index + 1}</h3><Markdown value={question.stem_markdown} className="explainer-stem" />
+          <small>{!question.has_solution ? "Needs a worked solution" : question.suggested ? "Suggested for animation" : "Animation optional"}</small></div>
+          {revisions.length > 0 && <button type="button" className="explainer-history-button" data-explainer-history={question.id} onClick={() => setHistoryQuestionId(question.id)} aria-label={`View ${revisions.length} generation${revisions.length === 1 ? "" : "s"} for question ${question.source_number || index + 1}`} title="View generation history"><span aria-hidden="true">↶</span><span>{revisions.length}</span></button>}</div>
+        {question.has_solution && <div className="explainer-controls">
+          <label htmlFor={`explainer-feedback-${question.id}`}>Directions for the next draft</label>
+          <textarea id={`explainer-feedback-${question.id}`} rows={2} maxLength={2000} value={feedback[question.id] || ""} onChange={event => setFeedback(current => ({ ...current, [question.id]: event.target.value }))} placeholder="For example: slow down the graph reveal and explain the sign change." />
+          <button disabled={active || Boolean(busy)} onClick={() => void generate(question.id, !question.suggested)}>{active ? "Generating…" : revisions.length ? "Generate new draft" : "Generate explainer"}</button>
+        </div>}
+        {latest && <div className="explainer-revision"><p className="explainer-version-label">Latest version</p><ExplainerRevisionDetails row={latest} questionLabel={`question ${question.source_number || index + 1}`} busy={busy} publish={publish} cancel={cancel} /></div>}
+      </section>;
+    })}
+  </Card>{historyQuestion && <ExplainerHistoryDialog question={historyQuestion} index={historyQuestionIndex} revisions={historyRevisions} busy={busy} publish={publish} cancel={cancel} close={() => setHistoryQuestionId(null)} />}</>;
+}
+
 function TestDetail({
   testId,
   initialTab,
@@ -1541,7 +1635,7 @@ function TestDetail({
 }) {
   const [test, setTest] = useState<Test | null>(null),
     [analytics, setAnalytics] = useState<Analytics | null>(null),
-    [tab, setTab] = useState<"preview" | "assignment" | "analytics">(initialTab || "preview"),
+    [tab, setTab] = useState<"preview" | "assignment" | "analytics" | "explainers">(initialTab || "preview"),
     [error, setError] = useState(""),
     [publishing, setPublishing] = useState(false),
     [savingAssignments, setSavingAssignments] = useState(false),
@@ -1678,7 +1772,9 @@ function TestDetail({
         >
           Analytics
         </button>
+        <button className={tab === "explainers" ? "active" : ""} onClick={() => setTab("explainers")}>Explainers</button>
       </nav>
+      {tab === "explainers" && <TestExplainers test={test} />}
       {tab === "preview" && (
         <Card>
           <h2>Immutable test preview</h2>
@@ -4659,10 +4755,12 @@ function TeacherDiagnostics({testId}:{testId:string}){
 }
 function Result({ attempt }: { attempt: any }) {
   const [data, setData] = useState<any>();
+  const [explainers, setExplainers] = useState<Record<string, { url: string }> >({});
   useEffect(() => {
     api(`/results/${attempt.id}`)
       .then(setData)
       .catch((e) => setData({ error: e.message }));
+    api(`/results/${attempt.id}/explainers`).then(setExplainers).catch(() => setExplainers({}));
   }, [attempt.id]);
   if (!data) return <div className="page">Loading result…</div>;
   if (data.error)
@@ -4686,6 +4784,7 @@ function Result({ attempt }: { attempt: any }) {
               studentAnswer={q.response}
               displayNumber={index + 1}
             />
+            {explainers[q.id] && <div className="result-explainer"><h3>Visual explainer</h3><video controls preload="metadata" src={explainers[q.id].url} aria-label={`Video explainer for question ${index + 1}`} /></div>}
             <p>
               Your response:{" "}
               {q.response?.option !== undefined

@@ -257,3 +257,41 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 @media(max-width:980px){
   .workspace-content .class-layout{grid-template-columns:minmax(0,1fr)}
 }
+.explainer-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem}
+.explainer-heading h2{margin-top:0}
+.explainer-question{border-top:1px solid var(--line,#d9e1e8);padding:1.25rem 0;display:grid;gap:1rem}
+.explainer-question h3{margin:0 0 .35rem}
+.explainer-question-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem}
+.explainer-question p{margin:.25rem 0 .5rem;overflow-wrap:anywhere}
+.explainer-stem{min-width:0;overflow-wrap:anywhere}
+.explainer-controls{display:grid;gap:.5rem;max-width:42rem}
+.explainer-controls textarea{width:100%;min-height:4.5rem}
+.explainer-controls button{justify-self:start}
+.explainer-revision{display:grid;gap:.65rem;border:1px solid var(--line,#d9e1e8);border-radius:12px;padding:1rem;max-width:48rem}
+.explainer-revision>div:first-child{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap}
+.explainer-version-label{margin:0!important;color:var(--muted,#687385);font-size:.78rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+.explainer-history-button{display:inline-flex;align-items:center;justify-content:center;gap:.22rem;min-width:2.5rem;height:2.5rem;padding:.35rem!important;border:1px solid var(--line)!important;border-radius:999px!important;background:var(--surface)!important;color:var(--blue)!important;box-shadow:none!important;font-size:.85rem;line-height:1}
+.explainer-history-button:hover{background:var(--indigo-mist)!important}
+.explainer-history-button span:first-child{font-size:1.22rem;line-height:1}
+.explainer-history-button span:last-child{font-size:.72rem;font-weight:800}
+.explainer-progress{display:grid;gap:.55rem;justify-items:start}
+.explainer-stage-window{height:2.5rem;overflow:hidden}
+.explainer-stage-track{transition:transform .55s cubic-bezier(.22,.7,.2,1);will-change:transform}
+.explainer-stage-item{height:2.5rem;display:flex;align-items:center;gap:.45rem;color:#252d70;font-size:1.05rem;font-weight:700}
+.explainer-dots{display:inline-flex;align-items:center;gap:.2rem;height:1rem}
+.explainer-dots i{width:.28rem;height:.28rem;border-radius:50%;background:currentColor;animation:explainer-dot 1.25s infinite ease-in-out}
+.explainer-dots i:nth-child(2){animation-delay:.17s}
+.explainer-dots i:nth-child(3){animation-delay:.34s}
+.explainer-progress .explainer-stage-detail{margin:0;color:var(--muted,#687385);font-size:.9rem}
+.explainer-status-accessible{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@keyframes explainer-dot{0%,60%,100%{opacity:.28;transform:translateY(0)}30%{opacity:1;transform:translateY(-.22rem)}}
+@media(prefers-reduced-motion:reduce){.explainer-stage-track{transition:none}.explainer-dots i{animation:none;opacity:.75}}
+.explainer-revision video,.result-explainer video{width:100%;max-width:48rem;aspect-ratio:16/9;background:#101827;border-radius:10px}
+.explainer-revision button{justify-self:start}
+.explainer-history-backdrop{position:fixed;z-index:10;inset:0;display:grid;place-items:center;padding:1rem;background:rgba(21,25,59,.48)}
+.explainer-history-dialog{width:min(52rem,100%);max-height:min(84dvh,60rem);overflow:auto;padding:1.25rem;border-radius:14px;background:var(--surface);box-shadow:var(--shadow)}
+.explainer-history-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;padding-bottom:1rem;border-bottom:1px solid var(--line)}
+.explainer-history-heading h2{margin:.25rem 0}.explainer-history-heading p{margin:.25rem 0;color:var(--muted)}
+.explainer-history-list{display:grid;gap:1rem;padding-top:1rem}.explainer-history-list .explainer-revision{max-width:none}
+.result-explainer{margin-top:1rem;border-top:1px solid var(--line,#d9e1e8);padding-top:1rem}
+@media(max-width:640px){.explainer-heading,.explainer-question-heading,.explainer-history-heading{flex-direction:column}.explainer-history-dialog{max-height:90dvh;padding:1rem}.explainer-history-heading .secondary-action{align-self:flex-start}}

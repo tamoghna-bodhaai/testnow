@@ -104,3 +104,9 @@ Follow [infrastructure/railway.md](infrastructure/railway.md). Use Railway Postg
 Production requires a sealed `SUPER_ADMIN_ACCESS_CODE` containing exactly five digits. The first API startup creates `utils@bodhaai.tech` as the super administrator. It manages teacher codes and statuses; teachers manage student codes and class/batch rosters.
 
 The production access-code migration intentionally starts teacher and student data from a clean slate. It deletes legacy teacher/student accounts and their assessment history, so it must not be run where those records need to be retained.
+
+# Video explainers
+
+Teachers can generate and review a Manim video for a question in a published assessment from its **Explainers** tab. The dedicated `explainer-worker` consumes the `explainers` queue; it needs the same database, Redis, object store, and OpenRouter access as the API. New drafts use a black mathematical canvas, a fixed graph and annotation layout, equation-driven curves, and Mistral's Himanshu Indian voice by default. Its speech model and voice remain configurable with `EXPLAINER_TTS_MODEL` and `EXPLAINER_TTS_VOICE`. A teacher must publish a completed draft before it appears beside the worked solution in a student's released result.
+
+The tab reports the current stage (waiting, formulating, narrating, building, or finalizing) and can cancel an active draft. Cancellation is recorded immediately; the worker stops at its next checkpoint, including during Manim and FFmpeg commands. An in-flight model or speech request may finish before the worker stops, but a cancelled draft cannot become ready or be published.

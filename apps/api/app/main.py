@@ -7,7 +7,7 @@ from sqlalchemy import String, cast, exists, func, or_
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, engine, get_db
-from .models import AccountStatus, AuditEvent, Attempt, AttemptEvent, Classroom, ClassMembership, Enrollment, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
+from .models import AccountStatus, AuditEvent, Attempt, AttemptEvent, Classroom, ClassMembership, Enrollment, ExplainerRevision, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
 from .schemas import AdminQuestionUpdate, SourceRelinkIn, TaxonomyAliasIn, AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, IntegrityViolationIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, SubmitIn, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
 from .security import COOKIE, current_user, hash_password, new_session, require, revoke_sessions, uid, verify_password
 from .services import attempt_event, audit, cancel_for_integrity, delivery_blueprint, ensure_live, finalize_attempt, finalize_if_expired, publish, safe_question_kind, score, snapshot_questions, source_number_key, validate_blueprint
@@ -24,8 +24,10 @@ from .job_state import extraction_state, lifecycle_view, heartbeat
 from .question_library import question_page
 from .question_revisions import question_revision, require_revision
 from .diagnostics import attempt_diagnostics, classify_skills, progress, summarize
+from .explainers import router as explainer_router
 
 app=FastAPI(title="TestNow API",version="1.0.0")
+app.include_router(explainer_router)
 def as_utc(value:datetime)->datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 def attempt_duration_seconds(attempt:Attempt)->int|None:
@@ -1367,10 +1369,15 @@ def delete_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),
         raise HTTPException(409,"A test with student attempts cannot be deleted")
     db.query(TestClassAssignment).filter_by(test_id=test.id).delete(synchronize_session=False)
     db.query(Enrollment).filter_by(test_id=test.id).delete(synchronize_session=False)
+    has_explainers=db.query(ExplainerRevision).filter_by(test_id=test.id).first() is not None
+    db.query(ExplainerRevision).filter_by(test_id=test.id).delete(synchronize_session=False)
     db.query(TestVersion).filter_by(test_id=test.id).delete(synchronize_session=False)
     db.delete(test)
     audit(db,user.id,"test.deleted","test",test_id,{"title":test.title})
     db.commit()
+    if has_explainers:
+        try:delete_prefix(f"explainers/{test_id}/")
+        except Exception:logging.exception("Could not remove deleted assessment explainers from object storage")
 @app.post("/tests/{test_id}/publish")
 def publish_test(test_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     t=test_for_owner(test_id,user,db)

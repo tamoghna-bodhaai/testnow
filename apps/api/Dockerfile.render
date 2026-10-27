@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg texlive-latex-extra dvisvgm fonts-dejavu-core fonts-lmodern \
+    libcairo2-dev libpango1.0-dev pkg-config build-essential util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home renderer
+COPY requirements.txt .
+RUN pip install -r requirements.txt && pip install manim==0.22.0
+COPY . .
+CMD ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=INFO", "-Q", "explainers", "--concurrency=1"]

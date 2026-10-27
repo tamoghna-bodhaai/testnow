@@ -7,7 +7,7 @@ import fitz
 from sqlalchemy.orm import Session
 from .config import settings
 from .db import SessionLocal
-from .models import Attempt, ImportJob, ImportStatus, Question, QuestionKind, SourceDocument
+from .models import Attempt, ExplainerRevision, ImportJob, ImportStatus, Question, QuestionKind, SourceDocument
 from .services import finalize_if_expired
 from .security import uid
 from .storage import get, put
@@ -18,6 +18,10 @@ celery_app.conf.beat_schedule={
     "finalize-expired-attempts-every-minute": {
         "task":"app.tasks.finalize_expired_attempts",
         "schedule":60.0,
+    },
+    "fail-stale-explainers-every-five-minutes": {
+        "task": "app.tasks.fail_stale_explainers",
+        "schedule": 300.0,
     },
 }
 SYSTEM="""You extract educational examination papers into teacher-reviewable records. Return only JSON matching the supplied schema.
@@ -453,3 +457,24 @@ def finalize_expired_attempts():
         raise
     finally:
         db.close()
+
+@celery_app.task
+def fail_stale_explainers():
+    """Let teachers retry jobs lost to a terminated render worker."""
+    from datetime import timedelta
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=20)
+        rows = db.query(ExplainerRevision).filter(ExplainerRevision.status.in_(["queued", "planning", "narrating", "rendering", "finalizing"]),
+                                                   ExplainerRevision.updated_at < cutoff).all()
+        for row in rows:
+            row.status = "failed"
+            row.progress_message = "Generation timed out"
+            row.error = "Generation timed out; request a new draft"
+        db.commit()
+        return {"failed": len(rows)}
+    finally:
+        db.close()
+
+# Register the dedicated explainer queue task when Celery loads this module.
+from . import explainer_generation  # noqa: E402,F401

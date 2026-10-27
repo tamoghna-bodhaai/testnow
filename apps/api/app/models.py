@@ -110,6 +110,23 @@ class TestVersion(Timestamped, Base):
     __tablename__="test_versions"; id: Mapped[str] = mapped_column(String(36), primary_key=True); test_id: Mapped[str] = mapped_column(ForeignKey("tests.id", ondelete="CASCADE"), index=True)
     ordinal: Mapped[int] = mapped_column(Integer); content: Mapped[dict] = mapped_column(JSON); published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__=(UniqueConstraint("test_id","ordinal"),)
+class ExplainerRevision(Timestamped, Base):
+    __tablename__="explainer_revisions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    test_id: Mapped[str] = mapped_column(ForeignKey("tests.id", ondelete="CASCADE"), index=True)
+    version_id: Mapped[str] = mapped_column(ForeignKey("test_versions.id", ondelete="CASCADE"))
+    question_id: Mapped[str] = mapped_column(String(36))
+    requested_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    feedback: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="queued", nullable=False)
+    progress_message: Mapped[str | None] = mapped_column(String(160))
+    scene_spec: Mapped[dict | None] = mapped_column(JSON)
+    video_object_key: Mapped[str | None] = mapped_column(String(512))
+    error: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__=(Index("ix_explainer_test_question", "test_id", "version_id", "question_id"),
+                    Index("uq_explainer_published", "test_id", "version_id", "question_id", unique=True,
+                          sqlite_where=published_at.is_not(None), postgresql_where=published_at.is_not(None)))
 class Enrollment(Timestamped, Base):
     __tablename__="enrollments"; test_id: Mapped[str] = mapped_column(ForeignKey("tests.id",ondelete="CASCADE"),primary_key=True); student_id: Mapped[str] = mapped_column(ForeignKey("users.id",ondelete="CASCADE"),primary_key=True)
 class Classroom(Timestamped, Base):
