@@ -150,7 +150,7 @@ def finalize_if_expired(db:Session, attempt:Attempt, now:datetime|None=None)->bo
     # deadline. Re-read under a row lock before scoring so only one path writes
     # the result and audit event.
     if db.bind and db.bind.dialect.name=="postgresql":
-        attempt=db.query(Attempt).filter_by(id=attempt.id).with_for_update().one()
+        attempt=db.query(Attempt).filter_by(id=attempt.id).populate_existing().with_for_update().one()
     now=now or datetime.now(timezone.utc)
     ends_at=attempt.ends_at.replace(tzinfo=timezone.utc) if attempt.ends_at.tzinfo is None else attempt.ends_at.astimezone(timezone.utc)
     if attempt.submitted_at or now<ends_at:

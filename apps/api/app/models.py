@@ -14,6 +14,21 @@ class QuestionScope(str, enum.Enum): PRIVATE="private"; GLOBAL="global"
 class Timestamped:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+class DurableJob(Timestamped, Base):
+    __tablename__ = "durable_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task: Mapped[str] = mapped_column(String(120))
+    queue: Mapped[str] = mapped_column(String(32))
+    resource: Mapped[str] = mapped_column(String(160))
+    args: Mapped[list] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    error: Mapped[str | None] = mapped_column(Text)
+    __table_args__ = (Index("ix_durable_jobs_queue_status_available", "queue", "status", "available_at"),)
+
 class User(Timestamped, Base):
     __tablename__="users"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

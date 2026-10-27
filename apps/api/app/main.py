@@ -6,6 +6,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import String, cast, exists, func, or_
 from sqlalchemy.orm import Session
 from .config import settings
+from .durable_jobs import commit_task, enqueue
 from .db import Base, engine, get_db
 from .models import AccountStatus, AuditEvent, Attempt, AttemptEvent, Classroom, ClassMembership, Enrollment, ExplainerRevision, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, QuestionTaxonomy, Response as AnswerResponse, Role, SourceDocument, TaxonomyNode, Test, TestClassAssignment, TestStatus, TestVersion, User
 from .schemas import AdminQuestionUpdate, SourceRelinkIn, TaxonomyAliasIn, AnswerKeyIn, ClassroomCreate, EnrolIn, ImportTestCreate, IntegrityViolationIn, LoginIn, QuestionBankCreate, QuestionBankUpdate, QuestionIn, QuestionOut, ResponseIn, RosterUpdate, StudentCreate, StudentUpdate, SubmitIn, TeacherCreate, TeacherUpdate, TestClassAssignmentsIn, TestCreate
@@ -328,8 +329,11 @@ async def create_bank_imports(bank_id:str,subject:str=Form(...),question_files:l
             outcomes.append({"filename":file.filename,"role":"question","status":"failed","error":"Question source could not be stored; retry this file"})
     if dispatch and bank.status!="published":bank.status="processing"
     audit(db,user.id,"question_bank.import_created","question_bank",bank.id,{"subject":subject,"outcomes":outcomes})
+    if settings().durable_jobs_enabled:
+        for job in dispatch:
+            enqueue(db, extract_bank_import, [job.id])
     db.commit()
-    for job in dispatch:
+    for job in ([] if settings().durable_jobs_enabled else dispatch):
         try:extract_bank_import.delay(job.id)
         except Exception:
             job.status=ImportStatus.FAILED;job.error="The worker queue could not accept this import. Retry this source when the queue is available."
@@ -344,8 +348,7 @@ def start_figure_revalidation(bank_id:str,user:User=Depends(require(Role.ADMIN))
     if not bank:raise HTTPException(404,"Question bank not found")
     run_id=uid()
     audit(db,user.id,"question_bank.figure_revalidation_started","question_bank",bank.id,{"run_id":run_id})
-    db.commit()
-    revalidate_bank_figures.delay(bank.id,run_id,user.id)
+    commit_task(db,revalidate_bank_figures,bank.id,run_id,user.id)
     return {"run_id":run_id,"status":"queued"}
 
 @app.get("/admin/question-banks/{bank_id}/figure-revalidation")
@@ -415,7 +418,7 @@ def retry_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMI
     job.status=ImportStatus.UPLOADED;job.error=None
     job.extraction_meta={**(job.extraction_meta or {}),"phase":"Queued to retry the failed import","pause_requested":False,"cancel_requested":False,"cancelled_acknowledged_at":None,"paused_acknowledged_at":None,"retry_requested_at":heartbeat()}
     audit(db,user.id,"question_bank.import_retried","question_bank",bank.id,{"job_id":job.id,"filename":db.get(SourceDocument,job.question_document_id).filename})
-    db.commit();extract_bank_import.delay(job.id)
+    commit_task(db,extract_bank_import,job.id)
     return import_view(job,db)
 
 def clear_bank_import_output(db:Session,job:ImportJob)->int:
@@ -452,7 +455,7 @@ def reextract_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.
     job.status=ImportStatus.UPLOADED;job.error=None;job.published_at=None
     job.extraction_meta={"subject":subject,"source_role":meta.get("source_role","combined"),"pairing":meta.get("pairing","missing_answer_source"),"phase":"Queued for clean re-extraction","reextraction_count":int(meta.get("reextraction_count") or 0)+1,"reextracted_at":datetime.now(timezone.utc).isoformat()}
     audit(db,user.id,"question_bank.import_reextracted","import",job.id,{"bank_id":bank_id,"filename":db.get(SourceDocument,job.question_document_id).filename,"cleared_questions":removed})
-    db.commit();extract_bank_import.delay(job.id)
+    commit_task(db,extract_bank_import,job.id)
     return import_view(job,db)
 
 @app.get("/admin/question-banks/{bank_id}/questions")
@@ -619,7 +622,7 @@ def start_import_solution_generation(bank_id:str,job_id:str,user:User=Depends(re
     try:state=queue_generation(db,job,user.id)
     except ValueError as exc:raise HTTPException(409,str(exc))
     except LookupError as exc:raise HTTPException(422,str(exc))
-    db.commit();generate_bank_solutions.delay(job.id,state["run_id"],user.id,None)
+    commit_task(db,generate_bank_solutions,job.id,state["run_id"],user.id,None)
     return state
 
 @app.post("/admin/question-banks/{bank_id}/questions/{question_id}/solution-generation",status_code=202)
@@ -630,7 +633,7 @@ def start_question_solution_generation(bank_id:str,question_id:str,user:User=Dep
     try:state=queue_generation(db,job,user.id,question)
     except ValueError as exc:raise HTTPException(409,str(exc))
     except LookupError as exc:raise HTTPException(422,str(exc))
-    db.commit();generate_bank_solutions.delay(job.id,state["run_id"],user.id,question.id)
+    commit_task(db,generate_bank_solutions,job.id,state["run_id"],user.id,question.id)
     return state
 
 @app.post("/admin/question-banks/{bank_id}/imports/{job_id}/solution-generation/{run_id}/approve")
@@ -665,7 +668,7 @@ def resume_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADM
     if extraction_state(job)!="paused":raise HTTPException(409,"Wait for the worker to acknowledge the pause before resuming")
     job.status=ImportStatus.UPLOADED;job.error=None
     job.extraction_meta={**meta,"pause_requested":False,"paused_at":None,"paused_acknowledged_at":None,"resumed_at":heartbeat(),"phase":"Queued to resume"}
-    audit(db,user.id,"question_bank.import_resumed","import",job.id,{"bank_id":bank_id});db.commit();extract_bank_import.delay(job.id);return import_view(job,db)
+    audit(db,user.id,"question_bank.import_resumed","import",job.id,{"bank_id":bank_id});commit_task(db,extract_bank_import,job.id);return import_view(job,db)
 
 @app.post("/admin/question-banks/{bank_id}/imports/{job_id}/cancel")
 def cancel_bank_import(bank_id:str,job_id:str,user:User=Depends(require(Role.ADMIN)),db:Session=Depends(get_db)):
@@ -847,7 +850,7 @@ async def store_upload(file:UploadFile,user:User,db:Session)->SourceDocument:
 @app.post("/teacher/imports",status_code=202)
 async def create_import(question_paper:UploadFile=File(...),answer_key:UploadFile=File(...),user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     paper=await store_upload(question_paper,user,db); key=await store_upload(answer_key,user,db)
-    job=ImportJob(id=uid(),owner_id=user.id,question_document_id=paper.id,answer_document_id=key.id if key else None,status=ImportStatus.UPLOADED,extraction_meta={"phase":"Queued for extraction"});db.add(job);audit(db,user.id,"import.created","import",job.id);db.commit();extract_import.delay(job.id);return import_view(job,db)
+    job=ImportJob(id=uid(),owner_id=user.id,question_document_id=paper.id,answer_document_id=key.id if key else None,status=ImportStatus.UPLOADED,extraction_meta={"phase":"Queued for extraction"});db.add(job);audit(db,user.id,"import.created","import",job.id);db.flush();commit_task(db,extract_import,job.id);return import_view(job,db)
 @app.get("/teacher/imports")
 def list_imports(limit:int=Query(default=25,ge=1,le=500),user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     query=db.query(ImportJob)
@@ -905,10 +908,12 @@ def import_source(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN))
 def reextract_import(job_id:str,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):
     job=db.get(ImportJob,job_id)
     if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
+    if settings().durable_jobs_enabled and job.status in {ImportStatus.UPLOADED, ImportStatus.PROCESSING}:
+        raise HTTPException(409,"Wait for the current extraction to finish before re-extracting")
     if db.query(Question).filter_by(import_job_id=job.id).filter(Question.approved_at.is_not(None)).first():raise HTTPException(409,"Approved questions cannot be replaced; create a new import instead")
     ensure_unreferenced_questions(db,[qid for qid, in db.query(Question.id).filter_by(import_job_id=job.id)])
     db.query(Question).filter_by(import_job_id=job.id).delete(synchronize_session=False)
-    job.status=ImportStatus.UPLOADED;job.error=None;job.extraction_meta={"phase":"Queued for improved extraction"};audit(db,user.id,"import.reextraction_requested","import",job.id);db.commit();extract_import.delay(job.id)
+    job.status=ImportStatus.UPLOADED;job.error=None;job.extraction_meta={"phase":"Queued for improved extraction"};audit(db,user.id,"import.reextraction_requested","import",job.id);commit_task(db,extract_import,job.id)
     return import_view(job,db)
 @app.put("/teacher/imports/{job_id}/questions/{question_id}")
 def edit_import_question(job_id:str,question_id:str,data:QuestionIn,user:User=Depends(require(Role.TEACHER,Role.ADMIN)),db:Session=Depends(get_db)):

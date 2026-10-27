@@ -432,6 +432,32 @@ def test_solver_receives_taxonomy_and_records_the_actual_fallback_model():
     assert question.interaction["solution_generation"]["model"] == "fallback/model"
 
 
+def test_replay_after_question_checkpoint_preserves_success_and_does_not_repeat_audit(monkeypatch):
+    db, admin, _, job = setup_db()
+    question_record(db)
+    state = queue_generation(db, job, admin.id)
+    db.commit()
+    job_id, actor_id, run_id = job.id, admin.id, state["run_id"]
+    monkeypatch.setattr("app.solution_generation.SessionLocal", sessionmaker(bind=db.get_bind()))
+    monkeypatch.setattr("app.solution_generation._provider_request", lambda _: {
+        "can_solve": True, "answer": {"option": 0},
+        "solution_markdown": "Adding two and two gives four, corresponding to option A.",
+        "confidence": 1, "notes": "Fixture",
+    })
+    run_generation(job_id, run_id, actor_id)
+    db.expire_all()
+    row = db.get(ImportJob, job_id)
+    # Crash boundary: individual question committed, final run completion did
+    # not. Recovery re-enters the run with that completed question intact.
+    row.extraction_meta = {**row.extraction_meta, "solution_generation": {**row.extraction_meta["solution_generation"], "status": "running"}}
+    db.commit()
+    monkeypatch.setattr("app.solution_generation._provider_request", lambda _: pytest.fail("Repeated completed provider call"))
+    run_generation(job_id, run_id, actor_id)
+    db.expire_all()
+    assert db.get(ImportJob, job_id).extraction_meta["solution_generation"]["succeeded"] == 1
+    assert db.query(AuditEvent).filter_by(action="question_solution_generation.completed").count() == 1
+
+
 def test_solver_rejects_out_of_range_multiple_choice_output():
     db, admin, _, job = setup_db()
     question = question_record(db, kind=QuestionKind.MULTIPLE)

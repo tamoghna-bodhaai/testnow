@@ -42,7 +42,8 @@ def stage_repair(db, question, figures, issues, actor_id=None):
     revision=uid()
     for index, figure in enumerate(figures):
         metadata={k:v for k,v in figure.items() if k!="png"}
-        key=f"repaired-diagrams/{question.id}/{revision}-{index}.png"
+        from .job_context import asset_key
+        key=asset_key(f"repaired-diagrams/{question.id}/{revision}-{index}.png")
         put(key,figure["png"],"image/png")
         saved.append({**metadata,"object_key":key})
     previous=question.diagrams
@@ -140,7 +141,8 @@ def revalidate_bank_figures(self, bank_id: str, run_id: str, actor_id: str | Non
         raise
     finally:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        report_key = f"figure-revalidation/{bank_id}/{run_id}.json"
+        from .job_context import asset_key
+        report_key = asset_key(f"figure-revalidation/{bank_id}/{run_id}.json")
         try:
             put(report_key, json.dumps(report, indent=2).encode(), "application/json")
             for job in jobs.values() if 'jobs' in locals() else []:

@@ -15,6 +15,7 @@ from .services import audit
 from .storage import client as storage_client
 from .config import settings
 from .tasks import celery_app
+from .durable_jobs import enqueue
 
 router = APIRouter()
 ACTIVE_EXPLAINER_STATUSES = ("queued", "planning", "narrating", "rendering", "finalizing")
@@ -119,6 +120,10 @@ def generate_explainer(test_id: str, question_id: str, data: GenerateExplainerIn
                             progress_message="Waiting for the render worker")
     db.add(row)
     audit(db, user.id, "explainer.generation_requested", "explainer", row.id, {"test_id": test.id, "question_id": question_id})
+    if settings().durable_jobs_enabled:
+        enqueue(db, "app.explainers.render_explainer", [row.id], queue="explainers")
+        db.commit()
+        return revision_view(row)
     db.commit()
     try:
         celery_app.send_task("app.explainers.render_explainer", args=[row.id], queue="explainers")

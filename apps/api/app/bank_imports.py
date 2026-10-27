@@ -238,7 +238,8 @@ def run_bank_import(job_id: str) -> None:
         conversion_info=dict(meta.get("docx_visual_inventory") or {})
         raw=get(canonical_key) if canonical_key else _pdf_bytes(source,conversion_info)
         if source.media_type != "application/pdf" and not canonical_key:
-            canonical_key=f"bank-sources/{bank.id}/{source.id}/canonical.pdf"
+            from .job_context import asset_key
+            canonical_key=asset_key(f"bank-sources/{bank.id}/{source.id}/canonical.pdf")
             put(canonical_key,raw,"application/pdf")
             job,meta=_checkpoint(db,job_id,{"canonical_pdf_key":canonical_key})
             db.commit()

@@ -699,11 +699,12 @@ def extract_figures(item, document, regions, reviewed=False):
 
 
 def save_figures(item, document, regions, prefix, put, reviewed=False):
+    from .job_context import asset_key
     figures, issues = extract_figures(item, document, regions, reviewed=reviewed)
     saved = []
     for index, figure in enumerate(figures):
         png = figure.pop("png")
-        key = f"{prefix}-{figure['page']}-{index}-{hashlib.sha256(png).hexdigest()[:16]}.png"
+        key = asset_key(f"{prefix}-{figure['page']}-{index}-{hashlib.sha256(png).hexdigest()[:16]}.png")
         try:
             put(key, png, "image/png")
         except Exception:

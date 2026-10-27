@@ -338,6 +338,23 @@ def test_expiry_worker_finalizes_attempt_without_a_browser(monkeypatch):
     assert finalize_expired_attempts.run()=={"finalized":1}
     assert db.get(Attempt,attempt_id).submitted_at is not None
 
+def test_direct_maintenance_expiry_is_independent_of_broker_and_idempotent(monkeypatch):
+    from app import maintenance_scheduler
+    db=make_db()
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)
+    test=Assessment(id="test",owner_id="teacher",title="Test",subject="Subject",status=AssessmentStatus.PUBLISHED,duration_seconds=60,max_attempts=1)
+    version=AssessmentVersion(id="version",test_id=test.id,ordinal=1,content={"questions":[]},published_at=datetime.now(timezone.utc))
+    attempt=Attempt(id="attempt",test_id=test.id,version_id=version.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc).replace(year=2020))
+    db.add_all([student,test,version,attempt]);db.commit()
+    monkeypatch.setattr("app.tasks.SessionLocal",lambda:db)
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("broker unavailable")
+    monkeypatch.setattr("app.tasks.celery_app.send_task",unavailable)
+
+    assert maintenance_scheduler.finalize_expired_attempts.run()=={"finalized":1}
+    assert maintenance_scheduler.finalize_expired_attempts.run()=={"finalized":0}
+    assert db.get(Attempt,"attempt").submitted_at is not None
+
 def test_existing_attempt_is_not_stranded_after_assignment_changes():
     db=make_db()
     student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT,status=AccountStatus.ACTIVE)

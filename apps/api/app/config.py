@@ -1,10 +1,19 @@
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     database_url: str = "sqlite+pysqlite:///:memory:"
     redis_url: str = "redis://localhost:6379/0"
+    # Enable only after migration and the Railway worker cutover in the runbook.
+    durable_jobs_enabled: bool = False
+    worker_wake_token: str | None = None
+    worker_wake_url: str | None = None
+    explainer_worker_wake_url: str | None = None
+    worker_queue: str = "celery"
+    worker_max_attempts: int = Field(default=3, ge=1)
+    worker_job_timeout_seconds: int = Field(default=3600, ge=60)
     session_secret: str = "development-only-change-me"
     cookie_secure: bool = True
     s3_endpoint_url: str | None = None

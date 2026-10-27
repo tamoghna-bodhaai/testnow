@@ -1,0 +1,6 @@
+# Use this config path for both worker services, keeping their existing
+# Dockerfiles. Set WORKER_QUEUE=explainers on the render service only.
+[deploy]
+startCommand = "sh -c 'exec uvicorn app.worker_service:app --host :: --port ${PORT:-8000} --workers 1'"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -408,12 +408,17 @@ def run_generation(job_id: str, run_id: str, actor_id: str, question_id: str | N
             if (current_job.extraction_meta or {}).get("delete_requested"):
                 delete_import_records(db,current_job,(current_job.extraction_meta or {}).get("delete_requested_by"));db.commit();return
             try:
-                result = generate_question(db, row, job)
+                # A durable replay may follow a crash after this question's
+                # checkpoint. Preserve its successful count and audit event.
+                prior = (row.interaction or {}).get("solution_generation", {})
+                already_completed = prior.get("run_id") == run_id and prior.get("status") == "completed" and not missing_generation_fields(row)
+                result = prior if already_completed else generate_question(db, row, job)
                 if result.get("status") == "skipped":
                     skipped += 1
                 else:
                     succeeded += 1
-                    audit(db, actor_id, "question_solution_generation.completed", "question", row.id, {"run_id": run_id, "generated_fields": result.get("generated_fields", []),"model":result.get("model")})
+                    if not already_completed:
+                        audit(db, actor_id, "question_solution_generation.completed", "question", row.id, {"run_id": run_id, "generated_fields": result.get("generated_fields", []),"model":result.get("model")})
             except Exception as exc:
                 db.rollback()
                 row = db.get(Question, row.id)

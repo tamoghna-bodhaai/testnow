@@ -19,6 +19,7 @@ from .explainer_math import sample_function, sample_region
 from .models import ExplainerRevision, TestVersion
 from .storage import client as storage_client, get, put
 from .tasks import celery_app
+from .job_context import asset_key, current_execution
 
 ACTIVE_STATUSES = ("queued", "planning", "narrating", "rendering", "finalizing")
 
@@ -265,8 +266,9 @@ def speech(text: str, path: Path):
     path.write_bytes(response.content)
 
 def run(command: list[str], *, env=None, cwd=None, timeout=300, cancel_check=None):
+    durable = current_execution.get() is not None
     process = subprocess.Popen(command, env=env, cwd=cwd, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+                               stderr=subprocess.PIPE, text=True, start_new_session=not durable)
     deadline = time.monotonic() + timeout
     try:
         while True:
@@ -285,11 +287,17 @@ def run(command: list[str], *, env=None, cwd=None, timeout=300, cancel_check=Non
         return subprocess.CompletedProcess(command, process.returncode, output, errors)
     except BaseException:
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
+            if durable:
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
             try:
                 process.communicate(timeout=3)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                if durable:
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
         raise
 
@@ -362,7 +370,7 @@ def render_explainer(revision_id: str):
                                 progress=lambda status, message: set_stage(db, revision_id, status, message),
                                 cancel_check=lambda: check_cancelled(db, revision_id))
         set_stage(db, revision_id, "finalizing", "Saving the finished video")
-        key = f"explainers/{row.test_id}/{row.version_id}/{row.question_id}/{row.id}.mp4"
+        key = asset_key(f"explainers/{row.test_id}/{row.version_id}/{row.question_id}/{row.id}.mp4")
         put(key, data, "video/mp4")
         uploaded_key = key
         changed = db.execute(update(ExplainerRevision).where(

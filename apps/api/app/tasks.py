@@ -14,6 +14,11 @@ from .storage import get, put
 from .figures import DIAGRAM_SCHEMA, OPTION_SCHEMA, VISUAL_INSTRUCTIONS, image_regions, vector_regions, save_figures, visual_context, model_visual_request, canonical_visual_response, mark_scope_conflicts, ground_question_spans, rect
 
 celery_app=Celery("testnow",broker=settings().redis_url,backend=settings().redis_url)
+# Celery otherwise starts one child per detected CPU, even when the queue is
+# empty. Railway containers can see many CPUs, making an idle worker expensive.
+# An explicit --concurrency on the worker command still overrides this default.
+celery_app.conf.worker_concurrency=1
+celery_app.conf.worker_prefetch_multiplier=1
 celery_app.conf.beat_schedule={
     "finalize-expired-attempts-every-minute": {
         "task":"app.tasks.finalize_expired_attempts",
@@ -467,12 +472,26 @@ def fail_stale_explainers():
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=20)
         rows = db.query(ExplainerRevision).filter(ExplainerRevision.status.in_(["queued", "planning", "narrating", "rendering", "finalizing"]),
                                                    ExplainerRevision.updated_at < cutoff).all()
+        if settings().durable_jobs_enabled:
+            from .models import DurableJob
+            # Queue time and heartbeat age do not prove worker death. The
+            # durable worker owns recovery and bounded interruption retries.
+            protected = {args[0] for args, in db.query(DurableJob.args).filter(
+                DurableJob.task == "app.explainers.render_explainer",
+                DurableJob.status.in_(["pending", "running"])).all() if args}
+            rows = [row for row in rows if row.id not in protected]
+        failed = 0
         for row in rows:
-            row.status = "failed"
-            row.progress_message = "Generation timed out"
-            row.error = "Generation timed out; request a new draft"
+            # A worker may have finished after the stale scan. Recheck in the
+            # UPDATE so maintenance cannot replace a newly ready revision.
+            failed += db.query(ExplainerRevision).filter(
+                ExplainerRevision.id == row.id,
+                ExplainerRevision.status.in_(["queued", "planning", "narrating", "rendering", "finalizing"]),
+                ExplainerRevision.updated_at < cutoff,
+            ).update({"status": "failed", "progress_message": "Generation timed out",
+                      "error": "Generation timed out; request a new draft"}, synchronize_session=False)
         db.commit()
-        return {"failed": len(rows)}
+        return {"failed": failed}
     finally:
         db.close()
 

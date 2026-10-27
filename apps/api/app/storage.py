@@ -16,6 +16,15 @@ def signed_get(key:str,seconds:int=300)->str:return client().generate_presigned_
 def digest(data:bytes)->str:return hashlib.sha256(data).hexdigest()
 def delete_prefix(prefix:str):
     """Delete only objects under one known seed prefix, including paginated keys."""
+    from .job_context import current_execution
+    owner = current_execution.get()
+    if owner is not None:
+        owner.check()
+        # A remote delete cannot participate in PostgreSQL fencing. Durable
+        # worker cleanup removes DB references and leaves objects for bucket
+        # lifecycle/garbage collection, so a disconnected execution cannot
+        # delete a replacement execution's assets.
+        return
     c=client(); bucket=settings().s3_bucket; token=None
     while True:
         args={"Bucket":bucket,"Prefix":prefix}

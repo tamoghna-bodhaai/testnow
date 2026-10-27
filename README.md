@@ -101,6 +101,8 @@ was not supplied.
 
 Follow [infrastructure/railway.md](infrastructure/railway.md). Use Railway PostgreSQL, Redis, and object storage; only publish the Next.js web service.
 
+For workers that sleep between jobs, use the opt-in [scale-to-zero deployment](infrastructure/railway-scale-to-zero.md), which includes transactional dispatch, fenced recovery, and independent assessment expiry.
+
 Production requires a sealed `SUPER_ADMIN_ACCESS_CODE` containing exactly five digits. The first API startup creates `utils@bodhaai.tech` as the super administrator. It manages teacher codes and statuses; teachers manage student codes and class/batch rosters.
 
 The production access-code migration intentionally starts teacher and student data from a clean slate. It deletes legacy teacher/student accounts and their assessment history, so it must not be run where those records need to be retained.
