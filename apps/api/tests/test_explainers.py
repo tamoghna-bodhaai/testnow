@@ -8,7 +8,7 @@ import pytest
 from app.db import Base
 from app.explainers import GenerateExplainerIn, cancel_explainer, generate_explainer, publish_explainer, result_is_released, stream_video, student_explainers, suggested
 from app.explainer_generation import ExplainerPlan, GenerationCancelled, Visual, plan_storyboard, raise_for_openrouter_status, run, scene_beats, set_stage, validate_storyboard
-from app.explainer_captions import caption_cues
+from app.explainer_captions import caption_cues, caption_markup
 from app.explainer_math import sample_function, sample_region
 from app.main import delete_test
 from app.models import AccountStatus, Attempt, Enrollment, ExplainerRevision, Role, Test, TestStatus, TestVersion, User
@@ -295,6 +295,11 @@ def test_caption_cues_cover_all_words_and_match_beat_duration():
     assert " ".join(text for text, _ in cues) == narration
     assert all("\n" not in text and duration > 0 for text, duration in cues)
     assert sum(duration for _, duration in cues) == pytest.approx(9.4)
+
+
+def test_caption_math_markup_preserves_prose_and_escapes_text():
+    assert caption_markup("10 x_m squared minus x_m") == "10 x<sub>m</sub> squared minus x<sub>m</sub>"
+    assert caption_markup("v^{2} and P_{KE} < 4") == "v<sup>2</sup> and P<sub>KE</sub> &lt; 4"
 
 def test_video_stream_forwards_byte_range(monkeypatch):
     class Body:

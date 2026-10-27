@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from manim import *
-from app.explainer_captions import caption_cues
+from app.explainer_captions import caption_cues, caption_markup
 from app.explainer_math import sample_function, sample_region
 
 BLACK = "#000000"
@@ -171,8 +171,8 @@ def caption_sequence(narration, duration, hold_last=False):
     cues = caption_cues(narration, duration)
     captions = []
     for content, _ in cues:
-        label = fit(Text(content, font="DejaVu Sans", font_size=26,
-                         color=WHITE_INK), 11.4, 0.48)
+        label = fit(MarkupText(caption_markup(content), font="DejaVu Sans", font_size=26,
+                               color=WHITE_INK), 11.4, 0.48)
         backing = RoundedRectangle(corner_radius=0.12, width=min(12.0, label.width + 0.55),
                                    height=0.68,
                                    fill_color="#10202E", fill_opacity=0.93,
