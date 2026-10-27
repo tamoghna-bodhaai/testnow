@@ -131,6 +131,23 @@ def test_storyboard_accepts_scene_list_and_visual_aliases():
     assert spec["scenes"][0]["objects"][0]["content"] == "y=x^2"
 
 
+def test_two_scene_storyboard_can_explain_a_short_problem(monkeypatch):
+    import json
+    narration = "We first identify the rate at which water rises and the height it travels. This gives the power needed against gravity. Next we account for the speed of the water as it leaves the pump. Adding both contributions gives the total mechanical power required for this process."
+    words = narration.split()
+    scene = {"heading": "Pump power", "beats": [
+        {"narration": " ".join(words[:23]), "objects": [{"type": "text", "content": "Lift the water"}]},
+        {"narration": " ".join(words[23:]), "objects": [{"type": "math", "content": "P=4\\,kW"}]}]}
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": json.dumps({"scenes": [scene] * 2})}}]}
+    # Expand the narration to the supported overall duration without changing beat structure.
+    scene["beats"][0]["narration"] *= 2
+    scene["beats"][1]["narration"] *= 2
+    monkeypatch.setattr("app.explainer_generation.httpx.post", lambda *args, **kwargs: Response())
+    assert len(plan_storyboard({"stem_markdown": "Find the pump power"}, None, None)["scenes"]) == 2
+
+
 def test_graph_functions_plot_equations_in_data_coordinates():
     parabola = sample_function("y**2", "y", -2, 2, count=5)[0]
     assert parabola == [(4.0, -2.0), (1.0, -1.0), (0.0, 0.0),

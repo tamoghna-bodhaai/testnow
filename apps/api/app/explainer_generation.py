@@ -117,7 +117,7 @@ class ScenePlan(BaseModel):
         return self
 
 class ExplainerPlan(BaseModel):
-    scenes: list[ScenePlan] = Field(min_length=3, max_length=6)
+    scenes: list[ScenePlan] = Field(min_length=2, max_length=6)
 
 
 def scene_beats(scene: dict) -> list[dict]:
@@ -145,7 +145,7 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
     prompt = {"question": {k: question.get(k) for k in ("stem_markdown", "options", "answer", "solution_markdown", "diagrams", "taxonomy")},
               "teacher_feedback": feedback, "previous_draft": previous}
     system = ("Create an accurate 60-120 second English educational animation with a blackboard mathematical visual style. "
-              "Use only the supplied question and worked solution as factual authority. Return JSON with 3-6 scenes. "
+              "Use only the supplied question and worked solution as factual authority. Return JSON with 2-6 scenes. "
               "Each scene has a heading and 2-5 beats, with at most 10 objects total. Each beat has its own short narration and 1-5 NEW visual objects, revealed when that beat's speech starts. "
               "Objects persist for the rest of their scene. Never put all objects in the first beat or show a conclusion before its spoken explanation. "
               "Plan a teaching sequence: introduce the question, construct axes/curves or diagram, mark bounds/intersections, reveal the relevant shaded area, then show the setup and answer. "
@@ -204,7 +204,7 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
             return spec
         except (ValueError, json.JSONDecodeError) as exc:
             if attempt:
-                raise
+                raise ValueError("The explainer plan could not be validated. Please generate a new draft.") from exc
             messages.extend([
                 {"role": "assistant", "content": value},
                 {"role": "user", "content": (
