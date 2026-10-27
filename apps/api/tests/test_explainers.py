@@ -202,6 +202,13 @@ def test_graph_functions_plot_equations_in_data_coordinates():
         ExplainerPlan.model_validate(spec)
 
 
+def test_physics_motion_path_is_validated():
+    block = Visual(type="moving_block", points=[[-3, 2], [-1, 0.5], [1, 0.2], [3, 0.2]])
+    assert len(block.points) == 4
+    with pytest.raises(ValueError):
+        Visual(type="moving_block", points=[[0, 0]])
+
+
 def test_shaded_regions_follow_function_boundaries_and_reject_crossings():
     points = sample_region("x**2", "0", "x", 0, 2, count=5)
     assert points[:5] == [(0.0, 0.0), (0.5, 0.25), (1.0, 1.0),

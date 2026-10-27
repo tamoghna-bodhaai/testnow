@@ -1542,7 +1542,7 @@ const explainerStageIndex: Record<string, number> = { queued: 0, planning: 0, na
 function ExplainerRevisionDetails({ row, questionLabel, busy, publish, cancel }: { row: ExplainerRevision; questionLabel: string; busy: string; publish: (revisionId: string) => Promise<void>; cancel: (revisionId: string) => Promise<void> }) {
   const active = explainerStages.includes(row.status);
   return <>
-    <div><b>{row.published_at ? "Published" : "Draft"}</b><span className={`badge ${row.status}`}>{active ? "In progress" : explainerStageLabels[row.status] || row.status}</span><small>{fmtDate(row.created_at)}</small></div>
+    <div className="explainer-revision-meta"><b>{row.published_at ? "Published" : "Draft"}</b><span className={`badge ${row.status}`}>{active ? "In progress" : explainerStageLabels[row.status] || row.status}</span><small>{fmtDate(row.created_at)}</small></div>
     {active && <div className="explainer-progress">
       <div className="explainer-stage-window" aria-hidden="true"><div className="explainer-stage-track" style={{ transform: `translateY(-${explainerStageIndex[row.status] * 2.5}rem)` }}>{explainerAnimatedStages.map(stage => <div className="explainer-stage-item" key={stage}><span>{stage}</span><span className="explainer-dots"><i /><i /><i /></span></div>)}</div></div>
       <span className="explainer-status-accessible" role="status" aria-live="polite">{explainerStageLabels[row.status]}. {row.progress_message || "Generation in progress"}</span>

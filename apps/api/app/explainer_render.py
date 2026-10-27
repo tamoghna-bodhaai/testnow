@@ -37,7 +37,7 @@ def bounds(marks):
                 xs.extend((x-r, x+r)); ys.extend((y-r, y+r))
         if kind in ("line", "arrow"):
             xs.append(float(item["x2"])); ys.append(float(item["y2"]))
-        if kind == "polyline":
+        if kind in ("polyline", "moving_block"):
             for x, y in item["points"]:
                 xs.append(float(x)); ys.append(float(y))
         if kind == "function":
@@ -102,6 +102,13 @@ def graph_mark(item, axes, color):
                 [xy(x, y) for x, y in run])
             for run in runs
         ])
+    if kind == "moving_block":
+        points = [xy(x, y) for x, y in item["points"]]
+        block = RoundedRectangle(width=0.55, height=0.42, corner_radius=0.06,
+                                 color=color, fill_color=color, fill_opacity=0.85)
+        block.move_to(points[0])
+        block.motion_path = VMobject().set_points_as_corners(points) if len(points) > 2 else Line(*points)
+        return block
     raise ValueError("Unsupported graph mark")
 
 
@@ -125,7 +132,7 @@ def mixed_text(content, color, font_size=34):
 
 
 def scene_body(items):
-    marks = [item for item in items if item["type"] in ("dot", "circle", "line", "arrow", "polyline", "function")]
+    marks = [item for item in items if item["type"] in ("dot", "circle", "line", "arrow", "polyline", "function", "moving_block")]
     regions = [item for item in items if item["type"] == "region"]
     notes = [item for item in items if item["type"] in ("text", "math")]
     show_axes = any(item["type"] in ("axes", "function") for item in items)
@@ -175,6 +182,8 @@ def scene_body(items):
 
 
 def visual_animation(item, mob):
+    if item["type"] == "moving_block":
+        return Succession(FadeIn(mob, run_time=0.2), MoveAlongPath(mob, mob.motion_path, rate_func=linear, run_time=1.8))
     if item["type"] in ("text", "math"):
         return Write(mob)
     if item["type"] == "dot":

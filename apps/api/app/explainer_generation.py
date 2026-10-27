@@ -43,7 +43,7 @@ def set_stage(db, revision_id: str, status: str, message: str):
     db.expire_all()
 
 class Visual(BaseModel):
-    type: Literal["text", "math", "dot", "circle", "line", "arrow", "polyline", "axes", "function", "region"]
+    type: Literal["text", "math", "dot", "circle", "line", "arrow", "polyline", "axes", "function", "region", "moving_block"]
     color: Literal["auto", "white", "cyan", "yellow", "green", "coral"] = "auto"
     content: str = Field(default="", max_length=160)
     x: float = Field(default=0, ge=-1000, le=1000)
@@ -65,8 +65,8 @@ class Visual(BaseModel):
             raise ValueError("Visual text is required")
         if self.type in {"text", "math"} and re.search(r"\\(?:input|include|write|read|open|catcode|usepackage|immediate|special|def|newcommand)\b", self.content, re.I):
             raise ValueError("Unsupported TeX command")
-        if self.type == "polyline" and (len(self.points) < 2 or any(len(p) != 2 or not all(isinstance(v, (int, float)) and -1000 <= v <= 1000 for v in p) for p in self.points)):
-            raise ValueError("Invalid polyline")
+        if self.type in {"polyline", "moving_block"} and (len(self.points) < 2 or any(len(p) != 2 or not all(isinstance(v, (int, float)) and -1000 <= v <= 1000 for v in p) for p in self.points)):
+            raise ValueError("Invalid visual path")
         if self.type == "function":
             sample_function(self.expression, self.variable, self.domain_start, self.domain_end, count=41)
         if self.type == "region":
@@ -188,7 +188,11 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
               "Objects persist for the rest of their scene. Never put all objects in the first beat or show a conclusion before its spoken explanation. "
               "Plan a teaching sequence: introduce the question, construct axes/curves or diagram, mark bounds/intersections, reveal the relevant shaded area, then show the setup and answer. "
               "Split spoken reasoning into beats at the exact moments when a visual should appear. Keep each beat focused on one idea. "
-              "Visual types: text, math, dot, circle, line, arrow, polyline, axes, function, region. "
+              "Visual types: text, math, dot, circle, line, arrow, polyline, axes, function, region, moving_block. "
+              "For physics, show the physical situation whenever possible, not just equations: draw relevant objects, surfaces, forces and motion in the narrated sequence. "
+              "A moving_block has points [[x,y],...] describing the block center along its path; it animates from the first to the last point during its narrated beat. "
+              "Use a separate polyline for a track and arrows for forces, with the block path slightly above the track so it remains visible. "
+              "Only depict motion and forces supported by the question and solution; do not claim the animation is a precise physical simulation. "
               "For every mathematical graph, include axes and function objects. A function object has expression (plain arithmetic, e.g. 'y**2' or '2*y+3'), "
               "variable ('y' means x=f(y); 'x' means y=f(x)), domain_start, and domain_end. "
               "Use functions for every smooth equation, including lines and parabolas; NEVER approximate a function with line segments or polyline points. "

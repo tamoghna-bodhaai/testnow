@@ -268,7 +268,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .explainer-controls textarea{width:100%;min-height:4.5rem}
 .explainer-controls button{justify-self:start}
 .explainer-revision{display:grid;gap:.65rem;border:1px solid var(--line,#d9e1e8);border-radius:12px;padding:1rem;max-width:48rem}
-.explainer-revision>div:first-child{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap}
+.explainer-revision-meta{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap}
 .explainer-version-label{margin:0!important;color:var(--muted,#687385);font-size:.78rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
 .explainer-history-button{display:inline-flex;align-items:center;justify-content:center;gap:.22rem;min-width:2.5rem;height:2.5rem;padding:.35rem!important;border:1px solid var(--line)!important;border-radius:999px!important;background:var(--surface)!important;color:var(--blue)!important;box-shadow:none!important;font-size:.85rem;line-height:1}
 .explainer-history-button:hover{background:var(--indigo-mist)!important}
