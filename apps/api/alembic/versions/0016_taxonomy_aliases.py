@@ -1,12 +1,12 @@
 """Add an alias target without repurposing existing taxonomy identifiers/codes.
 
 Revision ID: 0016_taxonomy_aliases
-Revises: 0015_keyed_answers_optional_solutions
+Revises: 0015_keyed_answers_optional
 """
 from alembic import op
 import sqlalchemy as sa
 revision='0016_taxonomy_aliases'
-down_revision='0015_keyed_answers_optional_solutions'
+down_revision='0015_keyed_answers_optional'
 branch_labels=None
 depends_on=None
 

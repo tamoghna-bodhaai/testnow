@@ -1,6 +1,6 @@
 """Clear false missing-solution warnings for authoritative answer keys.
 
-Revision ID: 0015_keyed_answers_optional_solutions
+Revision ID: 0015_keyed_answers_optional
 Revises: 0014_attempt_integrity
 """
 from __future__ import annotations
@@ -11,7 +11,9 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0015_keyed_answers_optional_solutions"
+# Alembic's default `alembic_version.version_num` column is VARCHAR(32).
+# Keep this identifier below that limit so an upgrade from 0014 can record it.
+revision = "0015_keyed_answers_optional"
 down_revision = "0014_attempt_integrity"
 branch_labels = None
 depends_on = None
