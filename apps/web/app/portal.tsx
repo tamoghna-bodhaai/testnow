@@ -513,6 +513,7 @@ export function Portal() {
   const [user, setUser] = useState<User | null>(null),
     [showLanding, setShowLanding] = useState(true),
     [error, setError] = useState(""),
+    [loginError, setLoginError] = useState(""),
     [view, setView] = useState<WorkspaceView>("home"),
     [supportTeacher,setSupportTeacher]=useState<string|null>(null),
     [tests, setTests] = useState<Test[]>([]),
@@ -613,7 +614,7 @@ export function Portal() {
   }, [message]);
   const login = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    setError("");
+    setLoginError("");
     try {
       const x = await api("/auth/login", {
         method: "POST",
@@ -621,7 +622,11 @@ export function Portal() {
       });
       await load(x);
     } catch (e: any) {
-      setMessage(e.message);
+      setLoginError(
+        e.status === 401
+          ? "Incorrect access code. Check the five digits and try again."
+          : e.message,
+      );
     }
   };
   if (!user && showLanding) return <LandingPage onSignIn={() => setShowLanding(false)} />;
@@ -658,12 +663,15 @@ export function Portal() {
                 pattern="[0-9]{5}"
                 maxLength={5}
                 autoComplete="one-time-code"
+                aria-invalid={Boolean(loginError)}
+                aria-describedby={loginError ? "login-access-code-error" : undefined}
+                onChange={() => setLoginError("")}
                 required
               />
+              {loginError && <Notice kind="error"><span id="login-access-code-error">{loginError}</span></Notice>}
             </div>
             <button>Continue</button>
           </form>
-          {error && <Notice kind="error">{error}</Notice>}
           <small>
             For local demo data, use the documented test accounts in the project
             README.
