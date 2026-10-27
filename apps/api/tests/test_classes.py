@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app import main
 from app.main import assigned_student_ids, create_import_test, create_student, delete_import, delete_test, get_attempt, integrity_violation, question_media, questions, save_response, student_can_access, student_classes, student_tests, submit, test_analytics as assessment_analytics
-from app.models import AccountStatus, Attempt, AttemptEvent, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionKind, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
+from app.models import AccountStatus, Attempt, AttemptEvent, Classroom, ClassMembership, ImportJob, ImportStatus, Question, QuestionBank, QuestionKind, QuestionScope, Response as AnswerResponse, Role, SourceDocument, Test as Assessment, TestClassAssignment as ClassAssignment, TestStatus as AssessmentStatus, TestVersion as AssessmentVersion, User
 from app.tasks import finalize_expired_attempts
 from app.schemas import ImportTestCreate, IntegrityViolationIn, LoginIn, ResponseIn, RosterUpdate, StudentCreate, SubmitIn
 from fastapi import HTTPException
@@ -148,6 +148,21 @@ def test_teacher_question_library_filters_approved_questions_by_source_pdf():
     assert result["total"]==1
     assert [item["id"] for item in result["items"]]==["approved-first"]
     assert result["items"][0]["import_job_id"]==first_job.id
+
+def test_teacher_question_library_excludes_global_bank_questions():
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    admin=User(id="admin",name="Admin",email="admin@example.com",password_hash="x",role=Role.ADMIN)
+    bank=QuestionBank(id="bank",slug="bank",name="Global Bank",exam_code="JEE",is_global=True)
+    approved_at=datetime.now(timezone.utc)
+    private=Question(id="private",owner_id=teacher.id,scope=QuestionScope.PRIVATE,kind=QuestionKind.SINGLE,stem_markdown="Private",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=approved_at)
+    global_question=Question(id="global",owner_id=admin.id,bank_id=bank.id,scope=QuestionScope.GLOBAL,kind=QuestionKind.SINGLE,stem_markdown="Global",options=[{"markdown":"4"},{"markdown":"5"}],answer={"option":0},approved_at=approved_at)
+    db.add_all([teacher,admin,bank,private,global_question]);db.commit()
+
+    result=questions(page=1,page_size=20,approved=True,import_job_id=None,user=teacher,db=db)
+
+    assert result["total"]==1
+    assert [item["id"] for item in result["items"]]==["private"]
 
 def test_teacher_can_create_and_publish_a_test_from_one_approved_pdf():
     db=make_db()

@@ -2685,8 +2685,28 @@ function Builder({
           </div>
         </Card>
         <Card className="builder-library">
-          <h2>{activePaper ? `Approved questions from ${activePaper.meta?.paper_title || activePaper.filename || "selected paper"}` : "Your approved questions"}</h2>
+          <h2>
+            {source === "bank"
+              ? `${activeBank?.name || "Global"} question bank`
+              : activePaper
+                ? `Approved questions from ${activePaper.meta?.paper_title || activePaper.filename || "selected paper"}`
+                : "Your approved questions"}
+          </h2>
           <div className="stacked-form compact-form builder-source-controls">
+            <label>
+              Question source
+              <select
+                value={source}
+                onChange={(e) => {
+                  setSource(e.target.value as "bank" | "mine");
+                  setPage(1);
+                  setSelected([]);
+                }}
+              >
+                <option value="bank" disabled={!bankId}>Global bank</option>
+                <option value="mine">My approved questions</option>
+              </select>
+            </label>
             {source === "bank" && (
               <>
                 <label>

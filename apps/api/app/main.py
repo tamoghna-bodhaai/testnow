@@ -1091,7 +1091,10 @@ def questions(
         job=db.get(ImportJob,import_job_id)
         if not job or (job.owner_id!=user.id and user.role!=Role.ADMIN):raise HTTPException(404,"Import not found")
         owner_id=job.owner_id
-    rows=db.query(Question).filter((Question.owner_id==owner_id)|((Question.scope==QuestionScope.GLOBAL)&(Question.approved_at.is_not(None)))).order_by(Question.created_at.desc())
+    # This is the teacher's private library.  Global material is deliberately
+    # served only by /question-banks/{bank_id}/questions, where its release
+    # status and taxonomy filters are enforced.
+    rows=db.query(Question).filter(Question.owner_id==owner_id,Question.scope!=QuestionScope.GLOBAL).order_by(Question.created_at.desc())
     if approved is True:rows=rows.filter(Question.approved_at.is_not(None))
     elif approved is False:rows=rows.filter(Question.approved_at.is_(None))
     if import_job_id:rows=rows.filter(Question.import_job_id==import_job_id)
