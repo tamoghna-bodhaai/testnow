@@ -139,12 +139,9 @@ def scene_body(items):
         annotations = []
         for i, item in enumerate(notes):
             color = ink(item, WHITE_INK)
-            try:
-                annotation = (MathTex(item["content"], font_size=44, color=color)
-                              if item["type"] == "math" else
-                              Text(item["content"], font=SERIF, font_size=34, color=color))
-            except Exception:
-                annotation = Text(item["content"], font=SERIF, font_size=30, color=color)
+            annotation = (MathTex(item["content"], font_size=44, color=color)
+                          if item["type"] == "math" else
+                          Text(item["content"], font=SERIF, font_size=34, color=color))
             annotations.append(fit(annotation, width, 1.15))
         stack = VGroup(*annotations).arrange(DOWN, buff=0.38, aligned_edge=LEFT)
         fit(stack, width, 4.5 if has_graph else 4.6)

@@ -7,7 +7,7 @@ import pytest
 
 from app.db import Base
 from app.explainers import GenerateExplainerIn, cancel_explainer, generate_explainer, publish_explainer, result_is_released, stream_video, student_explainers, suggested
-from app.explainer_generation import ExplainerPlan, GenerationCancelled, plan_storyboard, run, scene_beats, set_stage, validate_storyboard
+from app.explainer_generation import ExplainerPlan, GenerationCancelled, Visual, plan_storyboard, run, scene_beats, set_stage, validate_storyboard
 from app.explainer_captions import caption_cues
 from app.explainer_math import sample_function, sample_region
 from app.main import delete_test
@@ -129,6 +129,12 @@ def test_storyboard_accepts_scene_list_and_visual_aliases():
                "visuals": [{"type": "math", "label": "y=x^2"}]} for _ in range(3)]
     spec = validate_storyboard(json.dumps(scenes))
     assert spec["scenes"][0]["objects"][0]["content"] == "y=x^2"
+
+
+def test_equations_cannot_be_mistaken_for_plain_text():
+    with pytest.raises(ValueError, match="math object"):
+        Visual(type="text", content="P_KE = (0.5 * m * v^2) / t")
+    assert Visual(type="math", content=r"P_{\mathrm{KE}}=\frac{1}{2}mv^{2}/t").type == "math"
 
 
 def test_two_scene_storyboard_can_explain_a_short_problem(monkeypatch):

@@ -61,6 +61,8 @@ class Visual(BaseModel):
     def safe_visual(self):
         if self.type in {"text", "math"} and not self.content.strip():
             raise ValueError("Visual text is required")
+        if self.type == "text" and ("=" in self.content or re.search(r"[A-Za-z0-9][_^][A-Za-z0-9{]", self.content)):
+            raise ValueError("Equations and mathematical notation must use a math object with valid LaTeX")
         if self.type == "math" and re.search(r"\\(?:input|include|write|read|open|catcode|usepackage|immediate|special|def|newcommand)\b", self.content, re.I):
             raise ValueError("Unsupported TeX command")
         if self.type == "polyline" and (len(self.points) < 2 or any(len(p) != 2 or not all(isinstance(v, (int, float)) and -5.5 <= v <= 5.5 for v in p) for p in self.points)):
@@ -164,6 +166,10 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
               "All graph objects share mathematical x,y coordinates; do not use screen positions to lay them out. "
               "For other marks keep coordinates within x -5.5..5.5 and y -2.8..2.8. Line/arrow use x,y,x2,y2; "
               "circle uses radius; polyline uses points [[x,y],...]. Put brief labels and equations in text/math objects; "
+              "Every equation and mathematical expression MUST use a math object with valid LaTeX, never plain text. "
+              "Use braces for multi-character subscripts and powers, \\times or \\cdot for multiplication, and \\frac for fractions. "
+              "For example use P_{\\mathrm{KE}}=\\frac{1}{2}mv^{2}/t, not P_KE = (0.5 * m * v^2) / t. "
+              "Use \\text{...} for short labels within math, with no dollar delimiters. "
               "the renderer places these in a separate annotation area, ignoring their x and y. "
               "Use at most three short annotations per graph scene. Give functions mathematically correct expressions and domains from the source solution. "
               "Use bright cyan, yellow, green, or coral for highlighted math/curves and white for ordinary equations; the optional color field can match an equation to its curve. "
@@ -212,6 +218,7 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
                     "Every equation shown on axes must use a function object, not plotted line segments. "
                     "Area problems need a mathematically bounded region object in the relevant graph scene. "
                     "Every scene needs 2-5 narrated beats, each adding only the visuals discussed in that beat. "
+                    "Render equations using math objects containing valid LaTeX with grouped subscripts and superscripts, not plain text. "
                     "Keep the same mathematically correct lesson and return the complete corrected JSON."
                 )},
             ])
