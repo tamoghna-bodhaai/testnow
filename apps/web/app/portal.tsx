@@ -1549,7 +1549,7 @@ function ExplainerRevisionDetails({ row, questionLabel, busy, publish, cancel }:
       {row.progress_message && row.status !== "queued" && <p className="explainer-stage-detail">{row.progress_message}</p>}
       <button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => void cancel(row.id)}>{busy === row.id ? "Cancelling…" : "Cancel generation"}</button>
     </div>}
-    {row.status === "cancelled" && <p>Generation cancelled. You can start a new draft.</p>}
+    {row.status === "cancelled" && <p>Generation cancelled.</p>}
     {row.feedback && <p>Feedback: {row.feedback}</p>}
     {row.error && <p role="alert">Generation failed: {row.error}</p>}
     {row.preview_url && <><video controls preload="metadata" src={row.preview_url} aria-label={`Explainer preview for ${questionLabel}`} /><button className="secondary-action" disabled={Boolean(busy) || Boolean(row.published_at)} onClick={() => void publish(row.id)}>{row.published_at ? "Published to students" : "Publish this version"}</button></>}
@@ -1611,15 +1611,18 @@ function TestExplainers({ test }: { test: Test }) {
       const revisions = data.revisions.filter(row => row.question_id === question.id);
       const active = revisions.some(row => explainerStages.includes(row.status));
       const latest = revisions[0];
+      const published = revisions.some(row => Boolean(row.published_at));
+      const limitReached = revisions.length >= 3;
       return <section className="explainer-question" key={question.id}>
         <div className="explainer-question-heading"><div><h3>Question {question.source_number || index + 1}</h3><Markdown value={question.stem_markdown} className="explainer-stem" />
           <small>{!question.has_solution ? "Needs a worked solution" : question.suggested ? "Suggested for animation" : "Animation optional"}</small></div>
           {revisions.length > 0 && <button type="button" className="explainer-history-button" data-explainer-history={question.id} onClick={() => setHistoryQuestionId(question.id)} aria-label={`View ${revisions.length} generation${revisions.length === 1 ? "" : "s"} for question ${question.source_number || index + 1}`} title="View generation history"><span aria-hidden="true">↶</span><span>{revisions.length}</span></button>}</div>
-        {question.has_solution && <div className="explainer-controls">
+        {question.has_solution && !published && !limitReached && <div className="explainer-controls">
           <label htmlFor={`explainer-feedback-${question.id}`}>Directions for the next draft</label>
           <textarea id={`explainer-feedback-${question.id}`} rows={2} maxLength={2000} value={feedback[question.id] || ""} onChange={event => setFeedback(current => ({ ...current, [question.id]: event.target.value }))} placeholder="For example: slow down the graph reveal and explain the sign change." />
           <button disabled={active || Boolean(busy)} onClick={() => void generate(question.id, !question.suggested)}>{active ? "Generating…" : revisions.length ? "Generate new draft" : "Generate explainer"}</button>
         </div>}
+        {!published && limitReached && <p>Maximum of 3 explainer drafts reached.</p>}
         {latest && <div className="explainer-revision"><p className="explainer-version-label">Latest version</p><ExplainerRevisionDetails row={latest} questionLabel={`question ${question.source_number || index + 1}`} busy={busy} publish={publish} cancel={cancel} /></div>}
       </section>;
     })}

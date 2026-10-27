@@ -331,3 +331,26 @@ def test_deleting_unattempted_test_cleans_explainer_records(records, monkeypatch
     delete_test(test.id, teacher, db)
     assert db.query(ExplainerRevision).count() == 0
     assert removed == ["explainers/test/"]
+
+def test_generation_limit_counts_all_attempts_per_question(records):
+    db, teacher, _, _, test, _ = records
+    for _ in range(3):
+        draft = generate_explainer(test.id, "q1", GenerateExplainerIn(), teacher, db)
+        cancel_explainer(test.id, draft["id"], teacher, db)
+    with pytest.raises(HTTPException) as exc:
+        generate_explainer(test.id, "q1", GenerateExplainerIn(), teacher, db)
+    assert exc.value.status_code == 409
+    assert "limit of 3" in exc.value.detail
+    assert generate_explainer(test.id, "q2", GenerateExplainerIn(override_suggestion=True), teacher, db)["status"] == "queued"
+
+
+def test_generation_rejected_after_publication(records):
+    db, teacher, _, _, test, _ = records
+    row = ExplainerRevision(id="published", test_id=test.id, version_id="version", question_id="q1",
+                            requested_by=teacher.id, status="ready", video_object_key="video.mp4")
+    db.add(row); db.commit()
+    publish_explainer(test.id, row.id, teacher, db)
+    with pytest.raises(HTTPException) as exc:
+        generate_explainer(test.id, "q1", GenerateExplainerIn(), teacher, db)
+    assert exc.value.status_code == 409
+    assert "already been published" in exc.value.detail

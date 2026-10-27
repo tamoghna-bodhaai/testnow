@@ -18,6 +18,7 @@ from .tasks import celery_app
 from .durable_jobs import enqueue
 
 router = APIRouter()
+MAX_EXPLAINER_DRAFTS = 3
 ACTIVE_EXPLAINER_STATUSES = ("queued", "planning", "narrating", "rendering", "finalizing")
 
 class GenerateExplainerIn(BaseModel):
@@ -107,12 +108,19 @@ def teacher_explainers(test_id: str, user: User = Depends(require(Role.TEACHER, 
 def generate_explainer(test_id: str, question_id: str, data: GenerateExplainerIn,
                        user: User = Depends(require(Role.TEACHER, Role.ADMIN)), db: Session = Depends(get_db)):
     test = teacher_test(test_id, user, db)
+    # Serialize generation and publication for this assessment.
+    db.query(Test).filter_by(id=test.id).with_for_update().first()
     version, question = snapshot_for(test, question_id, db)
     if not str(question.get("solution_markdown") or "").strip():
         raise HTTPException(422, "Add a worked solution before generating an explainer")
     if not suggested(question) and not data.override_suggestion:
         raise HTTPException(422, "This question is not suggested for animation; choose override to generate anyway")
-    active = db.query(ExplainerRevision).filter_by(test_id=test.id, version_id=version.id, question_id=question_id).filter(ExplainerRevision.status.in_(ACTIVE_EXPLAINER_STATUSES)).first()
+    revisions = db.query(ExplainerRevision).filter_by(test_id=test.id, version_id=version.id, question_id=question_id)
+    if revisions.filter(ExplainerRevision.published_at.is_not(None)).first():
+        raise HTTPException(409, "An explainer has already been published for this question")
+    if revisions.count() >= MAX_EXPLAINER_DRAFTS:
+        raise HTTPException(409, "The limit of 3 explainer drafts for this question has been reached")
+    active = revisions.filter(ExplainerRevision.status.in_(ACTIVE_EXPLAINER_STATUSES)).first()
     if active:
         raise HTTPException(409, "An explainer is already generating for this question")
     row = ExplainerRevision(id=uid(), test_id=test.id, version_id=version.id, question_id=question_id,
