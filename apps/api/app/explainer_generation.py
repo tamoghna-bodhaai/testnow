@@ -44,11 +44,11 @@ class Visual(BaseModel):
     type: Literal["text", "math", "dot", "circle", "line", "arrow", "polyline", "axes", "function", "region"]
     color: Literal["auto", "white", "cyan", "yellow", "green", "coral"] = "auto"
     content: str = Field(default="", max_length=160)
-    x: float = Field(default=0, ge=-5.5, le=5.5)
-    y: float = Field(default=0, ge=-2.8, le=2.8)
-    x2: float = Field(default=0, ge=-5.5, le=5.5)
-    y2: float = Field(default=0, ge=-2.8, le=2.8)
-    radius: float = Field(default=1, gt=0, le=2.5)
+    x: float = Field(default=0, ge=-1000, le=1000)
+    y: float = Field(default=0, ge=-1000, le=1000)
+    x2: float = Field(default=0, ge=-1000, le=1000)
+    y2: float = Field(default=0, ge=-1000, le=1000)
+    radius: float = Field(default=1, gt=0, le=1000)
     points: list[list[float]] = Field(default_factory=list, max_length=30)
     expression: str = Field(default="", max_length=120)
     upper_expression: str = Field(default="", max_length=120)
@@ -61,11 +61,9 @@ class Visual(BaseModel):
     def safe_visual(self):
         if self.type in {"text", "math"} and not self.content.strip():
             raise ValueError("Visual text is required")
-        if self.type == "text" and ("=" in self.content or re.search(r"[A-Za-z0-9][_^][A-Za-z0-9{]", self.content)):
-            raise ValueError("Equations and mathematical notation must use a math object with valid LaTeX")
         if self.type == "math" and re.search(r"\\(?:input|include|write|read|open|catcode|usepackage|immediate|special|def|newcommand)\b", self.content, re.I):
             raise ValueError("Unsupported TeX command")
-        if self.type == "polyline" and (len(self.points) < 2 or any(len(p) != 2 or not all(isinstance(v, (int, float)) and -5.5 <= v <= 5.5 for v in p) for p in self.points)):
+        if self.type == "polyline" and (len(self.points) < 2 or any(len(p) != 2 or not all(isinstance(v, (int, float)) and -1000 <= v <= 1000 for v in p) for p in self.points)):
             raise ValueError("Invalid polyline")
         if self.type == "function":
             sample_function(self.expression, self.variable, self.domain_start, self.domain_end, count=41)
@@ -82,16 +80,16 @@ class Visual(BaseModel):
         return self
 
 class BeatPlan(BaseModel):
-    narration: str = Field(min_length=12, max_length=500)
-    objects: list[Visual] = Field(min_length=1, max_length=5)
+    narration: str = Field(min_length=1, max_length=2000)
+    objects: list[Visual] = Field(min_length=1, max_length=20)
 
 
 class ScenePlan(BaseModel):
     heading: str = Field(min_length=2, max_length=70)
     # Legacy drafts retain their one-piece scene. New drafts use narrated beats.
     narration: str = Field(default="", max_length=1400)
-    objects: list[Visual] = Field(default_factory=list, max_length=10)
-    beats: list[BeatPlan] = Field(default_factory=list, max_length=5)
+    objects: list[Visual] = Field(default_factory=list, max_length=40)
+    beats: list[BeatPlan] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def function_graphs_use_equations(self):
@@ -99,8 +97,6 @@ class ScenePlan(BaseModel):
             if self.narration or self.objects:
                 raise ValueError("A scene must use either beats or legacy narration and objects")
             objects = [obj for beat in self.beats for obj in beat.objects]
-            if len(objects) > 10:
-                raise ValueError("Too many visuals in one scene")
             if any(obj.type == "region" for obj in self.beats[0].objects):
                 raise ValueError("Introduce the boundaries before revealing the shaded region")
         else:
@@ -119,7 +115,7 @@ class ScenePlan(BaseModel):
         return self
 
 class ExplainerPlan(BaseModel):
-    scenes: list[ScenePlan] = Field(min_length=2, max_length=6)
+    scenes: list[ScenePlan] = Field(min_length=1, max_length=30)
 
 
 def scene_beats(scene: dict) -> list[dict]:
@@ -139,16 +135,52 @@ def validate_storyboard(value: str) -> dict:
                     step["objects"] = step.get("visuals", step.get("elements"))
                 if isinstance(step.get("objects"), list):
                     for obj in step["objects"]:
-                        if isinstance(obj, dict) and "content" not in obj:
-                            obj["content"] = obj.get("label", obj.get("text", obj.get("latex", "")))
+                        if not isinstance(obj, dict):
+                            continue
+                        if not obj.get("content"):
+                            obj["content"] = (obj.get("label") or obj.get("text") or obj.get("latex")
+                                              or (obj.get("expression") if obj.get("type") == "math" else "") or "")
+                        if obj.get("type") == "text":
+                            mathematical = obj.get("math") or obj.get("latex")
+                            content = obj.get("content", "")
+                            if isinstance(mathematical, str) and mathematical.strip():
+                                obj["type"], obj["content"] = "math", mathematical
+                            elif isinstance(content, str) and re.fullmatch(r"[A-Za-z0-9\s=+*/().,^_{}-]+", content) and ("=" in content or re.search(r"[A-Za-z0-9][_^][A-Za-z0-9{]", content)):
+                                content = re.sub(r"_([A-Za-z]{2,})", r"_{\\mathrm{\1}}", content)
+                                obj["type"], obj["content"] = "math", content.replace("*", r"\cdot ")
     return ExplainerPlan.model_validate(parsed).model_dump()
 
+
+def raise_for_openrouter_status(response: httpx.Response, operation: str):
+    """Raise a safe, actionable provider error instead of HTTPX's bare URL."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = ""
+        try:
+            body = response.json()
+            error = body.get("error", body) if isinstance(body, dict) else body
+            if isinstance(error, dict):
+                detail = str(error.get("message") or error.get("metadata") or "")
+            elif isinstance(error, str):
+                detail = error
+        except (ValueError, TypeError):
+            detail = response.text
+        detail = " ".join(detail.split())[:600]
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"OpenRouter rejected the {operation} request ({response.status_code}){suffix}"
+        ) from exc
+
+
 def plan_storyboard(question: dict, feedback: str | None, previous: dict | None) -> dict:
+    if not settings().openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
     prompt = {"question": {k: question.get(k) for k in ("stem_markdown", "options", "answer", "solution_markdown", "diagrams", "taxonomy")},
               "teacher_feedback": feedback, "previous_draft": previous}
-    system = ("Create an accurate 60-120 second English educational animation with a blackboard mathematical visual style. "
-              "Use only the supplied question and worked solution as factual authority. Return JSON with 2-6 scenes. "
-              "Each scene has a heading and 2-5 beats, with at most 10 objects total. Each beat has its own short narration and 1-5 NEW visual objects, revealed when that beat's speech starts. "
+    system = ("Create an accurate English educational animation with a blackboard mathematical visual style. "
+              "Use only the supplied question and worked solution as factual authority. Choose the number of scenes, beats, and narration length to explain this particular problem clearly. Return JSON with scenes. "
+              "Each scene has a heading and narrated beats. Each beat has its own narration and NEW visual objects, revealed when that beat's speech starts. "
               "Objects persist for the rest of their scene. Never put all objects in the first beat or show a conclusion before its spoken explanation. "
               "Plan a teaching sequence: introduce the question, construct axes/curves or diagram, mark bounds/intersections, reveal the relevant shaded area, then show the setup and answer. "
               "Split spoken reasoning into beats at the exact moments when a visual should appear. Keep each beat focused on one idea. "
@@ -164,7 +196,7 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
               "For an area bounded only by straight edges, region may instead use points [[x,y],...] in boundary order. "
               "Region boundaries must match the actual equations; never guess a filled shape from a few points. "
               "All graph objects share mathematical x,y coordinates; do not use screen positions to lay them out. "
-              "For other marks keep coordinates within x -5.5..5.5 and y -2.8..2.8. Line/arrow use x,y,x2,y2; "
+              "Use data coordinates for other marks. Line/arrow use x,y,x2,y2; "
               "circle uses radius; polyline uses points [[x,y],...]. Put brief labels and equations in text/math objects; "
               "Every equation and mathematical expression MUST use a math object with valid LaTeX, never plain text. "
               "Use braces for multi-character subscripts and powers, \\times or \\cdot for multiplication, and \\frac for fractions. "
@@ -173,7 +205,7 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
               "the renderer places these in a separate annotation area, ignoring their x and y. "
               "Use at most three short annotations per graph scene. Give functions mathematically correct expressions and domains from the source solution. "
               "Use bright cyan, yellow, green, or coral for highlighted math/curves and white for ordinary equations; the optional color field can match an equation to its curve. "
-              "Keep text concise and legible. Narration across all beats totals 160-220 words in clear Indian English, explaining concept, worked steps, and answer. "
+              "Keep text concise and legible. Use clear Indian English, explaining the relevant concept, worked steps, and answer at a natural pace. "
               "Function expressions contain arithmetic only; never include Python code, imports, or arbitrary LaTeX commands. Return only JSON.")
     user_content = [{"type": "text", "text": json.dumps(prompt)}]
     for diagram in (question.get("diagrams") or [])[:2]:
@@ -193,20 +225,17 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
             headers={"Authorization": f"Bearer {settings().openrouter_api_key}", "HTTP-Referer": "https://testnow.app", "X-Title": "TestNow Explainers"},
             json={"model": settings().explainer_model, "messages": messages,
                   "response_format": {"type": "json_object"}, "stream": False}, timeout=120)
-        response.raise_for_status()
+        raise_for_openrouter_status(response, "storyboard")
         value = response.json()["choices"][0]["message"]["content"]
         try:
             spec = validate_storyboard(value)
-            if any(len(scene["beats"]) < 2 for scene in spec["scenes"]):
-                raise ValueError("Each new scene needs at least two narrated visual beats")
+            if any(not scene["beats"] for scene in spec["scenes"]):
+                raise ValueError("Each new scene needs narrated visual beats")
             stem = question.get("stem_markdown") or ""
             if re.search(r"\b(area|integral|integration)\b|shaded\s+region", stem, re.I) and not any(
                 obj["type"] == "region" for scene in spec["scenes"] for beat in scene["beats"] for obj in beat["objects"]
             ):
                 raise ValueError("An area problem needs a shaded mathematical region")
-            words = sum(len(beat["narration"].split()) for scene in spec["scenes"] for beat in scene["beats"])
-            if not 130 <= words <= 250:
-                raise ValueError("Narration length is outside the supported range")
             return spec
         except (ValueError, json.JSONDecodeError) as exc:
             if attempt:
@@ -217,18 +246,20 @@ def plan_storyboard(question: dict, feedback: str | None, previous: dict | None)
                     f"Correct the storyboard JSON. Validation error: {str(exc)[:500]}. "
                     "Every equation shown on axes must use a function object, not plotted line segments. "
                     "Area problems need a mathematically bounded region object in the relevant graph scene. "
-                    "Every scene needs 2-5 narrated beats, each adding only the visuals discussed in that beat. "
+                    "Each scene needs narrated beats, adding the visuals discussed in each beat. "
                     "Render equations using math objects containing valid LaTeX with grouped subscripts and superscripts, not plain text. "
                     "Keep the same mathematically correct lesson and return the complete corrected JSON."
                 )},
             ])
 
 def speech(text: str, path: Path):
+    if not settings().openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
     response = httpx.post("https://openrouter.ai/api/v1/audio/speech",
         headers={"Authorization": f"Bearer {settings().openrouter_api_key}"},
         json={"model": settings().explainer_tts_model, "voice": settings().explainer_tts_voice,
               "input": text, "response_format": "mp3"}, timeout=120)
-    response.raise_for_status()
+    raise_for_openrouter_status(response, "speech")
     if not response.headers.get("content-type", "").startswith("audio/") or len(response.content) < 1000:
         raise ValueError("Speech service did not return audio")
     path.write_bytes(response.content)
@@ -281,8 +312,8 @@ def render_video(spec: dict, work: Path, *, progress=None, cancel_check=None) ->
             beat_durations.append(float(probe.stdout.strip()))
         durations.append(beat_durations)
     total = sum(sum(scene_durations) for scene_durations in durations)
-    if not 55 <= total <= 125:
-        raise ValueError("Narration duration is outside the supported range")
+    if not 0 < total <= 300:
+        raise ValueError("Narration audio has an invalid duration")
     (work / "spec.json").write_text(json.dumps(spec))
     (work / "durations.json").write_text(json.dumps(durations))
     manifest = work / "audio.txt"

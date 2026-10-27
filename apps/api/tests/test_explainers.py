@@ -7,13 +7,18 @@ import pytest
 
 from app.db import Base
 from app.explainers import GenerateExplainerIn, cancel_explainer, generate_explainer, publish_explainer, result_is_released, stream_video, student_explainers, suggested
-from app.explainer_generation import ExplainerPlan, GenerationCancelled, Visual, plan_storyboard, run, scene_beats, set_stage, validate_storyboard
+from app.explainer_generation import ExplainerPlan, GenerationCancelled, Visual, plan_storyboard, raise_for_openrouter_status, run, scene_beats, set_stage, validate_storyboard
 from app.explainer_captions import caption_cues
 from app.explainer_math import sample_function, sample_region
 from app.main import delete_test
 from app.models import AccountStatus, Attempt, Enrollment, ExplainerRevision, Role, Test, TestStatus, TestVersion, User
 
 NOW = datetime.now(timezone.utc)
+
+@pytest.fixture(autouse=True)
+def test_api_key(monkeypatch):
+    from app.explainer_generation import settings
+    monkeypatch.setattr(settings(), "openrouter_api_key", "test-key")
 
 @pytest.fixture
 def records(monkeypatch):
@@ -119,7 +124,7 @@ def test_scene_spec_rejects_executable_tex_and_out_of_bounds_geometry():
     template["scenes"][0]["objects"][0]["content"] = r"\input{/etc/passwd}"
     with pytest.raises(ValueError):
         ExplainerPlan.model_validate(template)
-    template["scenes"][0]["objects"][0] = {"type": "dot", "x": 10, "y": 0}
+    template["scenes"][0]["objects"][0] = {"type": "dot", "x": 1001, "y": 0}
     with pytest.raises(ValueError):
         ExplainerPlan.model_validate(template)
 
@@ -132,8 +137,14 @@ def test_storyboard_accepts_scene_list_and_visual_aliases():
 
 
 def test_equations_cannot_be_mistaken_for_plain_text():
-    with pytest.raises(ValueError, match="math object"):
-        Visual(type="text", content="P_KE = (0.5 * m * v^2) / t")
+    import json
+    beat = {"narration": "We calculate the power using the kinetic energy and time.", "objects": [
+        {"type": "text", "content": "P_KE = (0.5 * m * v^2) / t"},
+        {"type": "text", "content": "Intersection x=2", "math": "x=2"}]}
+    scene = {"heading": "Power", "beats": [beat]}
+    objects = validate_storyboard(json.dumps({"scenes": [scene, scene]}))["scenes"][0]["beats"][0]["objects"]
+    assert objects[0]["type"] == "math" and r"_{\mathrm{KE}}" in objects[0]["content"]
+    assert objects[1]["type"] == "math" and objects[1]["content"] == "x=2"
     assert Visual(type="math", content=r"P_{\mathrm{KE}}=\frac{1}{2}mv^{2}/t").type == "math"
 
 
@@ -152,6 +163,25 @@ def test_two_scene_storyboard_can_explain_a_short_problem(monkeypatch):
     scene["beats"][1]["narration"] *= 2
     monkeypatch.setattr("app.explainer_generation.httpx.post", lambda *args, **kwargs: Response())
     assert len(plan_storyboard({"stem_markdown": "Find the pump power"}, None, None)["scenes"]) == 2
+
+
+def test_short_single_scene_plan_is_accepted(monkeypatch):
+    import json
+    scene = {"heading": "One step", "beats": [{"narration": "Add the two values to find the result.",
+             "objects": [{"type": "math", "content": "1+1=2"}]}]}
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": json.dumps({"scenes": [scene]})}}]}
+    monkeypatch.setattr("app.explainer_generation.httpx.post", lambda *args, **kwargs: Response())
+    assert len(plan_storyboard({"stem_markdown": "Add 1 and 1"}, None, None)["scenes"]) == 1
+
+
+def test_openrouter_rejection_keeps_the_provider_explanation():
+    import httpx
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(400, request=request, json={"error": {"message": "Invalid image data"}})
+    with pytest.raises(RuntimeError, match=r"storyboard request \(400\): Invalid image data"):
+        raise_for_openrouter_status(response, "storyboard")
 
 
 def test_graph_functions_plot_equations_in_data_coordinates():
