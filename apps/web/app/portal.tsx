@@ -820,6 +820,8 @@ export function Portal() {
               setView("reviews");
             }}
             openTest={openTest}
+            createAssessment={() => setView("builder")}
+            importPaper={() => setView("import")}
             refresh={() => load(user)}
           />
         ))}
@@ -978,7 +980,7 @@ function WorkspaceSidebar({ user, view, navigate, home, logout }: {
     <div className="workspace-context"><span className="workspace-avatar" aria-hidden="true">{initials}</span><div><b>{user.name}</b><small>{user.role === "teacher" ? "Teacher workspace" : user.role === "admin" ? "Administrator" : "Student workspace"}</small></div></div>
     <nav className="workspace-nav" aria-label="Workspace sections">
       <p>Workspace</p>
-      {items.map((item) => <button type="button" key={item.view} className={view === item.view ? "active" : ""} onClick={() => navigate(item.view)}><b>{item.label}</b><small>{item.detail}</small></button>)}
+      {items.map((item) => <button type="button" key={item.view} className={view === item.view ? "active" : ""} aria-current={view === item.view ? "page" : undefined} onClick={() => navigate(item.view)}><b>{item.label}</b><small>{item.detail}</small></button>)}
     </nav>
     <div className="workspace-sidebar-footer"><button type="button" className="sidebar-signout" onClick={logout}>Sign out</button></div>
   </aside>;
@@ -1027,6 +1029,8 @@ function TeacherHome({
   onTestDeleted,
   openImport,
   openTest,
+  createAssessment,
+  importPaper,
   refresh,
 }: {
   tests: Test[];
@@ -1036,6 +1040,8 @@ function TeacherHome({
   onTestDeleted: (id: string) => void;
   openImport: (id: string) => void;
   openTest: (id: string) => void;
+  createAssessment: () => void;
+  importPaper: () => void;
   refresh: () => Promise<void> | void;
 }) {
   const actionable = jobs.filter((job) => job.status !== "approved"),
@@ -1058,6 +1064,7 @@ function TeacherHome({
     <div className="page">
       <p className="eyebrow">TEACHER WORKSPACE</p>
       <h1>Assessment control centre</h1>
+      <div className="page-actions" aria-label="Teacher shortcuts"><button type="button" onClick={createAssessment}>Create assessment</button><button type="button" className="secondary-action" onClick={importPaper}>Import paper</button></div>
       <div className="role-overview">
         <OverviewChart title="Assessment pipeline" description="Current assessments by publication status" rows={['draft','published','archived'].map(status=>({label:status,value:tests.filter(test=>test.status===status).length}))}/>
         <OverviewChart title="Class enrolment" description="Student enrolments across your classes and batches" rows={classes.map(item=>({label:item.name,value:item.student_count}))}/>
@@ -2978,7 +2985,9 @@ function StudentHome({
   const inProgress = tests.filter(
     (test) => test.latest_attempt?.status === "in_progress",
   ).length;
-  const pending = Math.max(0, tests.length - completed);
+  const ready = tests.filter((test) => test.availability === "available" && test.latest_attempt?.status !== "submitted" && test.latest_attempt?.status !== "cancelled" && Boolean(test.attempts_remaining)).length;
+  const nextTest = tests.find((test) => test.availability === "available" && test.latest_attempt?.status === "in_progress")
+    || tests.find((test) => test.availability === "available" && test.latest_attempt?.status !== "submitted" && Boolean(test.attempts_remaining));
   const initials = user.name
     .split(/\s+/)
     .map((part) => part[0])
@@ -3043,8 +3052,8 @@ function StudentHome({
           </Card>
           <Card>
             <span className="stat-icon pending">◷</span>
-            <b>{pending}</b>
-            <span>Still to complete</span>
+            <b>{ready}</b>
+            <span>Ready to take</span>
           </Card>
           <Card>
             <span className="stat-icon progress">↗</span>
@@ -3053,15 +3062,15 @@ function StudentHome({
           </Card>
         </div>
       </section>
-      {tests.some((test) => test.availability === "available" && test.latest_attempt?.status !== "submitted") && (
+      {nextTest && (
         <Card className="student-next-step">
           <div>
             <p className="eyebrow">NEXT UP</p>
-            <h2>{tests.find((test) => test.latest_attempt?.status === "in_progress")?.title || tests.find((test) => test.availability === "available")?.title}</h2>
-            <p>{tests.find((test) => test.latest_attempt?.status === "in_progress") ? "You have an assessment in progress. Resume when you are ready." : "This assessment is available now. Check the duration before you begin."}</p>
+            <h2>{nextTest.title}</h2>
+            <p>{nextTest.latest_attempt?.status === "in_progress" ? "You have an assessment in progress. Resume when you are ready." : "This assessment is available now. Check the duration before you begin."}</p>
           </div>
-          <button onClick={() => start((tests.find((test) => test.latest_attempt?.status === "in_progress") || tests.find((test) => test.availability === "available"))!.id)}>
-            {tests.some((test) => test.latest_attempt?.status === "in_progress") ? "Resume assessment" : "Review & start"}
+          <button onClick={() => start(nextTest.id)}>
+            {nextTest.latest_attempt?.status === "in_progress" ? "Resume assessment" : "Review & start"}
           </button>
         </Card>
       )}
@@ -3926,7 +3935,7 @@ function QuestionBankManager({
       <div className="bank-workspace">
         <Card className="new-bank-card">
           <div className="bank-workspace-heading">
-            <span className="bank-workspace-icon">+</span>
+            <span className="bank-workspace-icon" aria-hidden="true">+</span>
             <h2>New bank</h2>
           </div>
           <form className="stacked-form" onSubmit={create}>
@@ -3978,7 +3987,7 @@ function QuestionBankManager({
                 className={`bank-choice-row ${detail?.id === bank.id ? "selected" : ""}`}
                 key={bank.id}
                 disabled={busy}
-                aria-pressed={detail?.id === bank.id}
+                aria-current={detail?.id === bank.id ? "page" : undefined}
                 onClick={() => { void open(bank.id).then(() => { if (activeBank.current === bank.id) setBankPickerOpen(false); }); }}
               >
                 <span>
@@ -4485,6 +4494,8 @@ function Exam({
     fullscreenRequestPending = useRef(false),
     mounted = useRef(true),
     focusRef = useRef<{questionId:string;started:number;token:string}|null>(null);
+  const submitDialogFocus=useDialogFocus(submitReview,()=>setSubmitReview(false),()=>document.querySelector<HTMLButtonElement>(".exam footer .danger"));
+  const integrityDialogFocus=useDialogFocus(Boolean(integrityIncident),()=>{});
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
@@ -4749,8 +4760,8 @@ function Exam({
           </button>
         </footer>
       </section>
-      {submitReview && <div className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response will be saved before the test is submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finishNormally} disabled={saving}>Submit test</button></div></div></div>}
-      {integrityIncident && <div className="exam-dialog integrity-dialog" role="alertdialog" aria-modal="true"><div><p className="eyebrow">INTEGRITY WARNING</p><h2>{integrityIncident.saved && integrityIncident.cancelled === false ? "Integrity incident flagged" : "Assessment cancelled"}</h2><p>The secure exam detected <b>{integrityIncident.eventType.replaceAll("_", " ")}</b>. {integrityIncident.saved && integrityIncident.cancelled === false ? "The server had already closed your attempt, so its completed status was preserved and the incident was flagged for your teacher." : "Your saved responses were submitted, this attempt was cancelled immediately, and your teacher can see the incident."}</p>{!integrityIncident.saved && !integrityIncident.error && <Notice>Recording the incident securely…</Notice>}{integrityIncident.error && <Notice kind="error">The exam remains locked. Reconnect before closing this page so the incident can be recorded: {integrityIncident.error}</Notice>}<div className="dialog-actions">{integrityIncident.error && <button onClick={() => { const {eventType,clientTime}=integrityIncident; setIntegrityIncident({ eventType, clientTime, saved:false }); void cancelForIntegrity(eventType,clientTime).then((result) => { try { window.localStorage.removeItem(`testnow:integrity:${attempt.id}`); } catch {} setIntegrityIncident({ eventType, clientTime, saved:true, cancelled:Boolean(result.cancelled_at) }); }).catch((error:Error) => setIntegrityIncident({ eventType, clientTime, saved:false, error:error.message })); }}>Retry secure report</button>}<button disabled={!integrityIncident.saved} onClick={async () => { if (document.fullscreenElement) await document.exitFullscreen().catch(() => {}); await returnHome(); }}>Return to dashboard</button></div></div></div>}
+      {submitReview && <div ref={submitDialogFocus} tabIndex={-1} className="exam-dialog" role="dialog" aria-modal="true" aria-labelledby="submit-title"><div><h2 id="submit-title">Review before submitting</h2>{sections.map((section) => { const items=section.question_ids.map((id) => attempt.questions.find((question: any) => question.id===id)).filter(Boolean); return <p key={section.id}><b>{section.title}:</b> {items.filter((item: any) => status(item)==="answered" || status(item)==="answered-review").length} answered, {items.filter((item: any) => status(item)==="review" || status(item)==="answered-review").length} marked for review, {items.filter((item: any) => status(item)==="unanswered" || status(item)==="unvisited").length} unanswered.</p>; })}{draftChanged && <p className="notice">Your current response will be saved before the test is submitted.</p>}<div className="dialog-actions"><button onClick={() => setSubmitReview(false)}>Continue test</button><button className="danger" onClick={finishNormally} disabled={saving}>Submit test</button></div></div></div>}
+      {integrityIncident && <div ref={integrityDialogFocus} tabIndex={-1} className="exam-dialog integrity-dialog" role="alertdialog" aria-modal="true" aria-labelledby="integrity-title"><div><p className="eyebrow">INTEGRITY WARNING</p><h2 id="integrity-title">{integrityIncident.saved && integrityIncident.cancelled === false ? "Integrity incident flagged" : "Assessment cancelled"}</h2><p>The secure exam detected <b>{integrityIncident.eventType.replaceAll("_", " ")}</b>. {integrityIncident.saved && integrityIncident.cancelled === false ? "The server had already closed your attempt, so its completed status was preserved and the incident was flagged for your teacher." : "Your saved responses were submitted, this attempt was cancelled immediately, and your teacher can see the incident."}</p>{!integrityIncident.saved && !integrityIncident.error && <Notice>Recording the incident securely…</Notice>}{integrityIncident.error && <Notice kind="error">The exam remains locked. Reconnect before closing this page so the incident can be recorded: {integrityIncident.error}</Notice>}<div className="dialog-actions">{integrityIncident.error && <button onClick={() => { const {eventType,clientTime}=integrityIncident; setIntegrityIncident({ eventType, clientTime, saved:false }); void cancelForIntegrity(eventType,clientTime).then((result) => { try { window.localStorage.removeItem(`testnow:integrity:${attempt.id}`); } catch {} setIntegrityIncident({ eventType, clientTime, saved:true, cancelled:Boolean(result.cancelled_at) }); }).catch((error:Error) => setIntegrityIncident({ eventType, clientTime, saved:false, error:error.message })); }}>Retry secure report</button>}<button disabled={!integrityIncident.saved} onClick={async () => { if (document.fullscreenElement) await document.exitFullscreen().catch(() => {}); await returnHome(); }}>Return to dashboard</button></div></div></div>}
     </div>
   );
 }
@@ -4792,9 +4803,11 @@ function DiagnosticSummary({data,title="Learning diagnostics"}:{data?:Diagnostic
   </Card>
 }
 function StudentProgress(){
-  const [data,setData]=useState<DiagnosticData|null>(null);
-  useEffect(()=>{api("/student/diagnostics").then(setData).catch(()=>setData(null))},[]);
-  if(!data?.attempts?.length)return null;
+  const [data,setData]=useState<DiagnosticData|null>(null),[status,setStatus]=useState<"loading"|"ready"|"error">("loading");
+  useEffect(()=>{let active=true;api("/student/diagnostics").then(value=>{if(active){setData(value);setStatus("ready");}}).catch(()=>active&&setStatus("error"));return()=>{active=false};},[]);
+  if(status==="loading")return <Card className="student-progress-state" aria-busy="true"><h2>Learning progress</h2><p>Loading your assessment insights…</p></Card>;
+  if(status==="error")return <Card className="student-progress-state"><h2>Learning progress</h2><p>Progress insights are unavailable right now. Your submitted assessment results remain available from each assessment.</p></Card>;
+  if(!data?.attempts?.length)return <Card className="student-progress-state"><h2>Learning progress</h2><p>Complete an assessment to see your skill and question-level progress here.</p></Card>;
   return <DiagnosticSummary data={data} title="Progress across tests"/>;
 }
 function TeacherDiagnostics({testId}:{testId:string}){
