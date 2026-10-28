@@ -13,6 +13,7 @@ import { QuestionLibrary } from "./question-library";
 import { TeacherSupport } from "./teacher-support";
 import { useDialogFocus } from "./dialog-focus";
 import { AppConfirmHost, confirmApp } from "./app-confirm";
+import { compactQuestionPreview } from "./question-preview";
 
 type User = {
   id: string;
@@ -766,6 +767,7 @@ export function Portal() {
   if (user.role!=="admin" && typeof window!=="undefined" && window.location.pathname.startsWith("/admin/")) return <main className="page"><h1>Administrator access required</h1><p>This support workspace is restricted to administrators.</p><a href="/">Return to your dashboard</a></main>;
   return (
     <main className="application-shell">
+      <a className="skip-link" href="#workspace-main">Skip to main content</a>
       <AppConfirmHost />
       {view !== "exam" && (
         <WorkspaceSidebar
@@ -783,7 +785,7 @@ export function Portal() {
           logout={logout}
         />
       )}
-      <section className={view === "exam" ? "exam-shell" : "workspace-content"}>
+      <section id="workspace-main" className={view === "exam" ? "exam-shell" : "workspace-content"}>
       {message && <div className="toast">{message}</div>}
       {view === "home" &&
         (user.role === "student" ? (
@@ -976,6 +978,11 @@ function WorkspaceSidebar({ user, view, navigate, home, logout }: {
   const items = user.role === "teacher" ? teacherItems : user.role === "admin" ? adminItems : studentItems;
   const initials = user.name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase() || "TN";
   return <aside className="workspace-sidebar" aria-label="Application navigation">
+    <div className="workspace-mobile-header">
+      <button className="workspace-brand" onClick={home} aria-label="TestNow dashboard">Test<span>Now</span></button>
+      <div className="workspace-mobile-identity"><span className="workspace-avatar" aria-hidden="true">{initials}</span><span>{user.name}</span></div>
+      <button type="button" className="mobile-signout" onClick={logout}>Sign out</button>
+    </div>
     <button className="workspace-brand" onClick={home} aria-label="TestNow dashboard">Test<span>Now</span></button>
     <div className="workspace-context"><span className="workspace-avatar" aria-hidden="true">{initials}</span><div><b>{user.name}</b><small>{user.role === "teacher" ? "Teacher workspace" : user.role === "admin" ? "Administrator" : "Student workspace"}</small></div></div>
     <nav className="workspace-nav" aria-label="Workspace sections">
@@ -3041,22 +3048,22 @@ function StudentHome({
         </Card>
         <div className="student-stats">
           <Card>
-            <span className="stat-icon assigned">◫</span>
+            <span className="stat-icon assigned" aria-hidden="true">◫</span>
             <b>{tests.length}</b>
             <span>Tests assigned</span>
           </Card>
           <Card>
-            <span className="stat-icon completed">✓</span>
+            <span className="stat-icon completed" aria-hidden="true">✓</span>
             <b>{completed}</b>
-            <span>Tests appeared</span>
+            <span>Completed</span>
           </Card>
           <Card>
-            <span className="stat-icon pending">◷</span>
+            <span className="stat-icon pending" aria-hidden="true">◷</span>
             <b>{ready}</b>
             <span>Ready to take</span>
           </Card>
           <Card>
-            <span className="stat-icon progress">↗</span>
+            <span className="stat-icon progress" aria-hidden="true">↗</span>
             <b>{inProgress}</b>
             <span>In progress</span>
           </Card>
@@ -3068,9 +3075,10 @@ function StudentHome({
             <p className="eyebrow">NEXT UP</p>
             <h2>{nextTest.title}</h2>
             <p>{nextTest.latest_attempt?.status === "in_progress" ? "You have an assessment in progress. Resume when you are ready." : "This assessment is available now. Check the duration before you begin."}</p>
+            <small>{nextTest.subject} · {nextTest.question_count} questions · {Math.ceil(nextTest.duration_seconds / 60)} minutes{nextTest.closes_at ? ` · Due ${fmtDate(nextTest.closes_at)}` : ""}</small>
           </div>
           <button onClick={() => start(nextTest.id)}>
-            {nextTest.latest_attempt?.status === "in_progress" ? "Resume assessment" : "Review & start"}
+            {nextTest.latest_attempt?.status === "in_progress" ? "Resume assessment" : "Start assessment"}
           </button>
         </Card>
       )}
@@ -3078,13 +3086,13 @@ function StudentHome({
       <div className="assessment-heading">
         <div>
           <p className="eyebrow">MY ASSESSMENTS</p>
-          <h2>Assigned assessments</h2>
+          <h2>{nextTest ? "Other assessments" : "Assigned assessments"}</h2>
         </div>
-        <span>{tests.length} total</span>
+        <span>{nextTest ? `${Math.max(0, tests.length - 1)} other · ${tests.length} total` : `${tests.length} total`}</span>
       </div>
       <div className="cards student-test-cards">
-        {tests.length ? (
-          [...tests].sort((a, b) => Number(b.latest_attempt?.status === "in_progress") - Number(a.latest_attempt?.status === "in_progress") || Number(b.availability === "available") - Number(a.availability === "available")).map((t) => {
+        {tests.filter((test) => test.id !== nextTest?.id).length ? (
+          [...tests].filter((test) => test.id !== nextTest?.id).sort((a, b) => Number(b.latest_attempt?.status === "in_progress") - Number(a.latest_attempt?.status === "in_progress") || Number(b.availability === "available") - Number(a.availability === "available")).map((t) => {
             const latest = t.latest_attempt;
             const submitted = latest?.status === "submitted";
             const cancelled = latest?.status === "cancelled";
@@ -3161,10 +3169,9 @@ function StudentHome({
           })
         ) : (
           <Card className="empty-assessments">
-            <h2>No assessments yet</h2>
+            <h2>{nextTest ? "Your next assessment is shown above" : "No assessments yet"}</h2>
             <p>
-              Your teacher will add tests here after assigning them to your
-              class.
+              {nextTest ? "Start it when you are ready." : "Your teacher will add tests here after assigning them to your class."}
             </p>
           </Card>
         )}
@@ -4210,7 +4217,7 @@ function DocumentImportPage({bankName,feedback,operationError,job,activeQuestion
       <main className="bounded-review-workspace" aria-busy={loading}>
         <aside className="bounded-question-queue" aria-label="Question review queue">
           <p role="status">{loading?"Loading…":`${queue?.total||0} matching questions · page ${page}`}</p>
-          {items.map((item:any)=><button type="button" key={item.id} disabled={loading} className={`queue-question ${activeQuestion?.id===item.id?"active":""}`} onClick={()=>void selectQuestion(item.id)}><b>{questionNumber(item.source_number)} · {item.kind.replaceAll("_"," ")}</b><span>{item.preview}</span><small>{item.readiness.publishable?"Ready":item.readiness.content_valid?"Awaiting review":"Needs repair"}{item.source_page?` · page ${item.source_page}`:""}</small></button>)}
+          <div role="listbox" aria-label="Questions in this source">{items.map((item:any)=><button type="button" role="option" aria-selected={activeQuestion?.id===item.id} key={item.id} className={`queue-question ${activeQuestion?.id===item.id?"active":""}`} onClick={()=>void selectQuestion(item.id)}><b>{questionNumber(item.source_number)} · {item.kind.replaceAll("_"," ")}</b><span>{compactQuestionPreview(item.preview||"")}</span><small>{item.readiness.publishable?"Ready":item.readiness.content_valid?"Awaiting review":"Needs repair"}{item.source_page?` · page ${item.source_page}`:""}</small></button>)}</div>
           {!loading&&!items.length&&<p>{filter==="all"?"No questions have been extracted yet.":"No questions match this filter."}</p>}
           <div className="queue-pagination"><button type="button" className="secondary-action" disabled={page===1||loading} onClick={()=>changePage(page-1)}>Previous page</button><button type="button" className="secondary-action" disabled={!queue?.has_more||loading} onClick={()=>changePage(page+1)}>Next page</button></div>
         </aside>
