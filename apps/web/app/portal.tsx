@@ -13,7 +13,7 @@ import { QuestionLibrary } from "./question-library";
 import { TeacherSupport } from "./teacher-support";
 import { useDialogFocus } from "./dialog-focus";
 import { AppConfirmHost, confirmApp } from "./app-confirm";
-import { compactQuestionPreview } from "./question-preview";
+import { QuestionPreview } from "./question-preview";
 
 type User = {
   id: string;
@@ -4217,7 +4217,7 @@ function DocumentImportPage({bankName,feedback,operationError,job,activeQuestion
       <main className="bounded-review-workspace" aria-busy={loading}>
         <aside className="bounded-question-queue" aria-label="Question review queue">
           <p role="status">{loading?"Loading…":`${queue?.total||0} matching questions · page ${page}`}</p>
-          <div role="listbox" aria-label="Questions in this source">{items.map((item:any)=><button type="button" role="option" aria-selected={activeQuestion?.id===item.id} key={item.id} className={`queue-question ${activeQuestion?.id===item.id?"active":""}`} onClick={()=>void selectQuestion(item.id)}><b>{questionNumber(item.source_number)} · {item.kind.replaceAll("_"," ")}</b><span>{compactQuestionPreview(item.preview||"")}</span><small>{item.readiness.publishable?"Ready":item.readiness.content_valid?"Awaiting review":"Needs repair"}{item.source_page?` · page ${item.source_page}`:""}</small></button>)}</div>
+          <div role="listbox" aria-label="Questions in this source">{items.map((item:any)=><button type="button" role="option" aria-selected={activeQuestion?.id===item.id} key={item.id} className={`queue-question ${activeQuestion?.id===item.id?"active":""}`} onClick={()=>void selectQuestion(item.id)}><b>{questionNumber(item.source_number)} · {item.kind.replaceAll("_"," ")}</b><span><QuestionPreview value={item.preview||""}/></span><small>{item.readiness.publishable?"Ready":item.readiness.content_valid?"Awaiting review":"Needs repair"}{item.source_page?` · page ${item.source_page}`:""}</small></button>)}</div>
           {!loading&&!items.length&&<p>{filter==="all"?"No questions have been extracted yet.":"No questions match this filter."}</p>}
           <div className="queue-pagination"><button type="button" className="secondary-action" disabled={page===1||loading} onClick={()=>changePage(page-1)}>Previous page</button><button type="button" className="secondary-action" disabled={!queue?.has_more||loading} onClick={()=>changePage(page+1)}>Next page</button></div>
         </aside>

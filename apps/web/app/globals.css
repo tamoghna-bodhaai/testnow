@@ -442,7 +442,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .library-workspace .queue-question.active{box-shadow:inset 3px 0 var(--blue)!important}
 .queue-preview{font-weight:400;line-height:1.45;overflow-wrap:anywhere}
 .queue-preview .katex-display{display:inline;margin:0}
-.library-workspace .queue-pagination{padding:12px 0}
+.library-workspace .queue-pagination{padding:12px 14px;gap:10px}
 .library-workspace .library-question-queue{max-height:calc(100dvh - 280px);overflow:auto;padding:0;border:1px solid var(--line);border-radius:10px;scrollbar-gutter:stable}
 .library-workspace .queue-question{min-height:82px;padding:12px 14px!important}
 .library-workspace .queue-question>.queue-preview{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:2.9em;overflow-wrap:anywhere}
