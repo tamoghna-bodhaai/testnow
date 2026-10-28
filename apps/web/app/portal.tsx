@@ -1548,7 +1548,8 @@ function ClassesScreen({
 }
 
 type ExplainerRevision = { id: string; question_id: string; status: string; progress_message?: string; feedback?: string; error?: string; created_at: string; published_at?: string; preview_url?: string };
-type ExplainerList = { questions: { id: string; source_number?: string; stem_markdown: string; has_solution: boolean; suggested: boolean }[]; revisions: ExplainerRevision[] };
+type ExplainerQuestion = Question & { has_solution: boolean; suggested: boolean };
+type ExplainerList = { questions: ExplainerQuestion[]; revisions: ExplainerRevision[] };
 const explainerStages = ["queued", "planning", "narrating", "rendering", "finalizing"];
 const explainerStageLabels: Record<string, string> = { queued: "Formulating", planning: "Formulating", narrating: "Narrating", rendering: "Building", finalizing: "Finalizing", ready: "Ready", failed: "Failed", cancelled: "Cancelled" };
 const explainerAnimatedStages = ["Formulating", "Narrating", "Building", "Finalizing"];
@@ -1629,8 +1630,8 @@ function TestExplainers({ test }: { test: Test }) {
       const published = revisions.some(row => Boolean(row.published_at));
       const limitReached = revisions.length >= 3;
       return <section className="explainer-question" key={question.id}>
-        <div className="explainer-question-heading"><div><h3>Question {question.source_number || index + 1}</h3><Markdown value={question.stem_markdown} className="explainer-stem" />
-          <small>{!question.has_solution ? "Needs a worked solution" : question.suggested ? "Suggested for animation" : "Animation optional"}</small></div>
+        <div className="explainer-question-heading"><div><QuestionCard q={question} mode="teacher" displayNumber={index + 1} />
+          <small className={`explainer-readiness ${!question.has_solution ? "needs-solution" : question.suggested ? "suggested" : "optional"}`}>{!question.has_solution ? "Needs a worked solution" : question.suggested ? "Suggested for animation" : "Animation optional"}</small></div>
           {revisions.length > 0 && <button type="button" className="explainer-history-button" data-explainer-history={question.id} onClick={() => setHistoryQuestionId(question.id)} aria-label={`View ${revisions.length} generation${revisions.length === 1 ? "" : "s"} for question ${question.source_number || index + 1}`} title="View generation history"><span aria-hidden="true">↶</span><span>{revisions.length}</span></button>}</div>
         {question.has_solution && !published && !limitReached && <div className="explainer-controls">
           <label htmlFor={`explainer-feedback-${question.id}`}>Directions for the next draft</label>
@@ -2326,11 +2327,6 @@ function ReviewQuestion({
         : [answerOptionIndex(question)],
     ),
     [value, setValue] = useState(() => String(question.answer?.value ?? "")),
-    [confidence, setConfidence] = useState(() =>
-      Math.round(
-        Math.min(1, Math.max(0, Number(question.confidence ?? 0))) * 100,
-      ),
-    ),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
   const save = async (approve = false) => {
@@ -2348,7 +2344,7 @@ function ReviewQuestion({
         `/teacher/imports/${jobId}/questions/${question.id}/answer-key`,
         {
           method: "PUT",
-          body: JSON.stringify({ answer, confidence: confidence / 100 }),
+          body: JSON.stringify({ answer }),
         },
       );
       if (approve)
@@ -2436,21 +2432,6 @@ function ReviewQuestion({
               </div>
             )}
           </div>
-          <label>
-            Confidence{" "}
-            <input
-              type="number"
-              min="0"
-              max="100"
-              value={confidence}
-              onChange={(e) =>
-                setConfidence(
-                  Math.min(100, Math.max(0, Number(e.target.value))),
-                )
-              }
-            />
-            <span>%</span>
-          </label>
           <div className="review-buttons">
             <button
               type="button"
@@ -3232,6 +3213,31 @@ function ImportIssues({ job, stage }: { job: ImportJob; stage: "extraction" | "g
   </details>;
 }
 
+type ReadinessReportItem = {question_id: string; source_number: string | number | null; readiness: {reviewed: boolean; blocking: {message: string}[]; advisory: {message: string}[]}};
+function BankReadinessReport({bankId}: {bankId: string}) {
+  const [expanded, setExpanded] = useState(false), [page, setPage] = useState(1), [report, setReport] = useState<{affected_questions: ReadinessReportItem[]} | null>(null), [error, setError] = useState("");
+  useEffect(() => {
+    if (!expanded) return;
+    const controller = new AbortController(); setReport(null); setError(""); setPage(1);
+    api(`/admin/question-banks/${bankId}/readiness-report`, {signal: controller.signal}).then(setReport).catch((error) => {if (error.name !== "AbortError") setError(error.message);});
+    return () => controller.abort();
+  }, [expanded, bankId]);
+  const items = report?.affected_questions || [], pageSize = 20, visible = items.slice((page - 1) * pageSize, page * pageSize);
+  return <details className="readiness-report" onToggle={event => {if (event.target === event.currentTarget) setExpanded(event.currentTarget.open);}}>
+    <summary>View readiness report</summary>
+    {error ? <p role="alert">Could not load the report: {error}. Close and reopen to retry.</p> : !report ? <p role="status">Loading readiness report…</p> : <>
+      <p>{items.length ? `Showing ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, items.length)} of ${items.length} questions needing attention.` : "All questions are ready to publish."}</p>
+      <ul className="readiness-report-list">{visible.map(item => <li key={item.question_id}>
+        <a href={`${bankUrl({bankId, questionId: item.question_id})}?task=review`}>Question {item.source_number || item.question_id}</a>
+        <span>{item.readiness.reviewed ? "Reviewed" : "Awaiting review"}</span>
+        {item.readiness.blocking.length > 0 && <ul>{Array.from(new Set(item.readiness.blocking.map(reason => reason.message))).map(message => <li key={message}>{message}</li>)}</ul>}
+        {item.readiness.advisory.length > 0 && <details><summary>Advisories ({item.readiness.advisory.length})</summary><ul>{item.readiness.advisory.map((reason, index) => <li key={index}>{reason.message}</li>)}</ul></details>}
+      </li>)}</ul>
+      {items.length > pageSize && <div className="diagnostic-pagination"><button type="button" className="secondary-action" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {Math.ceil(items.length / pageSize)}</span><button type="button" className="secondary-action" disabled={page * pageSize >= items.length} onClick={() => setPage(page + 1)}>Next</button></div>}
+    </>}
+  </details>;
+}
+
 function BankImportStatus({
   jobs,
   onRetry,
@@ -3258,13 +3264,16 @@ function BankImportStatus({
   onApproveGenerated: (job: ImportJob) => void;
 }) {
   const [query,setQuery]=useState(()=>locationParam("source_q")), [status,setStatus]=useState(()=>locationParam("source_state","all")), [subjectFilter,setSubjectFilter]=useState(()=>locationParam("source_subject","all")), [sort,setSort]=useState("source"), [order,setOrder]=useState<string[]>([]);
+  const setMonitorStatus=(value:string)=>{setStatus(value);replaceLocationParams({source_state:value});};
   const subjects=Array.from(new Set((jobs||[]).map(job=>job.meta?.subject||"Unclassified")));
   const refreshOrder=(value=sort)=>{
     setSort(value);
     const sorted=[...(jobs||[])].sort((a,b)=>value==="filename"?(a.filename||"").localeCompare(b.filename||""):value==="issues"?(b.readiness?.needs_attention||0)-(a.readiness?.needs_attention||0):value==="activity"?String(b.lifecycle?.last_activity_at||"").localeCompare(String(a.lifecycle?.last_activity_at||"")):0);
     setOrder(sorted.map(job=>job.id));
   };
-  const visible=(jobs||[]).filter(job=>(job.filename||"").toLowerCase().includes(query.trim().toLowerCase())&&(subjectFilter==="all"||(job.meta?.subject||"Unclassified")===subjectFilter)&&(status==="all"||(status==="attention"?(job.status==="failed"||Boolean(job.readiness?.needs_attention)||Boolean(job.meta?.solution_generation?.failed)||Boolean(job.errors_total)):status==="active"?["queued","running","pause_requested","cancellation_requested"].includes(job.lifecycle?.state||""):job.lifecycle?.state===status)));
+  const needsAction=(job:ImportJob)=>job.status==="failed"||Boolean(job.readiness?.needs_attention)||Boolean(job.meta?.solution_generation?.failed)||Boolean(job.errors_total);
+  const isActive=(job:ImportJob)=>["queued","running","pause_requested","cancellation_requested"].includes(job.lifecycle?.state||"");
+  const visible=(jobs||[]).filter(job=>(job.filename||"").toLowerCase().includes(query.trim().toLowerCase())&&(subjectFilter==="all"||(job.meta?.subject||"Unclassified")===subjectFilter)&&(status==="all"||(status==="attention"?needsAction(job):status==="active"?isActive(job):status==="paused"?(job.lifecycle?.state==="paused"||job.lifecycle?.state==="pause_requested"):job.lifecycle?.state===status)));
   if(order.length)visible.sort((a,b)=>{const left=order.indexOf(a.id),right=order.indexOf(b.id);return(left<0?order.length:left)-(right<0?order.length:right);});
   const groups = visible.reduce<Record<string, ImportJob[]>>(
     (all, job) => {
@@ -3275,34 +3284,29 @@ function BankImportStatus({
     {},
   );
   const allJobs = jobs || [],
-    failed = allJobs.filter((job) => job.status === "failed" || Boolean(job.readiness?.needs_attention) || Boolean(job.errors_total) || Boolean(job.meta?.solution_generation?.failed)).length,
-    active = allJobs.filter(
-      (job) => ["queued", "running", "pause_requested", "cancellation_requested"].includes(job.lifecycle?.state || ""),
-    ).length;
+    failed = allJobs.filter(needsAction).length,
+    active = allJobs.filter(isActive).length;
   return (
     <Card className="import-dashboard">
       <div className="import-dashboard-head">
         <div>
           <p className="eyebrow">SOURCE LIBRARY</p>
-          <h2>Document imports</h2>
-          <p>
-            Monitor extraction, resolve source issues, and keep the bank ready
-            to publish.
-          </p>
+          <h2>Source monitor</h2>
+          <p>Start with sources that need action, then review completed material before publishing.</p>
         </div>
         <div className="import-summary">
-          <button type="button" className="secondary-action" onClick={()=>setStatus("all")}><b>{allJobs.length}</b> documents</button>
-          <button type="button" className="secondary-action" onClick={()=>setStatus("attention")}><b>{failed}</b> documents need attention</button>
-          <button type="button" className="secondary-action" onClick={()=>setStatus("active")}><b>{active}</b> in progress</button>
+          <button type="button" className={`secondary-action ${status==="attention"?"active":""}`} onClick={()=>setMonitorStatus("attention")}><b>{failed}</b> need action</button>
+          <button type="button" className={`secondary-action ${status==="active"?"active":""}`} onClick={()=>setMonitorStatus("active")}><b>{active}</b> in progress</button>
+          <button type="button" className={`secondary-action ${status==="all"?"active":""}`} onClick={()=>setMonitorStatus("all")}><b>{allJobs.length}</b> all sources</button>
         </div>
       </div>
       <div className="import-monitor-filters">
         <label>Find source<input type="search" value={query} onChange={event=>{setQuery(event.target.value);replaceLocationParams({source_q:event.target.value});}} placeholder="Filename"/></label>
         <label>Subject<select value={subjectFilter} onChange={event=>{setSubjectFilter(event.target.value);replaceLocationParams({source_subject:event.target.value});}}><option value="all">All subjects</option>{subjects.map(subject=><option key={subject}>{subject}</option>)}</select></label>
-        <label>State<select value={status} onChange={event=>{setStatus(event.target.value);replaceLocationParams({source_state:event.target.value});}}>{["all","attention","active","queued","running","pause_requested","paused","cancellation_requested","cancelled","completed","failed"].map(value=><option key={value} value={value}>{value.replaceAll("_"," ")}</option>)}</select></label>
+        <label>Show<select value={status} onChange={event=>setMonitorStatus(event.target.value)}>{[["all","All sources"],["attention","Needs action"],["active","In progress"],["paused","Paused"],["completed","Completed"],["failed","Failed"]].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
         <label>Order<select value={sort} onChange={event=>refreshOrder(event.target.value)}><option value="source">Source order</option><option value="filename">Filename</option><option value="activity">Last activity</option><option value="issues">Questions needing attention</option></select></label>
         <button type="button" className="secondary-action" onClick={()=>refreshOrder()}>Refresh ordering</button>
-        <small>{visible.length} matching documents. Status counts can overlap; updates preserve the chosen ordering.</small>
+        <small>{visible.length} matching source{visible.length===1?"":"s"}. “Needs action” means the source has a failed step, extraction issue, or questions requiring review.</small>
       </div>
       {Object.keys(groups).length ? (
         Object.entries(groups).map(([subject, items]) => (
@@ -3324,6 +3328,8 @@ function BankImportStatus({
                   ? `${job.meta.processed_pages || 0}/${job.meta.total_pages} pages checked`
                   : "";
               const failedJob = job.status === "failed";
+              const requiresAction = needsAction(job);
+              const primaryLabel = requiresAction ? "Resolve issues" : running ? "Check progress" : "Review source";
               // A pause request is durable but the worker may still be
               // finishing its in-flight page.  Only offer destructive/reset
               // actions after it has written the paused checkpoint.
@@ -3343,8 +3349,9 @@ function BankImportStatus({
                     </span>
                     <div>
                       <button type="button" className="import-file-link" onClick={() => onInspect(job)}>{job.filename || "Untitled import"}</button>
-                      <small>
-                        {failedJob
+                      <small className="import-state-summary">
+                        <b>{requiresAction ? "Needs action" : running ? "In progress" : job.published ? "Published" : "Ready to review"}</b>
+                        {" · "}{failedJob
                           ? "Extraction stopped"
                           : job.meta?.phase || "Waiting to start"}
                         {job.question_count !== undefined
@@ -3360,12 +3367,7 @@ function BankImportStatus({
                           : ""}
                         {pageProgress ? ` · ${pageProgress}` : ""}
                       </small>
-                      {job.error && (
-                        <p className="import-error">
-                          <strong>Action needed</strong>
-                          {job.error}
-                        </p>
-                      )}
+                      {job.error && <details className="import-error"><summary>Why this needs action</summary><p>{job.error}</p></details>}
                       <ImportIssues job={job} stage="extraction" />
                       {job.lifecycle?.heartbeat_at && <small>Worker last active: {fmtDate(job.lifecycle.heartbeat_at)}</small>}
                       {generation && (
@@ -3393,7 +3395,7 @@ function BankImportStatus({
                       data-import-review={job.id}
                       onClick={() => onInspect(job)}
                     >
-                      {job.status === "review" ? "Review" : "Inspect"}
+                      {primaryLabel}
                     </button>
                     <details className="import-secondary-actions">
                       <summary>More actions</summary>
@@ -4077,7 +4079,7 @@ function QuestionBankManager({
                 )}
                 <p>Each source document stays private until confirmed. Preview publication to see eligible, blocked and already published question counts. Only eligible questions become available for new tests.</p>
               </Card>
-              {detail.readiness && <Notice>Full bank: {detail.readiness.total} questions · {detail.readiness.publishable} ready · {detail.readiness.blocked} with blocking content issues · {detail.readiness.needs_review} awaiting review (counts can overlap). <a href={`/api/admin/question-banks/${detail.id}/readiness-report`} target="_blank" rel="noreferrer">Open nonmutating readiness report</a></Notice>}
+              {detail.readiness && <Notice>Full bank: {detail.readiness.total} questions · {detail.readiness.publishable} ready · {detail.readiness.blocked} with blocking content issues · {detail.readiness.needs_review} awaiting review (counts can overlap). <BankReadinessReport key={detail.id} bankId={detail.id}/></Notice>}
               <nav className="ingestion-task-tabs" aria-label="Bank workspace task">{([['monitor','Monitor imports'],['add','Add sources'],['review','Review library']] as const).map(([value,label])=><button type="button" key={value} className={workspace===value?"active":"secondary-action"} aria-current={workspace===value?"page":undefined} onClick={async()=>{if(await canLeave()){dirtyQuestion.current=false;setFigureEditing(false);setEditingQuestion(null);setWorkspace(value);replaceLocationParams({task:value});}}}>{label}</button>)}</nav>
               {workspace === "add" && <Card className="bank-upload-card">
                 <h2>Upload source documents</h2>

@@ -98,10 +98,9 @@ def teacher_explainers(test_id: str, user: User = Depends(require(Role.TEACHER, 
     if not version:
         return {"questions": [], "revisions": []}
     rows = db.query(ExplainerRevision).filter_by(test_id=test.id, version_id=version.id).order_by(ExplainerRevision.created_at.desc()).all()
-    return {"questions": [{"id": q["id"], "source_number": q.get("source_number"),
-                            "stem_markdown": q.get("stem_markdown", ""),
-                            "has_solution": bool(str(q.get("solution_markdown") or "").strip()),
-                            "suggested": suggested(q)} for q in version.content.get("questions", [])],
+    return {"questions": [{key: q[key] for key in ("id", "source_number", "kind", "stem_markdown", "options", "answer", "solution_markdown", "diagrams", "scoring", "interaction") if key in q}
+                            | {"has_solution": bool(str(q.get("solution_markdown") or "").strip()),
+                               "suggested": suggested(q)} for q in version.content.get("questions", [])],
             "revisions": [revision_view(row) for row in rows]}
 
 @router.post("/tests/{test_id}/explainers/{question_id}/generate", status_code=202)
