@@ -148,6 +148,7 @@ type Test = {
   assigned_class_names?: string[];
   classes?: Classroom[];
   questions?: Question[];
+  delivery_blueprint?: { sections: { id: string; title: string; question_ids: string[] }[] };
   availability?: "available" | "upcoming" | "closed";
   attempts_remaining?: number;
   latest_attempt?: {
@@ -1793,10 +1794,15 @@ function TestDetail({
             Students receive this question snapshot when they start the
             assessment.
           </p>
-          {test.questions?.map((q) => (
-            <div key={q.id}>
-              <QuestionCard q={q} mode="teacher" />
-            </div>
+          {(test.delivery_blueprint?.sections || [{ id: "general", title: "General", question_ids: (test.questions || []).map((q) => q.id) }]).map((section) => (
+            <section className="test-preview-section" key={section.id}>
+              <h3>{section.title}</h3>
+              <p>{section.question_ids.length} {section.question_ids.length === 1 ? "question" : "questions"}</p>
+              {section.question_ids.map((id) => {
+                const q = test.questions?.find((question) => question.id === id);
+                return q ? <QuestionCard key={q.id} q={q} mode="teacher" /> : null;
+              })}
+            </section>
           ))}
         </Card>
       )}
@@ -2097,6 +2103,7 @@ function ImportScreen({
                   <small>
                     {item.meta?.question_count || 0} questions ·{" "}
                     {item.meta?.phase || "Queued"}
+                    {jobs.filter((other) => (other.meta?.paper_title || other.filename) === (item.meta?.paper_title || item.filename)).length > 1 && ` · ID ${item.id.slice(0, 8)}`}
                   </small>
                 </button>
               ))
@@ -2241,6 +2248,14 @@ function ImportReview({
             <div className="review-question-context">
               <span>Question {questionIndex + 1} of {reviewQuestions.length}</span>
               <span>{currentQuestion.kind.replaceAll("_", " ")}</span>
+            </div>
+            <div className="review-jump-control">
+              <label htmlFor="review-question-select">Jump to question</label>
+              <select id="review-question-select" value={questionIndex} onChange={(event) => moveToQuestion(Number(event.target.value))}>
+                {reviewQuestions.map((question, index) => (
+                  <option key={question.id} value={index}>Question {index + 1} — {question.approved ? "Approved" : "Needs review"}</option>
+                ))}
+              </select>
             </div>
             <div className="review-pagination">
               <button type="button" className="secondary-action" disabled={!questionIndex} onClick={() => moveToQuestion(questionIndex - 1)}>Previous</button>
@@ -2397,6 +2412,8 @@ function ReviewQuestion({
                     type="button"
                     key={index}
                     className={selected.includes(index) ? "selected" : ""}
+                    aria-pressed={selected.includes(index)}
+                    aria-label={`Answer option ${String.fromCharCode(65 + index)}`}
                     onClick={() => toggle(index)}
                   >
                     {String.fromCharCode(65 + index)}
@@ -2461,7 +2478,9 @@ function Builder({
   initialImportId: string | null;
   onDone: (id: string, publishedFromImport: boolean) => void;
 }) {
-  const [selected, setSelected] = useState<string[]>([]),
+  const [sections, setSections] = useState<{ id: string; title: string; questionIds: string[] }[]>([{ id: "section-1", title: "Section 1", questionIds: [] }]),
+    [activeSectionId, setActiveSectionId] = useState("section-1"),
+    [selectedCache, setSelectedCache] = useState<Record<string, Question>>({}),
     [error, setError] = useState(""),
     [banks, setBanks] = useState<any[]>([]),
     [bankId, setBankId] = useState(""),
@@ -2487,6 +2506,8 @@ function Builder({
     }>({ total: 0, counts: {} }),
     [loading, setLoading] = useState(false),
     [countsLoading, setCountsLoading] = useState(false);
+  const selected = sections.flatMap((section) => section.questionIds);
+  const activeSection = sections.find((section) => section.id === activeSectionId) || sections[0];
   const activeBank = banks.find((bank) => bank.id === bankId);
   const sourceImports = sourceJobs.filter((item) => (item.approved_count || 0) > 0),
     activePaper = sourceImports.find((item) => item.id === paperId),
@@ -2500,7 +2521,6 @@ function Builder({
     setPaperId(initialImportId);
     setIncludeWholePaper(true);
     setPage(1);
-    setSelected([]);
   }, [initialImportId]);
   useEffect(() => {
     api("/question-banks")
@@ -2575,7 +2595,7 @@ function Builder({
       source === "bank"
         ? remote.items
         : mine.items,
-    selectedQuestions = selected.map((id) => shown.find((question) => question.id === id)).filter(Boolean) as Question[],
+    selectedQuestions = selected.map((id) => shown.find((question) => question.id === id) || selectedCache[id]).filter(Boolean) as Question[],
     toggleKind = (kind: string) => {
       setPage(1);
       setKinds((current) =>
@@ -2590,6 +2610,9 @@ function Builder({
         const f = Object.fromEntries(new FormData(e.currentTarget));
         const toIso = (value: FormDataEntryValue | undefined) =>
           value ? new Date(String(value)).toISOString() : null;
+        if (!directPaperMode && sections.some((section) => !section.title.trim() || !section.questionIds.length)) {
+          throw new Error("Give every section a name and add at least one question, or remove the empty section.");
+        }
         const questionIds = directPaperMode ? [] : selected;
         const payload: any = {
           ...f,
@@ -2606,13 +2629,13 @@ function Builder({
           instructions: String(f.candidate_instructions || "Read every question carefully. Use Save & Next to record an answer.").trim(),
           languages: ["en"],
           accommodations: {},
-          sections: [{
-            id: "section-1",
-            title: String(f.section_title || "Section 1").trim(),
-            question_ids: questionIds,
+          sections: directPaperMode ? [{ id: "section-1", title: "Section 1", question_ids: [], navigation: "free", optional_groups: [] }] : sections.map((section) => ({
+            id: section.id,
+            title: section.title.trim(),
+            question_ids: section.questionIds,
             navigation: "free",
             optional_groups: [],
-          }],
+          })),
         };
         const result = await api(directPaperMode ? `/teacher/imports/${paperId}/tests` : "/tests", {
           method: "POST",
@@ -2630,19 +2653,21 @@ function Builder({
       {error && <Notice kind="error">{error}</Notice>}
       <form onSubmit={submit} className="builder builder-workspace">
         <Card className="builder-settings">
+          <h2>Assessment details</h2>
+          <p className="builder-settings-help">Set the essentials, then add questions.</p>
           <div className="stacked-form">
             <div>
-              <label>Test title</label>
-              <input name="title" required />
+              <label htmlFor="builder-title">Test title</label>
+              <input id="builder-title" name="title" required />
             </div>
             <div>
-              <label>Subject</label>
-              <input name="subject" required />
+              <label htmlFor="builder-subject">Subject</label>
+              <input id="builder-subject" name="subject" required />
             </div>
             <div>
-              <label>Duration (minutes)</label>
+              <label htmlFor="builder-duration_minutes">Duration (minutes)</label>
               <input
-                name="duration_minutes"
+                id="builder-duration_minutes" name="duration_minutes"
                 type="number"
                 min="1"
                 defaultValue="60"
@@ -2650,9 +2675,9 @@ function Builder({
               />
             </div>
             <div>
-              <label>Maximum attempts</label>
+              <label htmlFor="builder-max_attempts">Maximum attempts</label>
               <input
-                name="max_attempts"
+                id="builder-max_attempts" name="max_attempts"
                 type="number"
                 min="1"
                 defaultValue="1"
@@ -2660,40 +2685,72 @@ function Builder({
               />
             </div>
             <div>
-              <label>Marks per question</label>
-              <input name="marks_per_question" type="number" min="1" defaultValue="4" required />
+              <label htmlFor="builder-marks_per_question">Marks per question</label>
+              <input id="builder-marks_per_question" name="marks_per_question" type="number" min="1" defaultValue="4" required />
             </div>
             <div>
-              <label>CBT preset</label>
-              <select name="blueprint_preset" defaultValue="jee-practice">
+              <label htmlFor="builder-blueprint_preset">CBT preset</label>
+              <select id="builder-blueprint_preset" name="blueprint_preset" defaultValue="jee-practice">
                 <option value="jee-practice">JEE-style practice CBT</option>
                 <option value="custom">Custom practice CBT</option>
               </select>
             </div>
-            <div>
-              <label>First section title</label>
-              <input name="section_title" defaultValue="Section 1" required />
-            </div>
             <div className="builder-wide-field">
-              <label>Candidate instructions</label>
-              <textarea name="candidate_instructions" rows={3} defaultValue="Read every question carefully. Use Save & Next to record an answer. Mark for Review & Next saves your response and flags it for review." />
+              <label htmlFor="builder-candidate_instructions">Candidate instructions</label>
+              <textarea id="builder-candidate_instructions" name="candidate_instructions" rows={3} defaultValue="Read every question carefully. Use Save & Next to record an answer. Mark for Review & Next saves your response and flags it for review." />
               <small>{directPaperMode
                 ? "Every approved question type from this source PDF is included in the published test."
                 : "New CBT papers use an explicit delivery blueprint. Subjective questions require manual evaluation and cannot be published in this mode."}</small>
             </div>
             <div>
-              <label>
+              <label htmlFor="builder-opens_at">
                 Opens at <span className="optional">(optional)</span>
               </label>
-              <input name="opens_at" type="datetime-local" />
+              <input id="builder-opens_at" name="opens_at" type="datetime-local" />
             </div>
             <div>
-              <label>
+              <label htmlFor="builder-closes_at">
                 Closes at <span className="optional">(optional)</span>
               </label>
-              <input name="closes_at" type="datetime-local" />
+              <input id="builder-closes_at" name="closes_at" type="datetime-local" />
             </div>
           </div>
+        </Card>
+        <Card className="builder-selection">
+          <div className="builder-selection-heading">
+            <span>Assessment sections</span>
+            <b>{directPaperMode ? activePaper.approved_count || mine.total : selected.length}</b>
+          </div>
+          {directPaperMode ? <div className="builder-selection-list"><div className="paper-selection-summary"><b>Entire PDF · one section</b><small>Every approved question will be included and the test published immediately. Turn off “Use entire PDF” to create custom sections.</small></div></div> : <div className="builder-sections">
+            <p>Choose a section, then select questions from the library. Each question belongs to one section.</p>
+            {sections.map((section, index) => <section className={`builder-section ${section.id === activeSectionId ? "active" : ""}`} key={section.id}>
+              <div className="builder-section-heading">
+                <button type="button" className="secondary-action" aria-pressed={section.id === activeSectionId} onClick={() => setActiveSectionId(section.id)}>{section.id === activeSectionId ? "Adding here" : "Add here"}</button>
+                <span>{section.questionIds.length} {section.questionIds.length === 1 ? "question" : "questions"}</span>
+              </div>
+              <label htmlFor={`section-title-${section.id}`}>Section {index + 1} name</label>
+              <input id={`section-title-${section.id}`} value={section.title} maxLength={100} onChange={(event) => setSections((current) => current.map((item) => item.id === section.id ? { ...item, title: event.target.value } : item))} />
+              {section.questionIds.length > 0 && <details className="section-questions"><summary>Manage questions</summary>
+                {section.questionIds.map((id) => {
+                  const question = selectedQuestions.find((item) => item.id === id);
+                  const label = question ? questionNumber(question.source_number) : "Question";
+                  return <div className="section-question" key={id}>
+                    <span>{label}</span>
+                    {sections.length > 1 && <label>Move <span className="sr-only">{label} to section</span><select aria-label={`Move ${label} to section`} value={section.id} onChange={(event) => { const target = event.target.value; setSections((current) => current.map((item) => item.id === section.id ? { ...item, questionIds: item.questionIds.filter((qid) => qid !== id) } : item.id === target ? { ...item, questionIds: [...item.questionIds, id] } : item)); }}>{sections.map((item, i) => <option key={item.id} value={item.id}>{item.title.trim() || `Section ${i + 1}`}</option>)}</select></label>}
+                    <button type="button" className="text-danger" aria-label={`Remove ${label} from assessment`} onClick={() => setSections((current) => current.map((item) => item.id === section.id ? { ...item, questionIds: item.questionIds.filter((qid) => qid !== id) } : item))}>Remove</button>
+                  </div>;
+                })}
+              </details>}
+              {sections.length > 1 && <button type="button" className="text-danger section-remove" disabled={section.questionIds.length > 0} title={section.questionIds.length ? "Move or remove this section’s questions first" : undefined} onClick={() => { setSections((current) => current.filter((item) => item.id !== section.id)); if (activeSectionId === section.id) setActiveSectionId(sections.find((item) => item.id !== section.id)!.id); }}>Remove empty section</button>}
+            </section>)}
+            <button type="button" className="secondary-action add-section" onClick={() => { const id = `section-${crypto.randomUUID()}`; setSections((current) => [...current, { id, title: `Section ${current.length + 1}`, questionIds: [] }]); setActiveSectionId(id); }}>Add section</button>
+          </div>}
+          <p className="builder-submit-help">{directPaperMode ? "Test title and subject are required before publishing." : "Name each section, add at least one question to each, and enter a test title and subject."}</p>
+          <button className="builder-selection-submit" disabled={directPaperMode ? !(activePaper.approved_count || mine.total) : !selected.length}>
+            {directPaperMode
+              ? `Create & publish (${activePaper.approved_count || mine.total})`
+              : `Create draft${selected.length ? ` (${selected.length})` : ""}`}
+          </button>
         </Card>
         <Card className="builder-library">
           <h2>
@@ -2711,7 +2768,6 @@ function Builder({
                 onChange={(e) => {
                   setSource(e.target.value as "bank" | "mine");
                   setPage(1);
-                  setSelected([]);
                 }}
               >
                 <option value="bank" disabled={!bankId}>Global bank</option>
@@ -2821,13 +2877,12 @@ function Builder({
                     setPaperId(e.target.value);
                     setIncludeWholePaper(false);
                     setPage(1);
-                    setSelected([]);
-                  }}
+                    }}
                 >
                   <option value="">All approved PDFs</option>
                   {sourceImports.map((item) => (
                     <option key={item.id} value={item.id}>
-                      {item.meta?.paper_title || item.filename || "Imported paper"} ({item.approved_count})
+                      {item.meta?.paper_title || item.filename || "Imported paper"} ({item.approved_count}){sourceImports.filter((other) => (other.meta?.paper_title || other.filename) === (item.meta?.paper_title || item.filename)).length > 1 ? ` · ${item.id.slice(0, 8)}` : ""}
                     </option>
                   ))}
                 </select>
@@ -2835,10 +2890,16 @@ function Builder({
             )}
             {source === "mine" && activePaper?.status === "approved" && (
               <label className="assignment-choice builder-paper-mode">
-                <input type="checkbox" checked={includeWholePaper} onChange={(e) => { setIncludeWholePaper(e.target.checked); setSelected([]); }} />
-                <span><b>Use entire PDF</b><small>Create and publish with every approved question—no manual selection.</small></span>
+                <input type="checkbox" checked={includeWholePaper} onChange={(e) => setIncludeWholePaper(e.target.checked)} />
+                <span><b>Use entire PDF</b><small>Create and publish every approved question in one section. Turn this off to assign questions to custom sections.</small></span>
               </label>
             )}
+          </div>
+          {!directPaperMode && <div className="builder-active-section">Adding questions to <strong>{activeSection.title.trim() || "Untitled section"}</strong>. Choose another section in the assessment panel.</div>}
+          <div className="builder-page-top" aria-label="Question library pages">
+            <span>{(source === "bank" ? remote.total : mine.total) ? `${(page - 1) * 20 + 1}–${(page - 1) * 20 + shown.length} of ${source === "bank" ? remote.total : mine.total} questions · Page ${page}` : "No matching questions"}</span>
+            <button type="button" className="secondary-action" disabled={page === 1} onClick={() => setPage((value) => value - 1)}>Previous</button>
+            <button type="button" className="secondary-action" disabled={source === "bank" ? !remote.has_more : !mine.has_more} onClick={() => setPage((value) => value + 1)}>Next</button>
           </div>
           <div className="builder-question-list">
             {loading ? (
@@ -2851,14 +2912,14 @@ function Builder({
                     type="checkbox"
                     checked={directPaperMode || selected.includes(q.id)}
                     disabled={directPaperMode}
-                    onChange={() =>
-                      setSelected((x) =>
-                        x.includes(q.id)
-                          ? x.filter((id) => id !== q.id)
-                          : [...x, q.id],
-                      )
-                    }
+                    onChange={() => {
+                      setSelectedCache((cache) => ({ ...cache, [q.id]: q }));
+                      setSections((current) => selected.includes(q.id)
+                        ? current.map((section) => ({ ...section, questionIds: section.questionIds.filter((id) => id !== q.id) }))
+                        : current.map((section) => section.id === activeSectionId ? { ...section, questionIds: [...section.questionIds, q.id] } : section));
+                    }}
                   />
+                  {!directPaperMode && selected.includes(q.id) && <p className="builder-assigned-label">Added to {sections.find((section) => section.questionIds.includes(q.id))?.title || "Untitled section"}</p>}
                   <QuestionCard q={q} mode="teacher" />
                 </div>
               ))
@@ -2874,7 +2935,7 @@ function Builder({
           </div>
           {(source === "bank" || source === "mine") && (
             <div className="review-actions">
-              <small>{source === "bank" ? remote.total : mine.total} matching questions</small>
+              <small role="status">{(source === "bank" ? remote.total : mine.total) ? `${(page - 1) * 20 + 1}–${(page - 1) * 20 + shown.length} of ${source === "bank" ? remote.total : mine.total} questions · Page ${page}` : "No matching questions"}</small>
               <button
                 type="button"
                 className="secondary-action"
@@ -2893,44 +2954,6 @@ function Builder({
               </button>
             </div>
           )}
-        </Card>
-        <Card className="builder-selection">
-          <div className="builder-selection-heading">
-            <span>Selection tray</span>
-            <b>{(directPaperMode ? activePaper.approved_count || mine.total : selected.length).toString().padStart(2, "0")}</b>
-          </div>
-          <div className="builder-selection-summary">
-            <span><small>Questions</small><b>{directPaperMode ? activePaper.approved_count : selected.length}</b></span>
-            <span><small>Source PDF</small><b>{activePaper ? activePaper.meta?.paper_title || activePaper.filename || "Selected PDF" : "Multiple PDFs"}</b></span>
-          </div>
-          <div className="builder-selection-list">
-            {directPaperMode ? (
-              <div className="paper-selection-summary">
-                <b>{activePaper.meta?.paper_title || activePaper.filename || "Imported paper"}</b>
-                <small>Every approved question from this PDF will be included. The test is published immediately, then you can assign a class.</small>
-              </div>
-            ) : selected.length ? <>
-              <div className="selection-preview">
-                {selected.slice(0, 4).map((id, index) => {
-                  const question = selectedQuestions.find((item) => item.id === id);
-                  return <span key={id}>{questionNumber(question?.source_number || String(index + 1))}</span>;
-                })}
-                {selected.length > 4 && <span>+{selected.length - 4} more</span>}
-              </div>
-              <details className="selection-details">
-                <summary>Manage selected questions</summary>
-                <div>{selected.map((id, index) => {
-                  const question = selectedQuestions.find((item) => item.id === id);
-                  return <span key={id}><b>{questionNumber(question?.source_number || String(index + 1))}</b><button type="button" className="text-danger" onClick={() => setSelected((current) => current.filter((questionId) => questionId !== id))}>Remove</button></span>;
-                })}</div>
-              </details>
-            </> : <p className="builder-selection-empty">Add questions from the library to build your test.</p>}
-          </div>
-          <button className="builder-selection-submit" disabled={directPaperMode ? !(activePaper.approved_count || mine.total) : !selected.length}>
-            {directPaperMode
-              ? `Create & publish (${activePaper.approved_count || mine.total})`
-              : `Create draft${selected.length ? ` (${selected.length})` : ""}`}
-          </button>
         </Card>
       </form>
     </div>
@@ -4364,7 +4387,7 @@ function QuestionCard({
               </span>
               <OptionContent q={q} index={i} />
               {isCorrect && (
-                <span className="answer-badge">Correct answer</span>
+                <span className="answer-badge">Correct answer: option {String.fromCharCode(65 + i)}</span>
               )}
               {isIncorrectStudentAnswer && (
                 <span className="answer-badge incorrect-answer-badge">
@@ -4438,7 +4461,6 @@ function Exam({
 }) {
   const blueprint = attempt.delivery_blueprint || { instructions: "Read every question carefully. Use Save & Next to record an answer.", sections: [{ id: "general", title: "General", question_ids: attempt.questions.map((question: any) => question.id) }] },
     [started, setStarted] = useState(() => Boolean(document.fullscreenElement)),
-    [sectionId, setSectionId] = useState(blueprint.sections[0]?.id || "general"),
     [paletteOpen, setPaletteOpen] = useState(false),
     [submitReview, setSubmitReview] = useState(false),
     [draft, setDraft] = useState<any>(null),
@@ -4530,7 +4552,8 @@ function Exam({
     }
   }, [left, attempt.submitted_at, expiryRetry, finish]);
   const sections = blueprint.sections as { id: string; title: string; question_ids: string[] }[];
-  const activeSection = sections.find((section) => section.id === sectionId) || sections[0];
+  const activeSection = sections.find((section) => section.question_ids.includes(q.id)) || sections[0];
+  const sectionId = activeSection?.id;
   const sectionQuestions = activeSection?.question_ids.map((id) => attempt.questions.find((question: any) => question.id === id)).filter(Boolean) || [];
   const draftChanged = JSON.stringify(draft) !== JSON.stringify(r.answer ?? null) || draftReview !== !!r.marked_for_review;
   const status = (question: any) => { const response = attempt.responses[question.id]; if (!response?.visited_at && !response?.answer && !response?.marked_for_review) return "unvisited"; if (response?.answer && response?.marked_for_review) return "answered-review"; if (response?.answer) return "answered"; if (response?.marked_for_review) return "review"; return "unanswered"; };
@@ -4615,7 +4638,7 @@ function Exam({
         <button className="palette-trigger" onClick={() => setPaletteOpen(!paletteOpen)} aria-expanded={paletteOpen} aria-controls="question-palette">Questions</button>
       </header>
       <nav className="exam-sections" aria-label="Test sections" role="tablist">
-        {sections.map((section) => <button key={section.id} role="tab" aria-selected={section.id === sectionId} className={section.id === sectionId ? "active" : ""} onClick={() => { setSectionId(section.id); const next = attempt.questions.findIndex((question: any) => question.id === section.question_ids[0]); if (next >= 0) goto(next); }}>{section.title}</button>)}
+        {sections.map((section) => <button key={section.id} role="tab" aria-selected={section.id === sectionId} className={section.id === sectionId ? "active" : ""} onClick={() => { const next = attempt.questions.findIndex((question: any) => question.id === section.question_ids[0]); if (next >= 0) goto(next); }}>{section.title}</button>)}
       </nav>
       <aside id="question-palette" className={paletteOpen ? "open" : ""}>
         <div className="palette-heading"><b>Question palette</b><button onClick={() => setPaletteOpen(false)} aria-label="Close question palette">×</button></div>

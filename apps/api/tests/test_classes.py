@@ -363,3 +363,26 @@ def test_existing_attempt_is_not_stranded_after_assignment_changes():
     attempt=Attempt(id="attempt",test_id="test",version_id="version",student_id="student",started_at=datetime.now(timezone.utc),ends_at=datetime.now(timezone.utc))
     db.add_all([student,test,version,attempt]);db.commit()
     assert get_attempt(attempt.id,student,db)["id"]==attempt.id
+
+def test_sectioned_assessment_survives_draft_publication_and_delivery():
+    from app.schemas import TestCreate
+    from app.services import delivery_blueprint
+    db=make_db()
+    teacher=User(id="teacher",name="Teacher",email="teacher@example.com",password_hash="x",role=Role.TEACHER)
+    student=User(id="student",name="Student",email="student@example.com",password_hash="x",role=Role.STUDENT)
+    approved=datetime.now(timezone.utc)
+    qs=[Question(id=f"q{i}",owner_id=teacher.id,kind=QuestionKind.SINGLE,stem_markdown=f"Question number {i}",options=[{"markdown":"Four"},{"markdown":"Five"}],answer={"option":0},approved_at=approved) for i in (1,2)]
+    db.add_all([teacher,student,*qs]);db.commit()
+    sections=[{"id":"physics","title":"Physics","question_ids":["q2"],"navigation":"free","optional_groups":[]},{"id":"chemistry","title":"Chemistry","question_ids":["q1"],"navigation":"free","optional_groups":[]}]
+    data=TestCreate(title="Sectioned",subject="Science",duration_minutes=30,max_attempts=1,marks_per_question=4,question_ids=["q2","q1"],delivery_blueprint={"sections":sections})
+    created=main.create_test(data,teacher,db)
+    draft=db.query(AssessmentVersion).filter_by(test_id=created["id"]).one()
+    assert draft.content["delivery_blueprint"]["sections"]==sections
+    assert main.test_detail(created["id"],teacher,db)["delivery_blueprint"]["sections"]==sections
+    main.publish_test(created["id"],teacher,db)
+    test=db.get(Assessment,created["id"])
+    published=db.get(AssessmentVersion,test.published_version_id)
+    assert delivery_blueprint(published.content)["sections"]==sections
+    attempt=Attempt(id="section-attempt",test_id=test.id,version_id=published.id,student_id=student.id,started_at=datetime.now(timezone.utc),ends_at=datetime(2030,1,1,tzinfo=timezone.utc))
+    db.add(attempt);db.commit()
+    assert get_attempt(attempt.id,student,db)["delivery_blueprint"]["sections"]==sections

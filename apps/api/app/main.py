@@ -1539,7 +1539,9 @@ def test_view(t:Test,db:Session,include=False):
     v=db.get(TestVersion,t.published_version_id) if t.published_version_id else db.query(TestVersion).filter_by(test_id=t.id).order_by(TestVersion.ordinal.desc()).first();classes=assigned_classrooms(t,db);student_ids=assigned_student_ids(t,db);out={"id":t.id,"title":t.title,"subject":t.subject,"status":t.status.value,"duration_seconds":t.duration_seconds,"opens_at":t.opens_at,"closes_at":t.closes_at,"max_attempts":t.max_attempts,"results_policy":t.results_policy,"question_count":len(v.content.get("questions",[])) if v else 0,"class_count":len(classes),"assigned_student_count":len(student_ids),"assigned_class_names":[c.name for c in classes]}
     if include:
         out["classes"]=[classroom_view(c,db) for c in classes]
-        if v:out["questions"]=v.content["questions"]
+        if v:
+            out["questions"]=v.content["questions"]
+            out["delivery_blueprint"]=delivery_blueprint(v.content)
     return out
 
 @app.get("/student/tests")
