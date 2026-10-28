@@ -3353,13 +3353,14 @@ function BankImportStatus({
                       <ImportIssues job={job} stage="extraction" />
                       {job.lifecycle?.heartbeat_at && <small>Worker last active: {fmtDate(job.lifecycle.heartbeat_at)}</small>}
                       {generation && (
-                        <div className="generation-progress" aria-live="polite">
-                          <div><span>{generation.phase || "Solution generation"}</span><b>{generation.processed || 0}/{generation.total || 0} questions attempted</b></div>
-                          <progress max={Math.max(1, generation.total || 1)} value={generation.processed || 0} />
+                        <details className="generation-progress">
+                          <summary>Solutions: {generation.failed ? `${generation.failed} failed` : generation.status === "failed" ? "generation failed" : generationActive ? "in progress" : "generation complete"} · {generation.processed || 0}/{generation.total || 0} attempted</summary>
+                          <div><span>{generation.phase || "Solution generation"}</span></div>
+                          <progress aria-label={`Solution generation for ${job.filename || "document"}`} max={Math.max(1, generation.total || 1)} value={generation.processed || 0} />
                           <small>{generation.succeeded || 0} generated · {generation.failed || 0} failed{generation.approved ? ` · ${generation.approved} approved` : ""}</small>
                           {generation.error && <p className="import-error">{generation.error}</p>}
                           <ImportIssues job={job} stage="generation" />
-                        </div>
+                        </details>
                       )}
                     </div>
                   </div>
@@ -3367,7 +3368,7 @@ function BankImportStatus({
                     <span
                       className={`badge ${job.status}`}
                     >
-                      {state.replaceAll("_", " ")}
+                      {generation?.failed && state === "completed" ? "Completed with errors" : state.replaceAll("_", " ")}
                     </span>
                     {job.published && <span className="badge published">Published</span>}
                     <button
@@ -3502,6 +3503,7 @@ function QuestionBankManager({
     const files=(name:string)=>Array.from(form.querySelectorAll<HTMLInputElement>(`input[name="${name}"][type="file"]`)).flatMap(input=>Array.from(input.files||[]));
     setUploadReview(reviewUploads(files("question_files"),files("answer_files"),uploadConfig));setUploadOutcomes([]);
   };
+  const [bankPickerOpen,setBankPickerOpen]=useState(false);
   const [removedBanks,setRemovedBanks]=useState<Bank[]>([]);
   const showRemoved=async()=>{try{setRemovedBanks((await api("/admin/question-banks?include_deleted=true")).filter((bank:Bank)=>bank.status==="deleted"));}catch(error:any){setError(error.message);}};
   const restoreBank=async(bank:Bank)=>{if(!await confirmApp(`Restore ${bank.name} (${bank.id}) with its prior visibility? Content readiness remains enforced.`))return;try{await api(`/admin/question-banks/${bank.id}/restore`,{method:"POST"});await load();await showRemoved();notify("Bank restored. Content readiness checks remain in effect.");}catch(error:any){setError(error.message);}};
@@ -3919,6 +3921,8 @@ function QuestionBankManager({
       <p className="eyebrow">SUPER ADMIN · QUESTION BANKS</p>
       <h1>Question bank library</h1>
       {error && <Notice kind="error">{error}</Notice>}
+      <details className="bank-picker" open={!detail || bankPickerOpen} onToggle={event => { if (detail) setBankPickerOpen(event.currentTarget.open); }}>
+        <summary>{detail ? `Switch bank or create a new bank` : "Choose or create a bank"}</summary>
       <div className="bank-workspace">
         <Card className="new-bank-card">
           <div className="bank-workspace-heading">
@@ -3974,7 +3978,8 @@ function QuestionBankManager({
                 className={`bank-choice-row ${detail?.id === bank.id ? "selected" : ""}`}
                 key={bank.id}
                 disabled={busy}
-                onClick={() => open(bank.id)}
+                aria-pressed={detail?.id === bank.id}
+                onClick={() => { void open(bank.id).then(() => { if (activeBank.current === bank.id) setBankPickerOpen(false); }); }}
               >
                 <span>
                   <b>{bank.name}</b>
@@ -3995,6 +4000,7 @@ function QuestionBankManager({
           </div>
         </Card>
       </div>
+      </details>
       <section className="bank-detail-workspace" aria-busy={loadingBank}>
           {loadingBank && <Notice>Loading the requested bank…</Notice>}
           {stale && <Notice kind="error">Refresh failed. Displayed data is stale. <button type="button" className="secondary-action" onClick={() => activeBank.current && open(activeBank.current)}>Retry refresh</button></Notice>}
@@ -4012,7 +4018,7 @@ function QuestionBankManager({
                   </div>
                   <div className="bank-actions">
                     {detail.status === "published" && <span className="badge published">Live</span>}
-                    <button type="button" onClick={publish} disabled={busy}>Publish all ready materials</button>
+                    <button type="button" onClick={publish} disabled={busy}>Preview publication</button>
                     <button type="button" className="secondary-action" onClick={revalidateFigures} disabled={busy}>Revalidate figures</button>
                     <button
                       type="button"
@@ -4056,7 +4062,7 @@ function QuestionBankManager({
                 <p>Each source document stays private until confirmed. Preview publication to see eligible, blocked and already published question counts. Only eligible questions become available for new tests.</p>
               </Card>
               {detail.readiness && <Notice>Full bank: {detail.readiness.total} questions · {detail.readiness.publishable} ready · {detail.readiness.blocked} with blocking content issues · {detail.readiness.needs_review} awaiting review (counts can overlap). <a href={`/api/admin/question-banks/${detail.id}/readiness-report`} target="_blank" rel="noreferrer">Open nonmutating readiness report</a></Notice>}
-              <nav className="ingestion-task-tabs" aria-label="Bank workspace task">{([['monitor','Monitor imports'],['add','Add sources'],['review','Review library']] as const).map(([value,label])=><button type="button" key={value} className={workspace===value?"active":"secondary-action"} onClick={async()=>{if(await canLeave()){dirtyQuestion.current=false;setFigureEditing(false);setEditingQuestion(null);setWorkspace(value);replaceLocationParams({task:value});}}}>{label}</button>)}</nav>
+              <nav className="ingestion-task-tabs" aria-label="Bank workspace task">{([['monitor','Monitor imports'],['add','Add sources'],['review','Review library']] as const).map(([value,label])=><button type="button" key={value} className={workspace===value?"active":"secondary-action"} aria-current={workspace===value?"page":undefined} onClick={async()=>{if(await canLeave()){dirtyQuestion.current=false;setFigureEditing(false);setEditingQuestion(null);setWorkspace(value);replaceLocationParams({task:value});}}}>{label}</button>)}</nav>
               {workspace === "add" && <Card className="bank-upload-card">
                 <h2>Upload source documents</h2>
                 <form ref={uploadFormRef} onSubmit={upload} onChange={event=>reviewUploadForm(event.currentTarget)} className="stacked-form">

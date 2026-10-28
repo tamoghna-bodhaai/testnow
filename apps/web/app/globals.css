@@ -377,3 +377,41 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .test-preview-section{margin-top:22px;padding-top:16px;border-top:1px solid var(--line)}
 .test-preview-section h3{margin:0;font-size:16px}.test-preview-section>p{margin:4px 0 8px;font-size:12px;color:var(--muted)}
 @media(min-width:801px){.builder.builder-workspace>.builder-selection{position:sticky;top:18px;max-height:calc(100vh - 36px);overflow-y:auto}}
+
+/* Admin bank workspace: keep the current task in view and reduce nested chrome. */
+.bank-picker{margin:12px 0 18px;border-bottom:1px solid var(--line)}
+.bank-picker>summary,.library-advanced>summary{cursor:pointer;color:var(--blue);font-weight:600;padding:12px 0;min-height:44px}
+.bank-picker .bank-workspace{margin-top:4px}
+.bank-list-scroll{height:auto;max-height:none;overflow:visible}
+.bank-detail-workspace>.card:first-of-type{padding:20px 22px}
+.bank-detail-workspace>.card:first-of-type>.section-heading+p{margin-bottom:0}
+.ingestion-task-tabs{border-bottom:1px solid var(--line);gap:0}
+.ingestion-task-tabs button{border:0!important;border-radius:0!important;box-shadow:none!important;background:transparent!important;color:var(--ink)!important;padding:10px 16px!important}
+.ingestion-task-tabs button.active{color:var(--blue)!important;box-shadow:inset 0 -3px var(--blue)!important;font-weight:700}
+.import-dashboard{box-shadow:none!important}
+.import-dashboard-head{background:transparent;padding:22px 24px}
+.import-summary{gap:8px}
+.import-summary button{min-height:44px}
+.import-item{align-items:start}
+.import-file small{font-size:12px;color:#505a70}
+.import-file-icon{display:none}
+.generation-progress{display:block;padding:0;margin-top:8px;border:0;background:transparent}
+.generation-progress>summary{cursor:pointer;color:var(--blue);font-size:12px;font-weight:600;min-height:32px;padding:7px 0}
+.generation-progress[open]>div,.generation-progress[open]>small,.generation-progress[open]>progress,.generation-progress[open]>.import-error-log{margin:6px 0}
+.import-controls button{min-height:40px}
+.library-advanced{border-bottom:1px solid var(--line);margin-bottom:16px}
+.library-filters{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.library-workspace .bounded-question-queue{max-height:none;overflow:visible;padding:0;border:0;border-radius:0}
+.library-workspace .queue-question{margin:0!important;border:0!important;border-bottom:1px solid var(--line)!important;border-radius:0!important;min-height:70px}
+.library-workspace .queue-question.active{box-shadow:inset 3px 0 var(--blue)!important}
+.queue-preview{font-weight:400;line-height:1.45;overflow-wrap:anywhere}
+.queue-preview .katex-display{display:inline;margin:0}
+.library-workspace .queue-pagination{padding:12px 0}
+.bank-manager :is(button,input,select,summary,a):focus-visible,.library-workspace :is(button,input,select,summary,a):focus-visible{outline:3px solid #3b59c7;outline-offset:2px}
+@media(max-width:800px){.library-workspace .bounded-question-queue{max-height:none}.bank-actions{justify-content:flex-start}.ingestion-task-tabs button{flex:1}.import-controls{justify-content:flex-start}}
+
+.bank-manager .bank-detail-workspace>.card:first-of-type .section-heading{flex-wrap:wrap;align-items:flex-start}
+.bank-manager .bank-detail-workspace>.card:first-of-type .section-heading>div:first-child{flex:1 1 220px}
+.bank-manager .bank-actions{justify-content:flex-start}
+
+@media(max-width:800px){.library-workspace .bounded-review-workspace.has-selection .selected-question-detail{order:-1}}
